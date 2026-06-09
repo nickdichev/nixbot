@@ -44,7 +44,7 @@ def test_reap_kills_whole_group(tmp_path: Path) -> None:
         while not pidfile.exists() or not pidfile.read_text().strip():  # noqa: ASYNC110
             await asyncio.sleep(0.01)
         await group.reap()
-        assert group.returncode is not None
+        assert group.proc.returncode is not None
         return int(pidfile.read_text())
 
     _assert_dead(asyncio.run(run()))
@@ -55,18 +55,9 @@ def test_reap_after_clean_exit_is_noop(tmp_path: Path) -> None:
         group = await ProcessGroup.start(["true"], cwd=tmp_path)
         await group.proc.wait()
         await group.reap()  # must not raise or block
-        return group.returncode
+        return group.proc.returncode
 
     assert asyncio.run(run()) == 0
-
-
-def test_kill_tolerates_missing_group(tmp_path: Path) -> None:
-    async def run() -> None:
-        group = await ProcessGroup.start(["true"], cwd=tmp_path)
-        await group.proc.wait()
-        group.kill()  # group already gone: no error
-
-    asyncio.run(run())
 
 
 def test_reap_on_task_cancel(tmp_path: Path) -> None:

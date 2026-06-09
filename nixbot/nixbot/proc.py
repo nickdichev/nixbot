@@ -29,8 +29,8 @@ class ProcessGroup:
     """A child process running as the leader of its own process group.
 
     Wraps the asyncio Process so callers keep direct access to its
-    streams/communicate()/wait(), while kill semantics (whole group,
-    idempotent, no zombie) live in one place.
+    streams/communicate()/wait()/returncode, while kill semantics
+    (whole group, idempotent, no zombie) live in one place.
     """
 
     proc: asyncio.subprocess.Process
@@ -58,18 +58,11 @@ class ProcessGroup:
         )
         return cls(proc)
 
-    @property
-    def returncode(self) -> int | None:
-        return self.proc.returncode
-
-    def kill(self) -> None:
-        """SIGKILL the whole group; the leader may already have exited."""
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(self.proc.pid, signal.SIGKILL)
-
     async def reap(self) -> None:
-        """Kill the group if still running, then reap the child so no
-        zombie is left behind."""
+        """SIGKILL the whole group if still running, then reap the
+        child so no zombie is left behind. The group may already be
+        gone when the kill races the leader's exit."""
         if self.proc.returncode is None:
-            self.kill()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.proc.pid, signal.SIGKILL)
             await self.proc.wait()

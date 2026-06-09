@@ -161,12 +161,12 @@ async def run_post_build_step(
         await group.reap()
         raise
     output = stdout.decode(errors="replace")
-    success = group.returncode == 0
+    success = group.proc.returncode == 0
     if not success:
         logger.log(
             logging.WARNING if step.warn_only else logging.ERROR,
             "post-build step failed",
-            extra={"step": step.name, "returncode": group.returncode},
+            extra={"step": step.name, "returncode": group.proc.returncode},
         )
     return PostBuildStepResult(
         name=step.name, success=success, warn_only=step.warn_only, output=output

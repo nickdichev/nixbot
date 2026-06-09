@@ -579,11 +579,10 @@ class NixBuildExecutor:
                 # Hard cancel of the surrounding task: the nix process
                 # group must not outlive the build (cancel_event covers
                 # only the cooperative path).
-                group.kill()
                 pump_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await pump_task
-                await proc.wait()
+                await group.reap()
 
 
 def read_log(path: Path) -> bytes:
