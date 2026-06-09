@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -19,6 +20,8 @@ from .support import make_config
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
+
+    import pytest
 
     from nixbot.auth import OAuthProvider
 
@@ -91,6 +94,26 @@ def test_explicit_listen_flag_keeps_both(tmp_path: Path) -> None:
     )
     configs = _uvicorn_configs(config, app=_app)
     assert len(configs) == 2
+
+
+def test_socket_activation_overrides_listeners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inherited systemd fds must be served instead of binding the
+    configured listeners, which would shadow the activation socket."""
+    config = make_config(
+        "postgresql://x", tmp_path, http_unix_socket=tmp_path / "web.sock"
+    )
+    monkeypatch.setenv("LISTEN_PID", str(os.getpid()))
+    monkeypatch.setenv("LISTEN_FDS", "1")
+    configs = _uvicorn_configs(config, app=_app)
+    assert [c.fd for c in configs] == [3]
+    assert [c.uds for c in configs] == [None]
+
+    # Foreign LISTEN_PID: not our fds, bind normally.
+    monkeypatch.setenv("LISTEN_PID", "1")
+    configs = _uvicorn_configs(config, app=_app)
+    assert [c.uds for c in configs] == [str(tmp_path / "web.sock")]
 
 
 async def test_lifespan_runs_once_with_two_listeners(tmp_path: Path) -> None:

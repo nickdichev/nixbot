@@ -1072,18 +1072,42 @@ in
       home = "/var/lib/nixbot";
     };
     users.groups.nixbot = { };
+    # The web socket is group-restricted (0660).
+    users.users.nginx = lib.mkIf cfg.nginx.enable { extraGroups = [ "nixbot" ]; };
 
     nix.settings.extra-allowed-users = [ "nixbot" ];
+
+    # Socket activation: the listener outlives service restarts, so
+    # nginx (or webhook deliveries on the TCP port) queue during a
+    # redeploy instead of getting connection-refused.
+    systemd.sockets.nixbot = {
+      description = "nixbot CI service socket";
+      wantedBy = [ "sockets.target" ];
+      socketConfig = {
+        ListenStream = if cfg.nginx.enable then webUnixSocket else cfg.port;
+        # nginx connects as group member.
+        SocketUser = "nixbot";
+        SocketGroup = "nixbot";
+        SocketMode = "0660";
+        # The socket path lives here; owned by the socket unit so a
+        # service stop does not remove it.
+        RuntimeDirectory = "nixbot";
+      };
+    };
 
     systemd.services.nixbot = {
       description = "nixbot CI service";
       wantedBy = [ "multi-user.target" ];
       after = [
         "network-online.target"
+        "nixbot.socket"
       ]
       ++ lib.optional cfg.database.createLocally "postgresql.target";
       wants = [ "network-online.target" ];
-      requires = lib.optional cfg.database.createLocally "postgresql.target";
+      requires = [
+        "nixbot.socket"
+      ]
+      ++ lib.optional cfg.database.createLocally "postgresql.target";
 
       path = [
         pkgs.git
@@ -1135,6 +1159,9 @@ in
         # Private repository clones and build logs live here.
         StateDirectoryMode = "0700";
         RuntimeDirectory = "nixbot";
+        # The socket unit shares /run/nixbot; removing it on service
+        # stop would yank the listening socket's path.
+        RuntimeDirectoryPreserve = true;
         WorkingDirectory = "/var/lib/nixbot";
         Restart = "on-failure";
         RestartSec = 5;

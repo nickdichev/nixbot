@@ -412,6 +412,16 @@ _UVICORN_OPTS: dict[str, Any] = {
 }
 
 
+def _activation_fds() -> list[int]:
+    """Listener fds inherited via systemd socket activation
+    (sd_listen_fds protocol: fds start at 3, LISTEN_PID guards
+    against inheritance by reexeced children)."""
+    if os.environ.get("LISTEN_PID") != str(os.getpid()):
+        return []
+    count = int(os.environ.get("LISTEN_FDS") or 0)
+    return list(range(3, 3 + count))
+
+
 def _uvicorn_configs(
     config: Config, app: ASGIApplication | Callable[..., object]
 ) -> list[uvicorn.Config]:
@@ -419,7 +429,11 @@ def _uvicorn_configs(
     listener gets its own server over the same app. With a unix socket
     (TLS proxy deployment), the TCP listener would be a plaintext
     bypass of the proxy, so it is only kept on explicit request
-    (http_listen)."""
+    (http_listen). Socket-activated fds take precedence over
+    configured listeners: binding both would shadow the activation
+    socket."""
+    if fds := _activation_fds():
+        return [uvicorn.Config(app, fd=fd, **_UVICORN_OPTS) for fd in fds]
     configs = []
     if config.http_unix_socket is None or config.http_listen:
         configs.append(
