@@ -18,14 +18,12 @@ import zstandard
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from nixbot.api_tokens import ApiTokenStore
-from nixbot.auth import AuthzConfig, User
+from nixbot.auth import User
 from nixbot.db import BuildStatus
 from nixbot.effects_state import TaskTokens
 from nixbot.executor import LogWriter
 from nixbot.forge_tokens import ForgeTokenStore
 from nixbot.scheduler import AttributeStatus
-from nixbot.visibility import VisibilityService
 from nixbot.web import events as events_module
 from nixbot.web.auth_routes import SESSION_COOKIE, create_auth_router
 from nixbot.web.events import EventBroker
@@ -57,6 +55,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from fastapi import FastAPI
+
+    from nixbot.visibility import VisibilityService
 
 
 @pytest.fixture(scope="module")
@@ -424,39 +424,6 @@ def test_legacy_redirect_hides_invisible_projects(client: WebHarness) -> None:
         assert client.get("/projects/acme/secret").status_code == 307
     finally:
         ctx.visibility = None
-        client.loop.run_until_complete(
-            ctx.pool.execute("DELETE FROM projects WHERE id = $1", secret_id)
-        )
-
-
-def test_api_token_grants_private_repo_visibility(client: WebHarness) -> None:
-    """Bearer-authenticated requests must go through the same
-    visibility path as session users: the token carries the user's
-    groups, which the private_repo_viewers rules match."""
-    ctx = client.ctx
-    authz = AuthzConfig(admins=[], private_repo_viewers={"*": ["github:group:dev"]})
-
-    async def setup() -> tuple[int, str]:
-        secret_id = await insert_project(
-            ctx.pool, "vault", forge_repo_id="web-vault", private=True
-        )
-        store = ApiTokenStore(ctx.pool)
-        token = await store.create(
-            User(provider="github", username="alice", groups=("dev",)), "t"
-        )
-        return secret_id, token
-
-    secret_id, token = client.loop.run_until_complete(setup())
-    ctx.token_store = ApiTokenStore(ctx.pool)
-    ctx.visibility = VisibilityService(ctx.pool, authz)
-    try:
-        url = "/api/repos/github/acme/vault"
-        assert client.get(url).status_code == 404  # anonymous
-        ok = client.get(url, headers={"Authorization": f"Bearer {token}"})
-        assert ok.status_code == 200
-    finally:
-        ctx.visibility = None
-        ctx.token_store = None
         client.loop.run_until_complete(
             ctx.pool.execute("DELETE FROM projects WHERE id = $1", secret_id)
         )

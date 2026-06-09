@@ -301,10 +301,9 @@ def test_api_token_inherits_login_groups(harness: WebHarness) -> None:
         assert restored is not None
         assert restored.groups == ("auditors",)
 
-        response = harness.get(
-            "/api/repos/github/acme/secret/builds",
-            headers={"Authorization": f"Bearer {token}"},
-        )
+        url = "/api/repos/github/acme/secret/builds"
+        assert harness.get(url).status_code == 404  # anonymous API access
+        response = harness.get(url, headers={"Authorization": f"Bearer {token}"})
         assert response.status_code == 200
     finally:
         ctx.visibility.authz = saved
