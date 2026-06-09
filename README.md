@@ -1,15 +1,17 @@
 # Nixbot
 
+**Development Status:** alpha (under active development: APIs, options and the
+database schema may change without notice)
+
 Nixbot is a continuous integration (CI) service for the Nix ecosystem, shipped
 as a single NixOS service. It is a rewrite of
 [buildbot-nix](https://github.com/nix-community/buildbot-nix), its spiritual
-ancestor: what started as a set of Buildbot plugins now runs standalone — one
-asyncio process handles forge webhooks, nix-eval-jobs evaluation, builds through
-the local nix daemon (offloaded via remote builders), commit statuses, and its
-own web frontend.
+ancestor.
 
-Status: alpha — under active development; APIs, options and the database schema
-may change without notice.
+What started as a set of Buildbot plugins now runs standalone. One server
+handles forge webhooks, nix-eval-jobs evaluation, builds through the local nix
+daemon (offloaded via remote builders), commit statuses, and its own web
+frontend.
 
 ## Features
 
@@ -220,10 +222,6 @@ The following instances integrated with Gitea:
   [Configuration](https://git.clan.lol/clan/clan-infra/src/branch/main/modules/buildbot.nix)
   | [Instance](https://buildbot.clan.lol/)
 -->
-
-## Get in touch
-
-We have a matrix channel at [nixbot](https://matrix.to/#/#nixbot:thalheim.io).
 
 ## Need commercial support or customization?
 
