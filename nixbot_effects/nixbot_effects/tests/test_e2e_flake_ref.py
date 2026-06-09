@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from nixbot_effects.tests.support import init_repo
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -37,27 +39,10 @@ FLAKE_NIX = """\
 """
 
 
-def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=True,
-        text=True,
-        capture_output=True,
-    ).stdout.strip()
-
-
 @pytest.fixture
 def flake_repo(tmp_path: Path) -> Path:
     """Create a git repo with a minimal flake that has effects."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-b", "main")
-    _git(repo, "config", "user.name", "test")
-    _git(repo, "config", "user.email", "test@test")
-
-    (repo / "flake.nix").write_text(FLAKE_NIX)
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-m", "init")
+    repo, _rev = init_repo(tmp_path, {"flake.nix": FLAKE_NIX})
     return repo
 
 

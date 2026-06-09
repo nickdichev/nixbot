@@ -5,7 +5,6 @@ HEAD; https://github.com/nix-community/nixbot/issues/583)."""
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -13,41 +12,23 @@ import pytest
 from nixbot_effects import _flake_url, effects_args, git_get_tag, secret_context
 from nixbot_effects.options import EffectsOptions
 from nixbot_effects.secrets import SimpleSecret, gather_secrets
-
-
-def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=True,
-        text=True,
-        capture_output=True,
-    ).stdout.strip()
+from nixbot_effects.tests.support import git, init_repo
 
 
 def test_branch_resolves_to_branch_tip(tmp_path: Path) -> None:
     """--branch should resolve rev to the tip of that branch, not HEAD."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-b", "main")
-    _git(repo, "config", "user.name", "test")
-    _git(repo, "config", "user.email", "test@test")
-
-    # Initial commit on main
-    (repo / "file.txt").write_text("main")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-m", "initial")
-    main_rev = _git(repo, "rev-parse", "HEAD")
+    repo, main_rev = init_repo(tmp_path, {"file.txt": "main"})
 
     # Create a feature branch with a new commit
-    _git(repo, "checkout", "-b", "feature")
+    git(repo, "checkout", "-b", "feature")
     (repo / "file.txt").write_text("feature")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-m", "feature commit")
-    feature_rev = _git(repo, "rev-parse", "HEAD")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "feature commit")
+    feature_rev = git(repo, "rev-parse", "HEAD")
 
     # Go back to main — HEAD is now main_rev
-    _git(repo, "checkout", "main")
-    assert _git(repo, "rev-parse", "HEAD") == main_rev
+    git(repo, "checkout", "main")
+    assert git(repo, "rev-parse", "HEAD") == main_rev
 
     # Ask for --branch=feature without --rev: should get feature_rev, not main_rev
     opts = EffectsOptions(path=repo, branch="feature")
@@ -63,15 +44,8 @@ def test_branch_resolves_to_branch_tip(tmp_path: Path) -> None:
 def test_git_tag_propagates_to_secret_context(tmp_path: Path) -> None:
     """A tag resolved from git must end up in opts.tag so that
     isTag-conditioned secrets can be granted."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-b", "main")
-    _git(repo, "config", "user.name", "test")
-    _git(repo, "config", "user.email", "test@test")
-    (repo / "file.txt").write_text("v1")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-m", "release")
-    _git(repo, "tag", "v1.0")
+    repo, _rev = init_repo(tmp_path, {"file.txt": "v1"})
+    git(repo, "tag", "v1.0")
 
     opts = EffectsOptions(path=repo, repo="acme/widget")
     result = effects_args(opts)
@@ -105,19 +79,7 @@ class TestFlakeUrl:
         assert _flake_url(opts, "abc1234") == "github:org/repo/abc1234def5678"
 
 
-def _init_repo(tmp_path: Path) -> tuple[Path, str]:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-b", "main")
-    _git(repo, "config", "user.name", "test")
-    _git(repo, "config", "user.email", "test@test")
-    (repo / "file.txt").write_text("content")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-m", "initial")
-    return repo, _git(repo, "rev-parse", "HEAD")
-
-
 def test_git_get_tag_no_tag(tmp_path: Path) -> None:
-    repo, rev = _init_repo(tmp_path)
+    repo, rev = init_repo(tmp_path)
 
     assert git_get_tag(repo, rev) is None
