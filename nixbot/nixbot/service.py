@@ -11,30 +11,21 @@ import dataclasses
 import logging
 import re
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from . import discovery
 from .config import ScheduleWhen
 from .db import BuildStatus
 from .effects import EffectsContext, effects_context
 from .events import ChangeEvent, RepoInfo, StatusReporter
 from .executor import LogWriter
-from .forge import (
-    GiteaClient,
-    GitHubAppClient,
-    GitlabClient,
-    filter_repos,
-)
-from .gitea_hooks import register_repo_hook
-from .gitlab_hooks import register_repo_hook as register_gitlab_repo_hook
 from .gitrepo import (
     CredentialsProvider,
     FetchCredentials,
     StaticCredentialsProvider,
 )
-from .hook_secrets import WebhookSecrets
-from .reconcile import gitea_heads, github_heads, gitlab_heads, reconcile_repo
 from .recovery import (
     check_store_paths,
     cleanup_old_builds,
@@ -58,13 +49,13 @@ from .webhooks import (
 from .work_queue import WorkItem, WorkQueue
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Coroutine
+    from collections.abc import Coroutine
 
     import asyncpg
 
-    from .config import Config, RepoFilters
+    from .config import Config
     from .db import BuildRecord
-    from .forge import DiscoveredRepo
+    from .forge import GiteaClient, GitHubAppClient, GitlabClient
     from .orchestrator import Orchestrator
     from .polling import PolledRepository
     from .recovery import ResumableBuild
@@ -768,117 +759,13 @@ class CIService:
             await asyncio.sleep(DISCOVERY_INTERVAL)
 
     async def reconcile_once(self) -> None:
-        """Build default-branch and open-PR heads that got no build
-        record while the service was down (missed webhooks)."""
-        for project in await self.repo_store.enabled_repos():
-            try:
-                if project.forge == "github" and self.github is not None:
-                    heads = await github_heads(self.github, project)
-                elif project.forge == "gitea" and self.gitea is not None:
-                    heads = await gitea_heads(self.gitea, project)
-                elif project.forge == "gitlab" and self.gitlab is not None:
-                    heads = await gitlab_heads(self.gitlab, project)
-                else:
-                    continue
-                await reconcile_repo(self.pool, project, heads, self)
-            except Exception:
-                logger.exception(
-                    "reconciliation failed",
-                    extra={"project": f"{project.owner}/{project.name}"},
-                )
-
-    async def _warn_github_webhook_misconfig(self, github: GitHubAppClient) -> None:
-        try:
-            base = self.config.webhook_base_url or self.config.url
-            for problem in await github.check_app_webhook(base):
-                logger.warning("github app misconfigured: %s", problem)
-        except Exception:
-            logger.exception("github app webhook check failed")
+        await discovery.reconcile_once(self)
 
     async def discover_once(self) -> None:
-        if self.config.pull_based is not None:
-            await self.repo_store.sync_pull_based(
-                [
-                    (repo.name, repo.url, repo.default_branch)
-                    for repo in self.config.pull_based.repositories.values()
-                ]
-            )
-        repos = []
-        # The topic is only a legacy import aid (one-shot enablement in
-        # sync_discovered); it must not hard-filter discovery, otherwise
-        # untagged repos never appear in the admin UI.
-        if self.github is not None and self.config.github is not None:
-            await self._warn_github_webhook_misconfig(self.github)
-            repos += await self._discover_forge(
-                "github", self.github.discover_repos(), self.config.github.filters
-            )
-        if self.gitea is not None and self.config.gitea is not None:
-            # Only the one-shot legacy import needs topics.
-            fetch_topics = (
-                self.config.gitea.filters.topic is not None
-                and await self.repo_store.is_empty()
-            )
-            repos += await self._discover_forge(
-                "gitea",
-                self.gitea.discover_repos(fetch_topics=fetch_topics),
-                self.config.gitea.filters,
-            )
-        if self.gitlab is not None and self.config.gitlab is not None:
-            repos += await self._discover_forge(
-                "gitlab", self.gitlab.discover_repos(), self.config.gitlab.filters
-            )
-        topics = {
-            forge: forge_config.filters.topic
-            for forge, forge_config in (
-                ("github", self.config.github),
-                ("gitea", self.config.gitea),
-                ("gitlab", self.config.gitlab),
-            )
-            if forge_config is not None and forge_config.filters.topic is not None
-        }
-        await self.repo_store.sync_discovered(repos, legacy_import_topics=topics)
-        # Auto-register Gitea/GitLab webhooks for enabled projects.
-        await self._register_hooks()
-
-    async def _discover_forge(
-        self,
-        forge: str,
-        discovery: Awaitable[list[DiscoveredRepo]],
-        filters: RepoFilters,
-    ) -> list[DiscoveredRepo]:
-        """One forge failing must not abort discovery for the others."""
-        try:
-            return filter_repos(replace(filters, topic=None), await discovery)
-        except Exception:
-            logger.exception("%s repo discovery failed", forge)
-            return []
+        await discovery.discover_once(self)
 
     async def _register_hooks(self) -> None:
-        registrars: dict[str, tuple[Any, Callable[..., Awaitable[None]]]] = {}
-        if self.gitea is not None:
-            registrars["gitea"] = (self.gitea, register_repo_hook)
-        if self.gitlab is not None:
-            registrars["gitlab"] = (self.gitlab, register_gitlab_repo_hook)
-        base = self.config.webhook_base_url or self.config.url
-        for project in await self.repo_store.enabled_repos():
-            if project.forge not in registrars:
-                continue
-            client, register = registrars[project.forge]
-            try:
-                await register(
-                    client,
-                    WebhookSecrets(self.pool, project.forge),
-                    project.id,
-                    project.owner,
-                    project.name,
-                    base,
-                )
-            except Exception:
-                logger.exception(
-                    "%s hook registration failed",
-                    project.forge,
-                    extra={"project": f"{project.owner}/{project.name}"},
-                )
+        await discovery.register_hooks(self)
 
     async def maintenance_loop(self) -> None:
         while True:
