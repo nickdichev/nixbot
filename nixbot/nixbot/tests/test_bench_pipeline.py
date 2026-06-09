@@ -17,28 +17,20 @@ import asyncio
 import os
 import resource
 import shutil
-import subprocess
 from typing import TYPE_CHECKING
 
 import pytest
 
-from nixbot.executor import (
-    BuildSettings,
-    FairScheduler,
-    LogWriter,
-    NixBuildExecutor,
-)
 from nixbot.nix_eval import EvalRunner, EvalSettings
 from nixbot.repo_config import BranchConfig
 from nixbot.scheduler import AttributeStatus, JobScheduler, ScheduleResult
+
+from .test_pipeline import PipelineExecutor, current_system
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from pytest_benchmark.fixture import BenchmarkFixture
-
-    from nixbot.models import NixEvalJobSuccess
-    from nixbot.scheduler import BuildOutcome
 
 pytestmark = [
     pytest.mark.skipif(
@@ -75,15 +67,6 @@ LOCAL_ONLY = [
 ]
 
 
-def current_system() -> str:
-    return subprocess.run(
-        ["nix", "eval", "--raw", "--impure", "--expr", "builtins.currentSystem"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-
 FLAKE_TEMPLATE = """
 {{
   outputs = {{ self }}:
@@ -111,24 +94,6 @@ FLAKE_TEMPLATE = """
     }};
 }}
 """
-
-
-class BenchExecutor:
-    """Adapts NixBuildExecutor to the scheduler's BuildExecutor protocol."""
-
-    def __init__(self, cwd: Path, log_dir: Path) -> None:
-        self.inner = NixBuildExecutor(
-            FairScheduler(BUILD_CONCURRENCY),
-            BuildSettings(log_dir=log_dir, timeout=300, extra_args=LOCAL_ONLY),
-        )
-        self.cwd = cwd
-        self.log_dir = log_dir
-
-    async def build(self, job: NixEvalJobSuccess) -> BuildOutcome:
-        writer = LogWriter(path=self.log_dir / f"{job.attr}.zst")
-        outcome = await self.inner.build_attribute("bench", job, writer, self.cwd)
-        await writer.close()
-        return outcome
 
 
 @pytest.fixture
@@ -159,7 +124,10 @@ def test_bench_full_pipeline(
             extra_args=LOCAL_ONLY,
         )
         eval_result = await EvalRunner().run(flake, BranchConfig(), settings)
-        scheduler = JobScheduler(BenchExecutor(flake, log_dir), [current_system()])
+        executor = PipelineExecutor(
+            flake, log_dir, concurrency=BUILD_CONCURRENCY, extra_args=LOCAL_ONLY
+        )
+        scheduler = JobScheduler(executor, [current_system()])
         return await scheduler.run(eval_result.jobs)
 
     # One round: derivations are salted per run and end up in the nix

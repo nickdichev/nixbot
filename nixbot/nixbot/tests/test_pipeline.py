@@ -73,9 +73,17 @@ FLAKE_TEMPLATE = """
 class PipelineExecutor:
     """Adapts NixBuildExecutor to the scheduler's BuildExecutor protocol."""
 
-    def __init__(self, cwd: Path, log_dir: Path) -> None:
+    def __init__(
+        self,
+        cwd: Path,
+        log_dir: Path,
+        *,
+        concurrency: int = 2,
+        extra_args: list[str] | None = None,
+    ) -> None:
         self.inner = NixBuildExecutor(
-            FairScheduler(2), BuildSettings(log_dir=log_dir, timeout=300)
+            FairScheduler(concurrency),
+            BuildSettings(log_dir=log_dir, timeout=300, extra_args=extra_args or []),
         )
         self.cwd = cwd
         self.log_dir = log_dir
