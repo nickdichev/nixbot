@@ -59,10 +59,6 @@ class ProcessGroup:
         return cls(proc)
 
     @property
-    def pid(self) -> int:
-        return self.proc.pid
-
-    @property
     def returncode(self) -> int | None:
         return self.proc.returncode
 
