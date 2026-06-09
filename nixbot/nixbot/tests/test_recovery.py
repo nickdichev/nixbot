@@ -8,8 +8,6 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-import asyncpg
-
 from nixbot.db import BuildDB
 from nixbot.recovery import (
     check_store_paths,
@@ -20,11 +18,13 @@ from nixbot.recovery import (
     settle_already_built,
 )
 
-from .support import insert_build, insert_project
+from .support import db_pool, insert_build, insert_project
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
+
+    import asyncpg
 
 
 async def make_build(pool: asyncpg.Pool, name: str) -> int:
@@ -53,8 +53,7 @@ async def add_attr(
 
 def test_resume_skips_terminal_attributes(postgres_dsn: str) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             build_id = await make_build(pool, "resume")
             await add_attr(pool, build_id, "done", "succeeded")
             await add_attr(pool, build_id, "failed", "failed")
@@ -65,16 +64,13 @@ def test_resume_skips_terminal_attributes(postgres_dsn: str) -> None:
             # Terminal attributes never resumed.
             assert [j.attr for j in target.pending_jobs] == ["todo"]
             assert not target.effects_started
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
 
 def test_settle_already_built(postgres_dsn: str) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             build_id = await make_build(pool, "settle")
             await add_attr(pool, build_id, "present", "pending")
             await add_attr(pool, build_id, "missing", "pending")
@@ -99,16 +95,13 @@ def test_settle_already_built(postgres_dsn: str) -> None:
             # Store-valid path completed without rebuild.
             assert statuses["present"] == "succeeded"
             assert statuses["missing"] == "pending"
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
 
 def test_retention_cleanup(postgres_dsn: str, tmp_path: Path) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             build_id = await make_build(pool, "old")
             await pool.execute(
                 "UPDATE builds SET status='succeeded', "
@@ -134,8 +127,6 @@ def test_retention_cleanup(postgres_dsn: str, tmp_path: Path) -> None:
                 )
                 == 1
             )
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -195,16 +186,13 @@ def test_resume_includes_interrupted_building_attributes(postgres_dsn: str) -> N
     # An attribute that was 'building' when the service died must
     # resume like a pending one (it is not terminal).
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             build_id = await make_build(pool, "resume-building")
             await add_attr(pool, build_id, "inflight", "building")
             await add_attr(pool, build_id, "done", "succeeded")
             builds = await find_unfinished_builds(pool)
             target = next(b for b in builds if b.build_id == build_id)
             assert [j.attr for j in target.pending_jobs] == ["inflight"]
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -214,8 +202,7 @@ def test_retention_skips_restarted_builds(postgres_dsn: str, tmp_path: Path) -> 
     # status is 'building' again; the hourly sweep must not delete it
     # mid-rerun.
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             build_id = await make_build(pool, "restarted-old")
             await pool.execute(
                 "UPDATE builds SET status = 'building', "
@@ -229,16 +216,13 @@ def test_retention_skips_restarted_builds(postgres_dsn: str, tmp_path: Path) -> 
                 )
                 == 1
             )
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
 
 def test_retention_ages_out_failed_caches(postgres_dsn: str, tmp_path: Path) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             old_ts = time.time() - 100 * 86400
             await pool.execute(
                 "INSERT INTO failed_statuses (revision, status_name, timestamp) "
@@ -270,8 +254,6 @@ def test_retention_ages_out_failed_caches(postgres_dsn: str, tmp_path: Path) -> 
             }
             assert "/nix/store/old.drv" not in drvs
             assert "/nix/store/new.drv" in drvs
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -303,8 +285,7 @@ def test_failed_rebuild_settles_pending_effects(postgres_dsn: str) -> None:
     """A failed rebuild must settle its pending effect rows."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             build_id = await make_build(pool, "fx-failed-rebuild")
             await pool.execute(
                 "INSERT INTO build_effects (build_id, name, status) "
@@ -318,8 +299,6 @@ def test_failed_rebuild_settles_pending_effects(postgres_dsn: str) -> None:
             )
             assert row["status"] == "failed"
             assert "did not succeed" in row["error"]
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -328,8 +307,7 @@ def test_eval_start_clears_stale_eval_warnings(postgres_dsn: str) -> None:
     """A re-run build must not show the previous attempt's warnings."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             build_id = await make_build(pool, "lw-rerun")
             db = BuildDB(pool)
             await db.set_eval_warnings(
@@ -346,8 +324,6 @@ def test_eval_start_clears_stale_eval_warnings(postgres_dsn: str) -> None:
                 )
                 is None
             )
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -357,8 +333,7 @@ def test_interrupted_effects_fail_on_recovery(postgres_dsn: str) -> None:
     would spin forever without the startup sweep."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             build_id = await make_build(pool, "fx-sweep")
             await pool.execute(
                 "INSERT INTO build_effects (build_id, name) VALUES ($1, 'deploy')",
@@ -387,8 +362,6 @@ def test_interrupted_effects_fail_on_recovery(postgres_dsn: str) -> None:
                 assert row["status"] == "failed"
                 assert "interrupted" in row["error"]
                 assert row["finished_at"] is not None
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -399,8 +372,7 @@ def test_interrupted_effects_sweep_spares_live_effects(postgres_dsn: str) -> Non
     flipped to failed."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             build_id = await make_build(pool, "fx-live")
             process_start = datetime.now(UTC)
             await pool.execute(
@@ -412,7 +384,5 @@ def test_interrupted_effects_sweep_spares_live_effects(postgres_dsn: str) -> Non
                 "SELECT status FROM build_effects WHERE build_id = $1", build_id
             )
             assert status == "running"
-        finally:
-            await pool.close()
 
     asyncio.run(run())

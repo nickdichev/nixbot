@@ -8,7 +8,6 @@ import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-import asyncpg
 import pytest
 
 from nixbot.config import ScheduleWhen
@@ -24,7 +23,7 @@ from nixbot.scheduled import (
     schedule_overview,
 )
 
-from .support import insert_project
+from .support import db_pool, insert_project
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -104,8 +103,7 @@ def test_replace_schedules_preserves_last_run_for_unchanged_spec(
     last_run."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, forge_repo_id="sched-keep")
             store = ScheduledEffectsStore(pool)
             schedules = parse_schedules_from_json(
@@ -129,8 +127,6 @@ def test_replace_schedules_preserves_last_run_for_unchanged_spec(
             )
             await store.replace_schedules(project_id, changed)
             assert len(mine(await store.due_effects(due_time.replace(minute=8)))) == 1
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -142,8 +138,7 @@ def test_replace_schedules_tolerates_duplicate_effect_names(
     the update and permanently block schedule refreshes."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, forge_repo_id="sched-dupe")
             store = ScheduledEffectsStore(pool)
             schedules = parse_schedules_from_json(
@@ -160,16 +155,13 @@ def test_replace_schedules_tolerates_duplicate_effect_names(
                 project_id,
             )
             assert [row["effect"] for row in rows] == ["deploy"]
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
 
 def test_store_roundtrip_and_due(postgres_dsn: str) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, forge_repo_id="sched-1")
             store = ScheduledEffectsStore(pool)
             schedules = parse_schedules_from_json(
@@ -201,8 +193,6 @@ def test_store_roundtrip_and_due(postgres_dsn: str) -> None:
             # Re-discovery replaces the schedule set.
             await store.replace_schedules(project_id, {})
             assert await store.due_effects(due_time.replace(day=7)) == []
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -260,8 +250,7 @@ def test_run_scheduled_effect_passes_secrets(
 
 def test_due_effects_window_and_bad_spec(postgres_dsn: str) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "gadget", forge_repo_id="sched-2")
             store = ScheduledEffectsStore(pool)
             schedules = parse_schedules_from_json(
@@ -288,8 +277,6 @@ def test_due_effects_window_and_bad_spec(postgres_dsn: str) -> None:
                 d for d in await store.due_effects(late) if d.project_id == project_id
             ]
             assert [d.schedule_name for d in due] == ["nightly"]
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -313,8 +300,7 @@ def test_run_scheduled_effect_secret_read_failure_raises(
 
 def test_run_recording_and_overview(postgres_dsn: str) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "gadget", forge_repo_id="sched-4")
             store = ScheduledEffectsStore(pool)
             schedules = parse_schedules_from_json(
@@ -351,7 +337,5 @@ def test_run_recording_and_overview(postgres_dsn: str) -> None:
             )
             assert overview[0]["run"]["status"] == "failed"
             assert overview[0]["run"]["error"] == "boom"
-        finally:
-            await pool.close()
 
     asyncio.run(run())

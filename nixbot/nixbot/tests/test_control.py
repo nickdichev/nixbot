@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-import asyncpg
 import httpx
 import pytest
 
@@ -36,6 +35,7 @@ from nixbot.web.token_routes import create_token_router
 
 from .support import (
     WebHarness,
+    db_pool,
     insert_build,
     insert_project,
     web_harness,
@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
+    import asyncpg
     from fastapi import FastAPI
 
 AUTHZ = AuthzConfig(admins=["github:root"])
@@ -91,8 +92,7 @@ def postgres_dsn(postgres_dsn: str) -> str:
 
 
 async def seed(dsn: str) -> None:
-    pool = await asyncpg.create_pool(dsn)
-    try:
+    async with db_pool(dsn) as pool:
         project_id = await insert_project(pool, forge_repo_id="ctl-1")
         build_id = await insert_build(
             pool,
@@ -120,8 +120,6 @@ async def seed(dsn: str) -> None:
         await insert_build(
             pool, queued_project, number=3, status="building", started=True
         )
-    finally:
-        await pool.close()
 
 
 BACKEND = FakeBackend()

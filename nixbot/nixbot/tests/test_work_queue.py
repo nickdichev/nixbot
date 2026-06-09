@@ -9,13 +9,14 @@ import pytest
 
 from nixbot.work_queue import WorkQueue
 
+from .support import db_pool
+
 pytestmark = pytest.mark.usefixtures("fresh_work_queue")
 
 
 def test_enqueue_dedupes_pending(postgres_dsn: str) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             queue = WorkQueue(pool)
             assert await queue.enqueue("restart", "build-1", {"build_id": 1})
             # Double click: identical pending intent collapses.
@@ -29,16 +30,13 @@ def test_enqueue_dedupes_pending(postgres_dsn: str) -> None:
             # Claimed (running) no longer blocks new intent.
             assert await queue.enqueue("restart", "build-1", {"build_id": 1})
             await queue.finish(item.id)
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
 
 def test_claim_serializes_per_key(postgres_dsn: str) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             queue = WorkQueue(pool)
             await queue.enqueue("restart", "build-2")
             first = await queue.claim_next()
@@ -66,16 +64,13 @@ def test_claim_serializes_per_key(postgres_dsn: str) -> None:
             blocked = await queue.claim_next()
             assert blocked is not None
             assert blocked.kind == "effects"
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
 
 def test_settle_interrupted_requeues(postgres_dsn: str) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             queue = WorkQueue(pool)
             await queue.enqueue("change", "proj-1")
             assert await queue.claim_next() is not None
@@ -91,7 +86,5 @@ def test_settle_interrupted_requeues(postgres_dsn: str) -> None:
                 "SELECT count(*) FROM work_queue WHERE status = 'failed'"
             )
             assert superseded == 1
-        finally:
-            await pool.close()
 
     asyncio.run(run())

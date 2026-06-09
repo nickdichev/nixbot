@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
-import asyncpg
 import httpx
 import pytest
 
@@ -26,6 +25,7 @@ from nixbot.web.auth_routes import SESSION_COOKIE, create_auth_router
 from .support import (
     WebHarness,
     cookie_header,
+    db_pool,
     insert_build,
     insert_project,
     web_harness,
@@ -34,6 +34,7 @@ from .support import (
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    import asyncpg
     from fastapi import FastAPI
 
 
@@ -63,8 +64,7 @@ def postgres_dsn(postgres_dsn: str) -> str:
 
 
 async def seed(dsn: str) -> None:
-    pool = await asyncpg.create_pool(dsn)
-    try:
+    async with db_pool(dsn) as pool:
         for repo_id, name, private in [
             ("pub-1", "public", False),
             ("priv-1", "secret", True),
@@ -78,8 +78,6 @@ async def seed(dsn: str) -> None:
                 "VALUES ($1, 'a.x', 'x86_64-linux', 'succeeded')",
                 build_id,
             )
-    finally:
-        await pool.close()
 
 
 FETCHER = FakeFetcher({"github:carol:tok-carol": frozenset({"github:priv-1"})})

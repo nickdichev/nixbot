@@ -32,7 +32,7 @@ from nixbot.scheduler import (
 )
 from nixbot.work_queue import WorkQueue
 
-from .support import FakeCache, git, insert_project, mk_job
+from .support import FakeCache, db_pool, git, insert_project, mk_job
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -498,8 +498,7 @@ def test_build_reuse_clears_pr_author_in_other_context(
     after the merge) must not stay controllable by the PR author."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             db = BuildDB(pool)
             project = await make_project(pool, name="reuse-author")
             build, created = await db.get_or_create_build(
@@ -530,16 +529,13 @@ def test_build_reuse_clears_pr_author_in_other_context(
                 "SELECT pr_author FROM builds WHERE id = $1", build.id
             )
             assert author is None
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
 
 def test_effects_started_flag(postgres_dsn: str, tmp_path: Path) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             db = BuildDB(pool)
             project = await make_project(pool, name="flag")
             build, _ = await db.get_or_create_build(
@@ -548,16 +544,13 @@ def test_effects_started_flag(postgres_dsn: str, tmp_path: Path) -> None:
             assert await db.mark_effects_started(build.id)
             # Second attempt (e.g. crash recovery) must not re-run.
             assert not await db.mark_effects_started(build.id)
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
 
 def test_aggregation_generation_monotonic(postgres_dsn: str, tmp_path: Path) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             db = BuildDB(pool)
             project = await make_project(pool, name="gen")
             build, _ = await db.get_or_create_build(
@@ -590,8 +583,6 @@ def test_aggregation_generation_monotonic(postgres_dsn: str, tmp_path: Path) -> 
             status2, gen2 = await db.aggregate_build(build.id)
             assert status2 == BuildStatus.SUCCEEDED
             assert gen2 > gen1
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -1397,8 +1388,7 @@ def test_effect_rows_roundtrip(postgres_dsn: str, tmp_path: Path) -> None:
     """Start, finish and rerun-reset of effect rows."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             db = BuildDB(pool)
             project = await make_project(pool, name="fx")
             build, _ = await db.get_or_create_build(
@@ -1426,8 +1416,6 @@ def test_effect_rows_roundtrip(postgres_dsn: str, tmp_path: Path) -> None:
             assert effects[0]["status"] == "running"
             assert effects[0]["finished_at"] is None
             assert effects[0]["error"] is None
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
