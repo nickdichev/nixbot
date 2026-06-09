@@ -9,7 +9,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import asyncpg
 import httpx
@@ -401,6 +401,17 @@ async def _run_startup(service: CIService) -> None:
     await service.discovery_loop()
 
 
+# timeout_graceful_shutdown: open SSE event streams never close on
+# their own; without the cap uvicorn waits for them forever and
+# systemd SIGKILLs the service on every stop.
+# lifespan="off": _serve runs the app lifespan once for all listeners.
+_UVICORN_OPTS: dict[str, Any] = {
+    "log_level": "info",
+    "lifespan": "off",
+    "timeout_graceful_shutdown": 5,
+}
+
+
 def _uvicorn_configs(
     config: Config, app: ASGIApplication | Callable[..., object]
 ) -> list[uvicorn.Config]:
@@ -410,25 +421,18 @@ def _uvicorn_configs(
     bypass of the proxy, so it is only kept on explicit request
     (http_listen)."""
     configs = []
-    # lifespan="off": _serve runs the app lifespan once for all listeners.
     if config.http_unix_socket is None or config.http_listen:
         configs.append(
             uvicorn.Config(
                 app,
                 host="0.0.0.0",  # noqa: S104
                 port=config.http_port,
-                log_level="info",
-                lifespan="off",
+                **_UVICORN_OPTS,
             )
         )
     if config.http_unix_socket:
         configs.append(
-            uvicorn.Config(
-                app,
-                uds=str(config.http_unix_socket),
-                log_level="info",
-                lifespan="off",
-            )
+            uvicorn.Config(app, uds=str(config.http_unix_socket), **_UVICORN_OPTS)
         )
     return configs
 
