@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import asyncpg
 import pytest
 
+from nixbot import build_run as build_run_mod
 from nixbot import orchestrator as orch_mod
 from nixbot.config import Config
 from nixbot.db import BuildDB, BuildStatus
@@ -1051,7 +1052,7 @@ def test_eval_settings_wired(
     # Pin the auto-sizing: it reads live memory, which shifts under
     # parallel test load.
     monkeypatch.setattr(
-        orch_mod,
+        build_run_mod,
         "calculate_eval_workers",
         lambda: EvalWorkerConfig(count=3, max_memory_mib=1234),
     )
