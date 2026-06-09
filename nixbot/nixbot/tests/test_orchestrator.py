@@ -731,6 +731,24 @@ async def test_eval_warnings_null_when_empty(
     assert warnings is None
 
 
+async def test_rerun_flips_stale_red_eval_status(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    """Resuming from stored eval results skips eval; the eval status
+    must still be re-posted green over a stale red one."""
+    sha = add_commit(upstream, "eval-flip")
+    # Failing attribute: keeps the effects path out of this test.
+    orchestrator, reporter, project = await make_env(
+        FakeEvalRunner([]),
+        FakeExecutor(outcomes={"a": BuildOutcome.failure}),
+        "eval-flip",
+    )
+    db = BuildDB(pool)
+    build, _ = await db.get_or_create_build(project.id, "eval-flip-tree", sha, "main")
+    await orchestrator.rerun_pending_attributes(project, build, [mk_job("a")])
+    assert ("eval", build.id, True, ()) in reporter.events
+
+
 async def test_recovery_rerun_failures_not_cached(
     pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
 ) -> None:

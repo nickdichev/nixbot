@@ -114,6 +114,9 @@ async def rerun_pending_attributes(
             event,
             worktree_path,
         ):
+            # No re-eval on this path: re-post the eval context green,
+            # the previous run may have left it red or pending.
+            await o.reporter.eval_finished(event, build, success=True, warnings=[])
             # cache_failures=False: see _ReadOnlyFailedBuildCache.
             status = await build_run.build_attributes(
                 o,
