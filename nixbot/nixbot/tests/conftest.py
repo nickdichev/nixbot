@@ -8,11 +8,13 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from .support import ephemeral_postgres, init_upstream, truncate_work_queue
+from .support import db_pool, ephemeral_postgres, init_upstream, truncate_work_queue
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import AsyncIterator, Iterator
     from pathlib import Path
+
+    import asyncpg
 
 
 @pytest.fixture(scope="module")
@@ -24,6 +26,13 @@ def postgres_dsn(
     dbname = request.module.__name__.rsplit(".", 1)[-1].removeprefix("test_")
     with ephemeral_postgres(tmp_path_factory, dbname) as dsn:
         yield dsn
+
+
+@pytest.fixture
+async def pool(postgres_dsn: str) -> AsyncIterator[asyncpg.Pool]:
+    """asyncpg pool on the module's database, closed after the test."""
+    async with db_pool(postgres_dsn) as pool:
+        yield pool
 
 
 @pytest.fixture
