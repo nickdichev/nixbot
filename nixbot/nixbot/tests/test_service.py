@@ -803,7 +803,7 @@ def test_rerun_resumes_building_rows_and_keeps_finished(
     async def all_valid(paths: list[str]) -> set[str]:
         return set(paths)
 
-    monkeypatch.setattr("nixbot.service.check_store_paths", all_valid)
+    monkeypatch.setattr("nixbot.restarts.check_store_paths", all_valid)
 
     async def run() -> None:
         service, _app = await build_service(

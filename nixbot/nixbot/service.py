@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from . import discovery
+from . import discovery, restarts
 from .config import ScheduleWhen
 from .db import BuildStatus
 from .effects import EffectsContext, effects_context
@@ -27,13 +27,13 @@ from .gitrepo import (
     StaticCredentialsProvider,
 )
 from .recovery import (
-    check_store_paths,
     cleanup_old_builds,
     cleanup_orphan_log_dirs,
     fail_interrupted_effects,
     find_unfinished_builds,
     settle_already_built,
 )
+from .repos import repo_info
 from .scheduled import (
     DueEffect,
     ScheduledEffectsStore,
@@ -58,8 +58,7 @@ if TYPE_CHECKING:
     from .forge import GiteaClient, GitHubAppClient, GitlabClient
     from .orchestrator import Orchestrator
     from .polling import PolledRepository
-    from .recovery import ResumableBuild
-    from .repos import RepoRecord, RepoStore
+    from .repos import RepoStore
     from .scheduler import AttributeResult
 
 logger = logging.getLogger(__name__)
@@ -95,19 +94,6 @@ class PullBasedCredentialsProvider:
             ssh_private_key_file=repo.ssh_private_key_file,
             ssh_known_hosts_file=repo.ssh_known_hosts_file,
         )
-
-
-def repo_info(record: RepoRecord) -> RepoInfo:
-    return RepoInfo(
-        id=record.id,
-        key=f"{record.forge}/{record.owner}/{record.name}",
-        name=f"{record.owner}/{record.name}",
-        owner=record.owner,
-        repo=record.name,
-        forge=record.forge,
-        clone_url=record.url,
-        default_branch=record.default_branch,
-    )
 
 
 MAX_REPORT_ATTEMPTS = 5
@@ -210,7 +196,7 @@ class CIService:
     # rows started after this are live deploys, not crash leftovers.
     _started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
-    def _credentials_provider(self, forge: str) -> CredentialsProvider:
+    def credentials_provider(self, forge: str) -> CredentialsProvider:
         return self.credentials_providers.get(forge, _STATIC_CREDENTIALS)
 
     def _spawn(self, coro: Coroutine[None, None, object]) -> asyncio.Task:
@@ -268,7 +254,7 @@ class CIService:
         ):
             return
         info = repo_info(project)
-        credentials = await self._credentials_provider(info.forge).get(info.clone_url)
+        credentials = await self.credentials_provider(info.forge).get(info.clone_url)
         event = ChangeEvent(
             repo=info,
             branch=change.branch,
@@ -345,12 +331,12 @@ class CIService:
         if item.kind == "change":
             await self._process_change(ChangeRequest(**payload))
         elif item.kind == "restart":
-            await self._restart(payload["build_id"], payload.get("attr"))
+            await restarts.restart(self, payload["build_id"], payload.get("attr"))
         elif item.kind == "rerun":
             # Crash recovery: resume pending attributes, no reset.
             await self._rerun(payload["build_id"])
         elif item.kind == "effects":
-            await self._restart_effects(payload["build_id"])
+            await restarts.restart_effects(self, payload["build_id"])
         elif item.kind == "effect":
             await self._run_effect_item(payload["build_id"], payload["name"])
         elif item.kind == "report":
@@ -430,7 +416,7 @@ class CIService:
         if project is None:
             return
         info = repo_info(project)
-        credentials = await self._credentials_provider(info.forge).get(info.clone_url)
+        credentials = await self.credentials_provider(info.forge).get(info.clone_url)
         try:
             await self.orchestrator.run_effect_item(info, build, name, credentials)
         except Exception as e:
@@ -447,7 +433,7 @@ class CIService:
         if project is None or not project.enabled:
             return
         info = repo_info(project)
-        credentials = await self._credentials_provider(info.forge).get(info.clone_url)
+        credentials = await self.credentials_provider(info.forge).get(info.clone_url)
         await self.orchestrator.repos.fetch(
             info.key, info.clone_url, ["+refs/heads/*:refs/heads/*"], credentials
         )
@@ -471,159 +457,8 @@ class CIService:
         finally:
             await self.orchestrator.repos.remove_worktree(worktree)
 
-    async def _restart_effects(self, build_id: int) -> None:
-        if build_id in self.orchestrator.cancel_events:
-            return  # build (or an effects rerun) still running
-        build = await self.orchestrator.db.get_build(build_id)
-        if build is None or build.status != "succeeded":
-            return  # effects only ever run after a successful build
-        project = await self.repo_store.by_id(build.project_id)
-        if project is None:
-            return
-        info = repo_info(project)
-        credentials = await self._credentials_provider(info.forge).get(info.clone_url)
-        await self.orchestrator.rerun_effects(info, build, credentials)
-
-    async def _restart(self, build_id: int, attr: str | None) -> None:
-        """Reset attributes (one or all) and re-run only the pending jobs
-        from the stored eval results — no re-eval."""
-        if build_id in self.orchestrator.cancel_events:
-            return  # still running; a restart would double-build
-        if await self.orchestrator.db.get_build(build_id) is None:
-            return
-        if attr is not None:
-            # A stale attr (e.g. after a re-eval renamed it) must not
-            # reset the build row and spawn an empty rerun.
-            known = await self.pool.fetchval(
-                "SELECT 1 FROM build_attributes WHERE build_id = $1 AND attr = $2",
-                build_id,
-                attr,
-            )
-            if known is None:
-                logger.warning(
-                    "restart of unknown attribute ignored",
-                    extra={"build_id": build_id, "attr": attr},
-                )
-                return
-        # An explicit rebuild clears cached failures so the attributes
-        # actually build again instead of re-skipping.
-        await self.pool.execute(
-            "DELETE FROM failed_builds WHERE project_id = "
-            "(SELECT project_id FROM builds WHERE id = $1) "
-            "AND derivation IN "
-            "(SELECT drv_path FROM build_attributes "
-            "WHERE build_id = $1 AND ($2::text IS NULL OR attr = $2))",
-            build_id,
-            attr,
-        )
-        await self.pool.execute(
-            "UPDATE build_attributes SET status = 'pending', error = NULL, "
-            "started_at = NULL, finished_at = NULL "
-            "WHERE build_id = $1 AND ($2::text IS NULL OR attr = $2)",
-            build_id,
-            attr,
-        )
-        if attr is None:
-            # A full restart re-runs effects; a partial rebuild must
-            # not re-deploy.
-            await self.pool.execute(
-                "UPDATE builds SET effects_started = FALSE WHERE id = $1", build_id
-            )
-            await self.pool.execute(
-                "UPDATE build_effects SET status = 'pending', error = NULL, "
-                "finished_at = NULL, log_path = NULL, log_size = 0, "
-                "log_truncated = FALSE WHERE build_id = $1",
-                build_id,
-            )
-        # Queued, not started: the rerun decides whether this becomes
-        # a re-eval (evaluating) or an attribute rerun (building).
-        # Clearing finished_at keeps retention cleanup off a build
-        # that is about to rerun; clearing error/eval_warnings keeps
-        # a stale failure banner off a restart that succeeds.
-        await self.pool.execute(
-            "UPDATE builds SET status = 'pending', error = NULL, "
-            "eval_warnings = NULL, started_at = NULL, finished_at = NULL "
-            "WHERE id = $1",
-            build_id,
-        )
-        await self._rerun(build_id)
-
     async def _rerun(self, build_id: int) -> None:
-        # Serialized by the work queue's per-build dedup key.
-        build = await self.orchestrator.db.get_build(build_id)
-        if build is None:
-            return
-        project = await self.repo_store.by_id(build.project_id)
-        if project is None:
-            return
-        info = repo_info(project)
-        credentials = await self._credentials_provider(info.forge).get(info.clone_url)
-        results = await find_unfinished_builds(self.pool, build_id=build_id)
-        resumable = results[0] if results else None
-        if resumable is None:
-            return
-        unfinished_count = await self.pool.fetchval(
-            "SELECT count(*) FROM build_attributes "
-            "WHERE build_id = $1 AND status IN ('pending', 'building')",
-            build_id,
-        )
-        if (
-            # A crash mid-eval leaves a partial attribute set; resuming
-            # it would report success for an incomplete build.
-            build.status != "evaluating"
-            and resumable.has_attributes
-            and len(resumable.pending_jobs) == unfinished_count
-        ):
-            # Stored drv paths may have been garbage-collected since
-            # the eval; rerunning them would fail with "path does not
-            # exist" instead of rebuilding.
-            drvs = [job.drv_path for job in resumable.pending_jobs]
-            valid = await check_store_paths(drvs)
-            if all(drv in valid for drv in drvs):
-                await self.orchestrator.rerun_pending_attributes(
-                    info, build, resumable.pending_jobs, credentials
-                )
-                return
-            logger.info(
-                "stored derivations missing from the store; re-evaluating",
-                extra={"build_id": build_id},
-            )
-        # No resumable eval results (no attribute rows, or unfinished
-        # rows without drv_path): an empty rerun would aggregate to
-        # "succeeded" without building anything; re-evaluate instead.
-        try:
-            await self._reeval(info, build, credentials)
-        except Exception:
-            logger.exception("re-evaluation failed", extra={"build_id": build_id})
-            await self.orchestrator.db.set_build_status(
-                build_id,
-                BuildStatus.FAILED,
-                error="re-evaluation failed; see service logs",
-            )
-            await self._report_interrupted(resumable)
-
-    async def _reeval(
-        self,
-        info: RepoInfo,
-        build: BuildRecord,
-        credentials: FetchCredentials | None,
-    ) -> None:
-        try:
-            async with self.orchestrator.rerun_worktree(
-                info, build, "rerun", credentials
-            ) as (event, worktree_path):
-                # Stale rows (e.g. failed_eval with NULL drv_path) would
-                # wedge the aggregate; the re-eval rewrites them. Finished
-                # rows with a drv_path are kept: their results are valid
-                # and the re-eval skips already-built attributes.
-                await self.pool.execute(
-                    "DELETE FROM build_attributes WHERE build_id = $1 "
-                    "AND (status IN ('pending', 'building') OR drv_path IS NULL)",
-                    build.id,
-                )
-                await self.orchestrator.run_build(event, build, worktree_path)
-        finally:
-            self.orchestrator.cancel_events.pop(build.id, None)
+        await restarts.rerun(self, build_id)
 
     async def recover_unfinished_builds(self) -> None:
         """Crash recovery: settle already-built attributes, then queue
@@ -636,7 +471,7 @@ class CIService:
             )
             if settled:
                 # Recovered results still need gcroots/outputs updates.
-                event = await self._change_event_for(resumable)
+                event = await restarts.change_event_for(self, resumable)
                 if event is not None:
                     await self.orchestrator.post_process_skipped(event, settled)
             logger.info(
@@ -648,31 +483,6 @@ class CIService:
                 f"build-{resumable.build_id}",
                 {"build_id": resumable.build_id},
             )
-
-    async def _change_event_for(self, resumable: ResumableBuild) -> ChangeEvent | None:
-        project = await self.repo_store.by_id(resumable.project_id)
-        if project is None:
-            return None
-        return ChangeEvent(
-            repo=repo_info(project),
-            branch=resumable.branch,
-            commit_sha=resumable.commit_sha,
-            pr_number=resumable.pr_number,
-        )
-
-    async def _report_interrupted(self, resumable: ResumableBuild) -> None:
-        """Post the failure to the forge; otherwise the commit status
-        stays pending forever after an interrupted evaluation."""
-        build = await self.orchestrator.db.get_build(resumable.build_id)
-        event = await self._change_event_for(resumable)
-        if build is None or event is None:
-            return
-        await self.orchestrator.reporter.eval_finished(
-            event, build, success=False, warnings=[]
-        )
-        await self.orchestrator.reporter.build_finished(
-            event, build, BuildStatus.FAILED, build.status_generation, []
-        )
 
     async def cancel_attribute(self, build_id: int, attr: str) -> None:
         event = self.orchestrator.attr_cancel_events.get((build_id, attr))
@@ -832,7 +642,7 @@ class CIService:
     async def _run_scheduled_inner(
         self, due: DueEffect, info: RepoInfo, run_id: int
     ) -> bool:
-        credentials = await self._credentials_provider(info.forge).get(info.clone_url)
+        credentials = await self.credentials_provider(info.forge).get(info.clone_url)
         await self.orchestrator.repos.fetch(
             info.key, info.clone_url, ["+refs/heads/*:refs/heads/*"], credentials
         )
