@@ -11,15 +11,13 @@ without coupling.
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
-from . import build_run, effects_run, gcroots, outputs, reruns
+from . import build_reuse, build_run, effects_run, gcroots, outputs, reruns
 from .canceller import (
     CancellationManager,
     RegisterOutcome,
@@ -30,7 +28,7 @@ from .db import BuildStatus
 from .effects_state import TaskTokens
 from .events import ChangeEvent, NullStatusReporter, RepoInfo, StatusReporter
 from .executor import LogWriter
-from .gitrepo import GitError, MergeConflictError, pr_refspec, run_git
+from .gitrepo import MergeConflictError, pr_refspec
 from .web.logs import LogRegistry
 from .work_queue import WorkQueue
 
@@ -209,15 +207,16 @@ class Orchestrator:
         incoming_stale = False
         running_commit = self.canceller.running_commit_for(repo.id, key)
         if running_commit is not None and running_commit != event.commit_sha:
-            incoming_stale = await self._is_ancestor(
-                repo.key, event.commit_sha, running_commit
+            incoming_stale = await build_reuse.is_ancestor(
+                self, repo.key, event.commit_sha, running_commit
             )
 
         if not created and build.status in (
             BuildStatus.SUCCEEDED,
             BuildStatus.FAILED,
         ):
-            await self._reuse_terminal_build(
+            await build_reuse.reuse_terminal_build(
+                self,
                 event,
                 build,
                 key,
@@ -255,7 +254,7 @@ class Orchestrator:
                 )
             return
         if not rebuild:
-            await self._attach_linked_event(event, build)
+            await build_reuse.attach_linked_event(self, event, build)
             return
         try:
             await self.run_build(event, build, worktree_path, credentials)
@@ -358,43 +357,6 @@ class Orchestrator:
             await writer.close()
             self.log_registry.unregister(build_id, key)
 
-    async def _attach_linked_event(
-        self, event: ChangeEvent, build: BuildRecord
-    ) -> None:
-        """In-flight (or recovering) build shared with another context:
-        attach for the final status fan-out."""
-        self.linked_events.setdefault(build.id, []).append(event)
-        await self.reporter.build_started(event, build)
-        # The build may have turned terminal between the record fetch
-        # and the attach: the final fan-out already happened and would
-        # never cover this event. Replay the final status instead.
-        current = await self.db.get_build(build.id)
-        if current is not None and current.status in BuildStatus.TERMINAL:
-            with contextlib.suppress(KeyError, ValueError):
-                self.linked_events[build.id].remove(event)
-            await self._replay_terminal_status(event, current)
-
-    async def _replay_terminal_status(
-        self, event: ChangeEvent, build: BuildRecord
-    ) -> None:
-        """Re-post the final eval and build statuses of an already
-        terminal build for a new context; without this the context's
-        nix-eval/nix-build checks stay pending forever. A succeeded
-        build with zero attributes is a genuine empty-but-green eval,
-        not an eval failure."""
-        if build.status == BuildStatus.CANCELLED:
-            await self.reporter.eval_cancelled(event, build)
-        else:
-            eval_success = build.status == BuildStatus.SUCCEEDED or bool(
-                await self.db.get_attribute_statuses(build.id)
-            )
-            await self.reporter.eval_finished(
-                event, build, success=eval_success, warnings=[]
-            )
-        await self.reporter.build_finished(
-            event, build, build.status, build.status_generation, []
-        )
-
     async def finish_linked(
         self,
         build: BuildRecord,
@@ -406,124 +368,13 @@ class Orchestrator:
     ) -> None:
         """Final status fan-out for second contexts attached to this
         build; eval_success is None when no eval result exists."""
-        for linked in self.linked_events.pop(build.id, []):
-            if eval_success is not None:
-                await self.reporter.eval_finished(
-                    linked, build, success=eval_success, warnings=[]
-                )
-            elif status == BuildStatus.CANCELLED:
-                # Cancel during eval: the linked contexts' nix-eval
-                # status would otherwise stay pending forever.
-                await self.reporter.eval_cancelled(linked, build)
-            await self.reporter.build_finished(
-                linked, build, status, generation, results
-            )
-
-    async def _is_ancestor(
-        self, project_key: str, ancestor: str, descendant: str
-    ) -> bool:
-        try:
-            await run_git(
-                ["merge-base", "--is-ancestor", ancestor, descendant],
-                cwd=self.repos.clone_path(project_key),
-            )
-        except GitError:
-            return False
-        return True
-
-    async def _reuse_terminal_build(  # noqa: PLR0913
-        self,
-        event: ChangeEvent,
-        build: BuildRecord,
-        key: str,
-        tree_hash: str,
-        *,
-        worktree_path: Path,
-        credentials: FetchCredentials | None,
-        incoming_stale: bool,
-    ) -> None:
-        """Same content already built in another context: only report
-        the existing result for this context. Still register so an
-        in-flight build of this context's previous content is
-        superseded, and a push reusing a PR build gets its
-        gcroots/outputs updates."""
-        logger.info(
-            "reusing build for tree hash",
-            extra={"build_id": build.id, "tree_hash": tree_hash},
+        await build_reuse.finish_linked(
+            self, build, status, generation, results, eval_success=eval_success
         )
-        outcome = self.canceller.register(
-            event.repo.id,
-            key,
-            build.id,
-            tree_hash,
-            event.commit_sha,
-            asyncio.Event(),
-            incoming_is_ancestor_of_running=incoming_stale,
-        )
-        if outcome == RegisterOutcome.STALE:
-            # Redelivered out-of-order event: superseding the in-flight
-            # newer build with this old result would cancel it.
-            return
-        self.canceller.complete(build.id)
-        if build.status == BuildStatus.SUCCEEDED:
-            # Guarded like in-build post-processing: a gcroots/outputs
-            # failure must not strand this context without a status.
-            try:
-                await self._post_process_existing(event, build)
-                # A build that ran as a PR never started effects, so a
-                # default-branch push reusing it must still deploy; the
-                # effects_started flag prevents re-deploys.
-                await self.maybe_run_effects(event, build, worktree_path, credentials)
-                await self.refresh_schedules(event)
-            except Exception:
-                logger.exception(
-                    "post-processing reused build failed",
-                    extra={"build_id": build.id},
-                )
-        await self._replay_terminal_status(event, build)
-
-    async def _post_process_existing(
-        self, event: ChangeEvent, build: BuildRecord
-    ) -> None:
-        """Gcroots/outputs updates for a context reusing an already
-        succeeded build (e.g. default-branch push reusing a PR build)."""
-        rows = await self.db.pool.fetch(
-            "SELECT attr, outputs FROM build_attributes "
-            "WHERE build_id = $1 AND status IN ('succeeded', 'skipped_local')",
-            build.id,
-        )
-        pairs = []
-        for row in rows:
-            out = (json.loads(row["outputs"]) if row["outputs"] else {}).get("out")
-            if out:
-                pairs.append((row["attr"], out))
-        await self.post_process_skipped(event, pairs)
 
     async def post_process_skipped(
         self, event: ChangeEvent, skipped: list[tuple[str, str]]
     ) -> None:
-        branches = self.config.branches
-        repo = event.repo
-        if event.pr_number is not None:
-            return  # push events only, matching current behavior
-        for attr, out_path in skipped:
-            if not out_path:
-                continue
-            # Forge-scoped paths: the same owner/repo on two forges
-            # must not share gc-roots or outputs files.
-            if branches.do_register_gcroot(repo.default_branch, event.branch):
-                await self.register_gcroot(
-                    self.config.gcroots_dir, repo.key, attr, out_path
-                )
-            if self.config.outputs_path is not None and branches.do_update_outputs(
-                repo.default_branch, event.branch
-            ):
-                self.write_output_path(
-                    self.config.outputs_path,
-                    repo.forge,
-                    repo.owner,
-                    repo.repo,
-                    event.branch,
-                    attr,
-                    out_path,
-                )
+        """Gcroots/outputs updates for built or skipped-as-local
+        attributes (push events only)."""
+        await build_reuse.post_process_skipped(self, event, skipped)
