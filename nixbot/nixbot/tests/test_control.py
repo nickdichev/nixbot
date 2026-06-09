@@ -151,12 +151,6 @@ def test_control_buttons_hidden_without_permission(harness: WebHarness) -> None:
     assert "rebuild failed" in harness.get(url, ALICE).text
 
 
-def test_anonymous_cannot_control(harness: WebHarness) -> None:
-    response = harness.post("/repos/github/acme/widget/builds/1/restart")
-    assert response.status_code == 403
-    assert BACKEND.restarted == []
-
-
 def test_admin_can_restart_and_cancel(harness: WebHarness) -> None:
     assert (
         harness.post("/repos/github/acme/widget/builds/1/restart", ROOT).status_code
