@@ -10,12 +10,13 @@ import secrets
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import asyncpg
 import httpx
 
 from nixbot.auth import SessionSigner
+from nixbot.config import Config
 from nixbot.migrations import apply_migrations
 from nixbot.web.app import WebContext, create_app
 
@@ -29,6 +30,17 @@ if TYPE_CHECKING:
     from nixbot.auth import User
 
 from nixbot.models import CacheStatus, NixEvalJobSuccess
+
+
+def make_config(dsn: str, state_dir: Path, **kwargs: Any) -> Config:
+    """A minimal valid Config for service-level tests."""
+    return Config(
+        db_url=dsn,
+        build_systems=["x86_64-linux"],
+        url="http://ci.test",
+        state_dir=state_dir,
+        **kwargs,
+    )
 
 
 def mk_job(

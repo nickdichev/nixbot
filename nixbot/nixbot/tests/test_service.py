@@ -17,7 +17,6 @@ import pytest
 
 from nixbot.bootstrap import _startup, build_service, run_service
 from nixbot.config import (
-    Config,
     PullBasedConfig,
     PullBasedRepository,
     resolve_credential_path,
@@ -28,19 +27,9 @@ from nixbot.scheduled import DueEffect, ScheduleWhen
 from nixbot.service import scheduled_worktree_id
 from nixbot.webhooks import ChangeRequest, PrClosed
 
-from .support import git, insert_build, insert_project
+from .support import git, insert_build, insert_project, make_config
 
 pytestmark = pytest.mark.usefixtures("fresh_work_queue")
-
-
-def make_config(dsn: str, state_dir: Path, **kwargs: Any) -> Config:
-    return Config(
-        db_url=dsn,
-        build_systems=["x86_64-linux"],
-        url="http://ci.test",
-        state_dir=state_dir,
-        **kwargs,
-    )
 
 
 @pytest.fixture

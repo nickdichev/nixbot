@@ -12,23 +12,15 @@ import httpx
 from fastapi import FastAPI
 
 from nixbot.bootstrap import _serve, _uvicorn_configs, register_oidc_with_retry
-from nixbot.config import Config, OIDCConfig
+from nixbot.config import OIDCConfig
+
+from .support import make_config
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
 
     from nixbot.auth import OAuthProvider
-
-
-def make_config(state_dir: Path, **kwargs: Any) -> Config:
-    return Config(
-        db_url="postgresql://x",
-        build_systems=["x86_64-linux"],
-        url="http://ci.test",
-        state_dir=state_dir,
-        **kwargs,
-    )
 
 
 async def _app(scope: Any, receive: Any, send: Any) -> None:
@@ -87,14 +79,19 @@ def test_oidc_retry_registers_provider_after_transient_failure(
 def test_unix_socket_skips_tcp_listener(tmp_path: Path) -> None:
     """With an nginx front over a unix socket, a 0.0.0.0 TCP listener
     is a plaintext bypass of the TLS proxy."""
-    config = make_config(tmp_path, http_unix_socket=tmp_path / "web.sock")
+    config = make_config(
+        "postgresql://x", tmp_path, http_unix_socket=tmp_path / "web.sock"
+    )
     configs = _uvicorn_configs(config, app=_app)
     assert [c.uds for c in configs] == [str(tmp_path / "web.sock")]
 
 
 def test_explicit_listen_flag_keeps_both(tmp_path: Path) -> None:
     config = make_config(
-        tmp_path, http_unix_socket=tmp_path / "web.sock", http_listen=True
+        "postgresql://x",
+        tmp_path,
+        http_unix_socket=tmp_path / "web.sock",
+        http_listen=True,
     )
     configs = _uvicorn_configs(config, app=_app)
     assert len(configs) == 2
@@ -117,7 +114,9 @@ def test_lifespan_runs_once_with_two_listeners(tmp_path: Path) -> None:
 
     app = FastAPI(lifespan=lifespan)
     sock = tmp_path / "web.sock"
-    config = make_config(tmp_path, http_unix_socket=sock, http_listen=True)
+    config = make_config(
+        "postgresql://x", tmp_path, http_unix_socket=sock, http_listen=True
+    )
     config.http_port = 0  # ephemeral TCP port
 
     async def run() -> None:
