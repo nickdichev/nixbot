@@ -85,16 +85,11 @@ class FakeCache:
         self.added.append((drv_path, url))
 
 
-def gitea_client(
-    handler: Callable[[httpx.Request], httpx.Response],
-    *,
-    base_url: str = "https://gitea.example.com",
-    token: str = "tkn",  # noqa: S107 (test credential)
-) -> GiteaClient:
+def gitea_client(handler: Callable[[httpx.Request], httpx.Response]) -> GiteaClient:
     """GiteaClient backed by an httpx mock transport."""
     return GiteaClient(
-        base_url,
-        token,
+        "https://gitea.example.com",
+        "tkn",
         http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
 
@@ -124,20 +119,18 @@ class FakeGitea:
         topics: dict[str, list[str]] | None = None,
         hooks: list[dict] | None = None,
         delete_status: int = 204,
-        token: str = "tkn",  # noqa: S107 (test credential)
     ) -> None:
         self.repos = repos or []
         self.topics = topics or {}
         self.hooks = hooks or []
         self.delete_status = delete_status
-        self.token = token
         self.created: list[dict] = []
         self.deleted: list[str] = []
         self.patched: list[tuple[str, dict]] = []
         self.topics_requests = 0
 
     def handler(self, request: httpx.Request) -> httpx.Response:  # noqa: PLR0911
-        assert request.headers["Authorization"] == f"token {self.token}"
+        assert request.headers["Authorization"] == "token tkn"
         path = request.url.path
         if path == "/api/v1/user/repos":
             page = int(request.url.params["page"])
@@ -151,8 +144,6 @@ class FakeGitea:
             return httpx.Response(200, json=self.hooks if page == 1 else [])
         if request.method == "DELETE":
             self.deleted.append(path.rsplit("/", 1)[-1])
-            if self.delete_status >= 400:  # noqa: PLR2004
-                return httpx.Response(self.delete_status, text="boom")
             return httpx.Response(self.delete_status)
         if request.method == "PATCH":
             self.patched.append((path.rsplit("/", 1)[-1], json.loads(request.content)))
@@ -163,25 +154,23 @@ class FakeGitea:
         return httpx.Response(404)
 
     def client(self) -> GiteaClient:
-        return gitea_client(self.handler, token=self.token)
+        return gitea_client(self.handler)
 
 
 class FakeGitlab:
-    """Minimal GitLab API fake: project list and a mutable hooks store
-    recording create/update calls."""
+    """Minimal GitLab API fake: project list and a hooks store
+    recording created hooks."""
 
     def __init__(
         self,
         projects: list[dict] | None = None,
         *,
-        hooks: list[dict] | None = None,
         token: str = "tkn",  # noqa: S107 (test credential)
     ) -> None:
         self.projects = projects or []
-        self.hooks = hooks or []
+        self.hooks: list[dict] = []
         self.token = token
         self.created: list[dict] = []
-        self.updated: list[tuple[str, dict]] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         assert request.headers["PRIVATE-TOKEN"] == self.token
@@ -193,9 +182,6 @@ class FakeGitlab:
         if path.endswith("/hooks") and request.method == "POST":
             self.created.append(json.loads(request.content))
             return httpx.Response(201, json={})
-        if request.method == "PUT":
-            self.updated.append((path.rsplit("/", 1)[-1], json.loads(request.content)))
-            return httpx.Response(200, json={})
         return httpx.Response(404)
 
     def client(self, *, base_url: str = "https://gitlab.example.com") -> GitlabClient:
