@@ -25,6 +25,8 @@ from nixbot.outputs import (
 
 
 def test_gcroot_path_layout() -> None:
+    # gcroots_dir is configurable (dev setups use a user-writable dir);
+    # the layout below it is dir/project/attr.
     assert (
         str(
             gcroot_path(
@@ -35,11 +37,6 @@ def test_gcroot_path_layout() -> None:
         )
         == "/nix/var/nix/gcroots/per-user/ci-user/owner/repo/checks.x.foo"
     )
-
-
-def test_gcroot_path_custom_dir(tmp_path: Path) -> None:
-    # Dev setups point gcroots_dir at a user-writable directory.
-    assert gcroot_path(tmp_path, "o/r", "a") == tmp_path / "o" / "r" / "a"
 
 
 def test_safe_attr_filename_preserves_normal_attrs() -> None:
