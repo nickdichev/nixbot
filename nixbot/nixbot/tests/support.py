@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
 
     from nixbot.auth import User
+    from nixbot.scheduler import CachedFailure
 
 from nixbot.models import CacheStatus, NixEvalJobSuccess
 
@@ -68,6 +69,20 @@ def mk_job(
         outputs={"out": out or f"/nix/store/{attr}-out"},
         system=system,
     )
+
+
+class FakeCache:
+    """Failed-build cache fake: configurable lookups, records adds."""
+
+    def __init__(self, entries: dict[str, CachedFailure] | None = None) -> None:
+        self.entries = entries or {}
+        self.added: list[tuple[str, str]] = []
+
+    async def check(self, drv_path: str) -> CachedFailure | None:
+        return self.entries.get(drv_path)
+
+    async def add(self, drv_path: str, url: str) -> None:
+        self.added.append((drv_path, url))
 
 
 def gitea_client(

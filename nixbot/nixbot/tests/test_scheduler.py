@@ -24,7 +24,7 @@ from nixbot.scheduler import (
     sort_jobs_by_closures,
 )
 
-from .support import mk_job
+from .support import FakeCache, mk_job
 
 SYSTEM = "x86_64-linux"
 
@@ -40,18 +40,6 @@ class FakeExecutor:
         self.built.append(job.attr)
         await asyncio.sleep(0)
         return self.outcomes.get(job.attr, BuildOutcome.success)
-
-
-class FakeCache:
-    def __init__(self, entries: dict[str, CachedFailure] | None = None) -> None:
-        self.entries = entries or {}
-        self.added: list[tuple[str, str]] = []
-
-    async def check(self, drv_path: str) -> CachedFailure | None:
-        return self.entries.get(drv_path)
-
-    async def add(self, drv_path: str, url: str) -> None:
-        self.added.append((drv_path, url))
 
 
 def run_scheduler(scheduler: JobScheduler, jobs: list) -> ScheduleResult:

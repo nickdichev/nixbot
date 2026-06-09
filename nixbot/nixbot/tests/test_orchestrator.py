@@ -32,7 +32,7 @@ from nixbot.scheduler import (
 )
 from nixbot.work_queue import WorkQueue
 
-from .support import git, insert_project, mk_job
+from .support import FakeCache, git, insert_project, mk_job
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -113,19 +113,6 @@ class FakeExecutor:
             await self.gate.wait()
         await log_writer.write(b"fake build output\n")
         return self.outcomes.get(job.attr, BuildOutcome.success)
-
-
-class RecordingCache:
-    """Failed-build cache fake recording added drv paths."""
-
-    def __init__(self) -> None:
-        self.added: list[str] = []
-
-    async def check(self, drv_path: str) -> None:
-        return None
-
-    async def add(self, drv_path: str, url: str) -> None:
-        self.added.append(drv_path)
 
 
 @dataclass
@@ -629,7 +616,7 @@ def test_internal_error_not_recorded_in_failed_build_cache(
             CrashingExecutor(),
             "crash",
         )
-        cache = RecordingCache()
+        cache = FakeCache()
         orchestrator.failed_build_cache = lambda _project_id: cache  # type: ignore[assignment]
         orchestrator.config = orchestrator.config.model_copy(
             update={"cache_failed_builds": True}
@@ -795,7 +782,7 @@ def test_recovery_rerun_failures_not_cached(
             FakeExecutor(outcomes={"a": BuildOutcome.failure}),
             "recov",
         )
-        cache = RecordingCache()
+        cache = FakeCache()
         orchestrator.failed_build_cache = lambda _project_id: cache  # type: ignore[assignment]
         orchestrator.config = orchestrator.config.model_copy(
             update={"cache_failed_builds": True}
