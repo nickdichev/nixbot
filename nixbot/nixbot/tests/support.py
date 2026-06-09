@@ -21,7 +21,7 @@ from nixbot.migrations import apply_migrations
 from nixbot.web.app import WebContext, create_app
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine, Iterator
+    from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
     from pathlib import Path
 
     import pytest
@@ -65,6 +65,16 @@ def mk_job(
         outputs={"out": out or f"/nix/store/{attr}-out"},
         system=system,
     )
+
+
+@contextlib.asynccontextmanager
+async def db_pool(dsn: str, **kwargs: Any) -> AsyncIterator[asyncpg.Pool]:
+    """asyncpg pool that is closed on exit."""
+    pool = await asyncpg.create_pool(dsn, **kwargs)
+    try:
+        yield pool
+    finally:
+        await pool.close()
 
 
 def cookie_header(cookies: dict[str, str]) -> dict[str, str]:

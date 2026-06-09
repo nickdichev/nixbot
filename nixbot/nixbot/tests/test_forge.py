@@ -12,7 +12,6 @@ import shutil
 import subprocess
 from typing import TYPE_CHECKING
 
-import asyncpg
 import httpx
 import pytest
 
@@ -40,7 +39,7 @@ from nixbot.status import (
     StatusState,
 )
 
-from .support import insert_build, insert_project
+from .support import db_pool, insert_build, insert_project
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -445,8 +444,7 @@ def test_gitea_discovery_null_topics() -> None:
 
 def test_project_store_sync_and_legacy_import(postgres_dsn: str) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             store = RepoStore(pool)
             repos = [
                 repo("acme", "tagged", topics=("build-with-buildbot",)),
@@ -484,8 +482,6 @@ def test_project_store_sync_and_legacy_import(postgres_dsn: str) -> None:
                 "renamed",
                 "later",
             }
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -495,8 +491,7 @@ def test_legacy_import_runs_despite_pull_based_rows(postgres_dsn: str) -> None:
     must not suppress the one-shot legacy topic import."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             await pool.execute("TRUNCATE projects CASCADE")
             store = RepoStore(pool)
             await store.sync_pull_based([("pull/one", "https://x/one.git", "main")])
@@ -506,8 +501,6 @@ def test_legacy_import_runs_despite_pull_based_rows(postgres_dsn: str) -> None:
             )
             enabled = {p.name for p in await store.enabled_repos()}
             assert "tagged" in enabled
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -516,8 +509,7 @@ def test_legacy_import_scopes_topics_per_forge(postgres_dsn: str) -> None:
     """Each forge's configured topic only enables that forge's repos."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             await pool.execute("TRUNCATE projects CASCADE")
             store = RepoStore(pool)
             gitea_repo = DiscoveredRepo(
@@ -537,8 +529,6 @@ def test_legacy_import_scopes_topics_per_forge(postgres_dsn: str) -> None:
             enabled = {p.name for p in await store.enabled_repos()}
             assert "gt" in enabled
             assert "cross" not in enabled
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -549,8 +539,7 @@ def test_project_store_sync_skips_unchanged_rows(postgres_dsn: str) -> None:
     updates churn WAL and autovacuum on otherwise idle databases."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             store = RepoStore(pool)
             repos = [repo("acme", "stable"), repo("acme", "other")]
             await store.sync_discovered(repos)
@@ -576,8 +565,6 @@ def test_project_store_sync_skips_unchanged_rows(postgres_dsn: str) -> None:
             )
             assert row is not None
             assert row["default_branch"] == "develop"
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -616,8 +603,7 @@ def test_gitea_hook_registration(postgres_dsn: str) -> None:
         return httpx.Response(404)
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(
                 pool, forge="gitea", forge_repo_id="hook-1"
             )
@@ -669,8 +655,6 @@ def test_gitea_hook_registration(postgres_dsn: str) -> None:
             hook_id, patch_body = patched[0]
             assert hook_id == "9"
             assert patch_body["config"]["secret"] == secret
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -701,8 +685,7 @@ def test_gitlab_heads_carry_target_branch_base(postgres_dsn: str) -> None:
         return httpx.Response(404)
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             await insert_project(
                 pool, "glrecon", forge="gitlab", forge_repo_id="glrecon-1"
             )
@@ -716,8 +699,6 @@ def test_gitlab_heads_carry_target_branch_base(postgres_dsn: str) -> None:
             heads = await gitlab_heads(client, project)
             mr_head = next(h for h in heads if h.pr_number == 5)
             assert mr_head.base_sha == "refs/heads/main"
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -738,8 +719,7 @@ def test_gitea_heads_encode_slashed_default_branch(postgres_dsn: str) -> None:
         return httpx.Response(404)
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             await insert_project(
                 pool,
                 "slashy",
@@ -756,8 +736,6 @@ def test_gitea_heads_encode_slashed_default_branch(postgres_dsn: str) -> None:
             )
             heads = await gitea_heads(client, project)
             assert [h.commit_sha for h in heads] == ["head-rel"]
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -791,8 +769,7 @@ def test_reconcile_unbuilt_heads(postgres_dsn: str) -> None:
         return httpx.Response(404)
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(
                 pool, "recon", forge="gitea", forge_repo_id="recon-1"
             )
@@ -844,8 +821,6 @@ def test_reconcile_unbuilt_heads(postgres_dsn: str) -> None:
             events.clear()
             submitted = await reconcile_repo(pool, project, heads, Sink())
             assert submitted == 0  # main head cancelled, PRs skipped
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -934,8 +909,7 @@ def test_register_repo_hook_without_admin_warns(
         return httpx.Response(404)
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(
                 pool, "locked", forge="gitea", forge_repo_id="hook-403"
             )
@@ -952,8 +926,6 @@ def test_register_repo_hook_without_admin_warns(
                 "locked",
                 "https://ci.example.com",
             )
-        finally:
-            await pool.close()
 
     with caplog.at_level("WARNING"):
         asyncio.run(run())
@@ -1030,8 +1002,7 @@ def test_gitlab_hook_registration(postgres_dsn: str) -> None:
         return httpx.Response(404)
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(
                 pool, forge="gitlab", forge_repo_id="glhook-1"
             )
@@ -1068,8 +1039,6 @@ def test_gitlab_hook_registration(postgres_dsn: str) -> None:
             )
             assert len(created) == 1
             assert updated[0][0] == "9"
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -1084,8 +1053,7 @@ def test_register_repo_hook_500_with_403_in_body_raises(postgres_dsn: str) -> No
         return httpx.Response(404)
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(
                 pool, "err500", forge="gitea", forge_repo_id="hook-500"
             )
@@ -1103,8 +1071,6 @@ def test_register_repo_hook_500_with_403_in_body_raises(postgres_dsn: str) -> No
                     "err500",
                     "https://ci.example.com",
                 )
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -1123,8 +1089,7 @@ def test_gitlab_register_repo_hook_status_classification(
 
     async def run() -> None:
         nonlocal status
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(
                 pool, "glperm", forge="gitlab", forge_repo_id="glhook-403"
             )
@@ -1152,8 +1117,6 @@ def test_gitlab_register_repo_hook_status_classification(
                     "glperm",
                     "https://ci.example.com",
                 )
-        finally:
-            await pool.close()
 
     with caplog.at_level("WARNING"):
         asyncio.run(run())
@@ -1193,8 +1156,7 @@ def test_gitea_legacy_hook_delete_failure_warns(
         return httpx.Response(404)
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(
                 pool, forge="gitea", forge_repo_id="hook-del-1"
             )
@@ -1215,7 +1177,5 @@ def test_gitea_legacy_hook_delete_failure_warns(
             assert any(
                 "failed to remove legacy" in record.message for record in caplog.records
             )
-        finally:
-            await pool.close()
 
     asyncio.run(run())

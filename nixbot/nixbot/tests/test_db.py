@@ -19,7 +19,7 @@ from nixbot.models import CacheStatus
 from nixbot.scheduler import AttributeResult, AttributeStatus
 from nixbot.status import FailedStatusStore
 
-from .support import insert_build, insert_project, mk_job
+from .support import db_pool, insert_build, insert_project, mk_job
 
 
 async def _connect(dsn: str) -> asyncpg.Connection:
@@ -73,8 +73,7 @@ def test_huge_attr_name_does_not_break_notify_trigger(postgres_dsn: str) -> None
     such a row fails."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "hugename")
             build_id = await insert_build(pool, project_id, commit_sha="huge-sha")
             await pool.execute(
@@ -85,8 +84,6 @@ def test_huge_attr_name_does_not_break_notify_trigger(postgres_dsn: str) -> None
             )
             # Other tests assert over the shared builds table.
             await pool.execute("DELETE FROM projects WHERE id = $1", project_id)
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -157,8 +154,7 @@ def test_failed_status_store_component(postgres_dsn: str) -> None:
     mark/upsert/get/clear cycle covers the table semantics."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             store = FailedStatusStore(pool)
             assert await store.get_failed("abc") == set()
             await store.mark_failed("abc", "nix-build")
@@ -169,16 +165,13 @@ def test_failed_status_store_component(postgres_dsn: str) -> None:
             await store.clear("abc", "nix-build")
             assert await store.get_failed("abc") == {"nix-eval"}
             await store.clear("abc", "nix-eval")
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
 
 def test_failed_build_cache_component(postgres_dsn: str) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "cache", forge_repo_id="fb-0")
             cache = PostgresFailedBuildCache(pool, project_id)
             drv = "/nix/store/cache-test.drv"
@@ -194,8 +187,6 @@ def test_failed_build_cache_component(postgres_dsn: str) -> None:
             assert entry is not None
             assert entry.url == "http://ci/b/2"
             assert entry.time >= first_time
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -208,8 +199,7 @@ def test_get_or_create_build_concurrent_no_duplicates(postgres_dsn: str) -> None
     # constraint on (project_id, tree_hash), so without locking two
     # concurrent change events for the same tree create two builds.
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn, min_size=5, max_size=5)
-        try:
+        async with db_pool(postgres_dsn, min_size=5, max_size=5) as pool:
             project_id = await insert_project(pool, "race")
             db = BuildDB(pool)
             results = await asyncio.gather(
@@ -224,8 +214,6 @@ def test_get_or_create_build_concurrent_no_duplicates(postgres_dsn: str) -> None
                 "SELECT count(*) FROM builds WHERE project_id = $1", project_id
             )
             assert count == 1
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -234,8 +222,7 @@ def test_cancelled_build_not_reused(postgres_dsn: str) -> None:
     # A cancelled build carries no verdict; re-pushing the same tree
     # must build again instead of re-reporting "cancelled".
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "cancelled-reuse")
             db = BuildDB(pool)
             first, created = await db.get_or_create_build(
@@ -250,8 +237,6 @@ def test_cancelled_build_not_reused(postgres_dsn: str) -> None:
             )
             assert created
             assert second.id != first.id
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -261,8 +246,7 @@ def test_reuse_backfills_pr_fields(postgres_dsn: str) -> None:
     # tree must backfill pr_number/pr_author so the PR author keeps
     # restart/cancel rights.
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "pr-backfill")
             db = BuildDB(pool)
             first, _ = await db.get_or_create_build(
@@ -285,8 +269,6 @@ def test_reuse_backfills_pr_fields(postgres_dsn: str) -> None:
             )
             assert row["pr_number"] == 7
             assert row["pr_author"] == "github:alice"
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -296,8 +278,7 @@ def test_reuse_by_other_pr_clears_both_identity_fields(postgres_dsn: str) -> Non
     # event must not leave a row mixing PR A's number with no author,
     # nor attach PR B's author to PR A's number.
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "pr-cross")
             db = BuildDB(pool)
             first, _ = await db.get_or_create_build(
@@ -327,8 +308,6 @@ def test_reuse_by_other_pr_clears_both_identity_fields(postgres_dsn: str) -> Non
             assert row["pr_number"] is None
             assert row["pr_author"] is None
             assert row["branch"] == "feature-a"
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -338,8 +317,7 @@ def test_branch_push_takes_over_reused_pr_build(postgres_dsn: str) -> None:
     # the merge) sheds the PR identity and takes over the branch field,
     # else the UI and the pr_number guards keep pointing at the PR.
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "pr-shed")
             db = BuildDB(pool)
             first, _ = await db.get_or_create_build(
@@ -362,8 +340,6 @@ def test_branch_push_takes_over_reused_pr_build(postgres_dsn: str) -> None:
                 first.id,
             )
             assert dict(row) == {"pr_number": None, "pr_author": None, "branch": "main"}
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -373,8 +349,7 @@ def test_pr_does_not_capture_branch_push_build(postgres_dsn: str) -> None:
     # branch sharing the tree hash must not gain pr_author authz
     # (restart/cancel control) over it.
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "pr-capture")
             db = BuildDB(pool)
             first, _ = await db.get_or_create_build(project_id, "tree-m", "sha", "main")
@@ -393,8 +368,6 @@ def test_pr_does_not_capture_branch_push_build(postgres_dsn: str) -> None:
             )
             assert row["pr_number"] is None
             assert row["pr_author"] is None
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -405,8 +378,7 @@ def test_complete_attribute_preserves_eval_outputs(postgres_dsn: str) -> None:
     # map, and must never NULL an existing map when no out path is
     # known (restarted/cancelled attributes).
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "multi-out")
             db = BuildDB(pool)
             build, _ = await db.get_or_create_build(project_id, "tree-o", "sha", "main")
@@ -462,8 +434,6 @@ def test_complete_attribute_preserves_eval_outputs(postgres_dsn: str) -> None:
                 "out": "/nix/store/foo-out-new",
                 "dev": "/nix/store/foo-dev",
             }
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -473,8 +443,7 @@ def test_complete_attribute_marks_substituted_as_cached(postgres_dsn: str) -> No
     # substituted from a binary cache must set it, not only ones
     # skipped because they were already in the local store.
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "cached-flag")
             db = BuildDB(pool)
             build, _ = await db.get_or_create_build(project_id, "tree-s", "sha", "main")
@@ -507,8 +476,6 @@ def test_complete_attribute_marks_substituted_as_cached(postgres_dsn: str) -> No
             assert await cached("sub") is True
             assert await cached("local") is True
             assert await cached("built") is False
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -517,8 +484,7 @@ def test_complete_attribute_replaces_log_row(postgres_dsn: str) -> None:
     # Attribute restarts rewrite the same log file; the metadata row
     # must be replaced, not duplicated with stale sizes.
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "log-dup")
             db = BuildDB(pool)
             build, _ = await db.get_or_create_build(project_id, "tree-l", "sha", "main")
@@ -547,8 +513,6 @@ def test_complete_attribute_replaces_log_row(postgres_dsn: str) -> None:
             )
             assert len(rows) == 1
             assert rows[0]["size_bytes"] == 20
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -557,8 +521,7 @@ def test_record_attributes_persists_pending_rows_with_outputs(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "record-attrs")
             db = BuildDB(pool)
             build, _ = await db.get_or_create_build(
@@ -593,8 +556,6 @@ def test_record_attributes_persists_pending_rows_with_outputs(
                 build.id,
             )
             assert status == "succeeded"
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -606,8 +567,7 @@ def test_mark_attribute_building_does_not_resurrect_cancelled_rows(
     scheduler later dispatches it."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "no-resurrect")
             db = BuildDB(pool)
             build, _ = await db.get_or_create_build(project_id, "tree-c", "sha", "main")
@@ -636,8 +596,6 @@ def test_mark_attribute_building_does_not_resurrect_cancelled_rows(
                 build.id,
             )
             assert status == "cancelled"
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -646,8 +604,7 @@ def test_mark_attribute_building_sets_status_and_started_at(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "building-status")
             db = BuildDB(pool)
             build, _ = await db.get_or_create_build(project_id, "tree-b", "sha", "main")
@@ -678,8 +635,6 @@ def test_mark_attribute_building_sets_status_and_started_at(
             assert row["status"] == "succeeded"
             assert row["started_at"] is not None  # preserved by completion
             assert row["finished_at"] is not None
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -691,8 +646,7 @@ def test_complete_attribute_if_unfinished_skips_terminal_rows(
     already settled, without a per-result status round trip."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(pool, "if-unfinished")
             db = BuildDB(pool)
             build, _ = await db.get_or_create_build(project_id, "tree-u", "sha", "main")
@@ -730,8 +684,6 @@ def test_complete_attribute_if_unfinished_skips_terminal_rows(
             )
             statuses = await db.get_attribute_statuses(build.id)
             assert statuses["bar"] == "skipped_local"
-        finally:
-            await pool.close()
 
     asyncio.run(run())
 
@@ -742,8 +694,7 @@ def test_failed_build_cache_scoped_per_project(postgres_dsn: str) -> None:
     derivation."""
 
     async def run() -> None:
-        pool = await asyncpg.create_pool(postgres_dsn)
-        try:
+        async with db_pool(postgres_dsn) as pool:
             p1 = await insert_project(pool, "one", forge_repo_id="fb-1")
             p2 = await insert_project(pool, "two", forge_repo_id="fb-2")
             drv = "/nix/store/shared.drv"
@@ -752,7 +703,5 @@ def test_failed_build_cache_scoped_per_project(postgres_dsn: str) -> None:
             entry = await PostgresFailedBuildCache(pool, p1).check(drv)
             assert entry is not None
             assert entry.url == "http://ci/one/1"
-        finally:
-            await pool.close()
 
     asyncio.run(run())
