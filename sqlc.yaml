@@ -1,0 +1,30 @@
+version: "2"
+plugins:
+  - name: python
+    wasm:
+      # Kept in sync with nix/sqlc.nix (the dev shell and the freshness
+      # check use the nix-pinned copy of the same artifact).
+      url: https://github.com/Mic92/sqlc-gen-better-python/releases/download/v0.4.5-mic92.1/sqlc-gen-better-python.wasm
+      sha256: 0591d150f96fee81977937038b27f09db773cc0476dbd63353a69bdb1a8b0ced
+sql:
+  - engine: postgresql
+    queries: nixbot/nixbot/queries
+    schema: nixbot/nixbot/migrations
+    codegen:
+      - out: nixbot/nixbot/db_gen
+        plugin: python
+        options:
+          package: nixbot.db_gen
+          emit_init_file: true
+          sql_driver: asyncpg
+          model_type: dataclass
+          docstrings: none
+          omit_unused_models: true
+          # Column/field names that must not be singularized in
+          # generated row dataclasses.
+          inflection_exclude_table_names: [
+            outputs,
+            groups,
+            median_secs,
+            eval_warnings,
+          ]

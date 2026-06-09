@@ -19,6 +19,7 @@ import httpx
 
 from nixbot.auth import SessionSigner
 from nixbot.config import Config
+from nixbot.db_gen import builds as builds_q
 from nixbot.forge import GiteaClient, GitlabClient
 from nixbot.migrations import apply_migrations
 from nixbot.web.app import WebContext, create_app
@@ -196,6 +197,12 @@ async def db_pool(dsn: str, **kwargs: Any) -> AsyncIterator[asyncpg.Pool]:
         yield pool
     finally:
         await pool.close()
+
+
+async def attribute_statuses(pool: asyncpg.Pool, build_id: int) -> dict[str, str]:
+    """Attribute name -> status for assertions."""
+    rows = await builds_q.attribute_statuses(pool, build_id=build_id)
+    return {r.attr: r.status for r in rows}
 
 
 def cookie_header(cookies: dict[str, str]) -> dict[str, str]:

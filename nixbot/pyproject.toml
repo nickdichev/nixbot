@@ -45,6 +45,10 @@ ignore = "J004,J018"
 [tool.ruff]
 target-version = "py312"
 line-length = 88
+# sqlc-generated code; the sqlc-generated flake check fails on any drift.
+extend-exclude = ["nixbot/db_gen"]
+# Apply the exclude even when paths are passed explicitly (treefmt does).
+force-exclude = true
 
 [tool.ruff.lint]
 select = ["ALL"]

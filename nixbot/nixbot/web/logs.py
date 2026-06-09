@@ -25,6 +25,9 @@ from ..ansi import (  # noqa: TID252
     CTRL_RE,
     strip_ansi,
 )
+from ..db_gen import maintenance as maint_gen  # noqa: TID252
+from ..db_gen import scheduled as sched_gen  # noqa: TID252
+from ..db_gen import web as gen  # noqa: TID252
 from ..executor import read_log  # noqa: TID252
 from ..scheduler import TERMINAL_FAILURES  # noqa: TID252
 from .api_routes import FailureSummary, clean_row
@@ -198,23 +201,14 @@ async def _log_path(
 ) -> Path | None:
     if attr.startswith("effect:"):
         # Effects store log metadata inline (no attribute row).
-        row = await ctx.pool.fetchrow(
-            "SELECT log_path AS path FROM build_effects "
-            "WHERE build_id = $1 AND name = $2 AND log_path IS NOT NULL",
-            build["id"],
-            attr.removeprefix("effect:"),
+        log_rel = await gen.effect_log_path(
+            ctx.pool, build_id=build["id"], name=attr.removeprefix("effect:")
         )
     else:
-        row = await ctx.pool.fetchrow(
-            """
-            SELECT l.path FROM logs l
-            JOIN build_attributes a ON a.id = l.attribute_id
-            WHERE a.build_id = $1 AND a.attr = $2
-            """,
-            build["id"],
-            attr,
+        log_rel = await gen.attribute_log_path(
+            ctx.pool, build_id=build["id"], attr=attr
         )
-    path = ctx.state_dir / row["path"] if row else None
+    path = ctx.state_dir / log_rel if log_rel else None
     if path is None:
         # No logs row until completion; running attributes use the
         # live writer's on-disk file.
@@ -345,10 +339,8 @@ class _LogRoutes:
         reachable under /logs/raw/), otherwise serve raw as before."""
         _, build = await self._build_or_404(request, forge, owner, name, number)
         shadowed = f"{attr}.txt"
-        if await self.ctx.pool.fetchval(
-            "SELECT 1 FROM build_attributes WHERE build_id = $1 AND attr = $2",
-            build["id"],
-            shadowed,
+        if await maint_gen.attribute_known(
+            self.ctx.pool, build_id=build["id"], attr=shadowed
         ):
             return await self.log_viewer(request, forge, owner, name, number, shadowed)
         return await self.log_raw_text(request, forge, owner, name, number, attr, tail)
@@ -363,10 +355,8 @@ class _LogRoutes:
     ) -> PlainTextResponse:
         """Log of one scheduled-effect run as plain text."""
         project = await self.ctx.repo_or_404(forge, owner, name, request)
-        row = await self.ctx.pool.fetchrow(
-            "SELECT id FROM scheduled_effect_runs WHERE id = $1 AND project_id = $2",
-            run_id,
-            project["id"],
+        row = await sched_gen.scheduled_run_exists(
+            self.ctx.pool, id_=run_id, project_id=project["id"]
         )
         path = self.ctx.state_dir / "logs" / "scheduled" / f"{run_id}.zst"
         if row is None or not await asyncio.to_thread(path.exists):
@@ -423,10 +413,8 @@ class _LogRoutes:
         project, build, path = await self._resolve(
             request, forge, owner, name, number, attr
         )
-        attr_status = await self.ctx.pool.fetchval(
-            "SELECT status FROM build_attributes WHERE build_id = $1 AND attr = $2",
-            build["id"],
-            attr,
+        attr_status = await gen.attribute_status(
+            self.ctx.pool, build_id=build["id"], attr=attr
         )
         # Live pages render no snapshot: the stream replays full
         # history on connect, the client would throw it away.

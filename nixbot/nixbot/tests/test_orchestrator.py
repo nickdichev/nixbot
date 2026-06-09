@@ -14,9 +14,11 @@ from typing import TYPE_CHECKING
 import pytest
 
 from nixbot import build_run as build_run_mod
+from nixbot import db
 from nixbot import effects_run as effects_run_mod
 from nixbot.config import Config
-from nixbot.db import BuildDB, BuildStatus
+from nixbot.db import BuildStatus
+from nixbot.db_gen import builds as builds_q
 from nixbot.events import ChangeEvent, RepoInfo
 from nixbot.gitrepo import FetchCredentials, RepoManager
 from nixbot.memory import EvalWorkerConfig
@@ -31,7 +33,7 @@ from nixbot.scheduler import (
 )
 from nixbot.work_queue import WorkQueue
 
-from .support import FakeCache, git, insert_project, mk_job
+from .support import FakeCache, attribute_statuses, git, insert_project, mk_job
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -192,7 +194,7 @@ def make_orchestrator(
 
     orchestrator = Orchestrator(
         config=config,
-        db=BuildDB(dsn_pool),
+        pool=dsn_pool,
         repos=RepoManager(config.state_dir),
         eval_runner=eval_runner,
         executor=executor,
@@ -306,7 +308,9 @@ async def drain_effect_items(
     queue = WorkQueue(pool)
     while (item := await queue.claim_next()) is not None:
         if item.kind == "effect":
-            build = await orchestrator.db.get_build(item.payload["build_id"])
+            build = await builds_q.get_build(
+                orchestrator.pool, id_=item.payload["build_id"]
+            )
             assert build is not None
             await orchestrator.run_effect_item(info, build, item.payload["name"])
         await queue.finish(item.id)
@@ -538,9 +542,9 @@ async def test_build_reuse_clears_pr_author_in_other_context(
     """A PR build reused for another context (e.g. the default branch
     after the merge) must not stay controllable by the PR author."""
 
-    db = BuildDB(pool)
     project = await make_project(pool, name="reuse-author")
     build, created = await db.get_or_create_build(
+        pool,
         project.id,
         "tree-reuse",
         "sha",
@@ -551,34 +555,39 @@ async def test_build_reuse_clears_pr_author_in_other_context(
     assert created
 
     # Re-trigger of the same PR: author keeps control.
-    await db.get_or_create_build(project.id, "tree-reuse", "sha", "main", pr_number=7)
+    await db.get_or_create_build(
+        pool, project.id, "tree-reuse", "sha", "main", pr_number=7
+    )
     author = await pool.fetchval("SELECT pr_author FROM builds WHERE id = $1", build.id)
     assert author == "github:alice"
 
     # Default-branch push producing the same tree: control revoked.
-    _, created = await db.get_or_create_build(project.id, "tree-reuse", "sha", "main")
+    _, created = await db.get_or_create_build(
+        pool, project.id, "tree-reuse", "sha", "main"
+    )
     assert not created
     author = await pool.fetchval("SELECT pr_author FROM builds WHERE id = $1", build.id)
     assert author is None
 
 
 async def test_effects_started_flag(pool: asyncpg.Pool, tmp_path: Path) -> None:
-    db = BuildDB(pool)
     project = await make_project(pool, name="flag")
-    build, _ = await db.get_or_create_build(project.id, "tree-flag", "sha", "main")
-    assert await db.mark_effects_started(build.id)
+    build, _ = await db.get_or_create_build(
+        pool, project.id, "tree-flag", "sha", "main"
+    )
+    assert await builds_q.mark_effects_started(pool, id_=build.id) is not None
     # Second attempt (e.g. crash recovery) must not re-run.
-    assert not await db.mark_effects_started(build.id)
+    assert await builds_q.mark_effects_started(pool, id_=build.id) is None
 
 
 async def test_aggregation_generation_monotonic(
     pool: asyncpg.Pool, tmp_path: Path
 ) -> None:
-    db = BuildDB(pool)
     project = await make_project(pool, name="gen")
-    build, _ = await db.get_or_create_build(project.id, "tree-gen", "sha", "main")
+    build, _ = await db.get_or_create_build(pool, project.id, "tree-gen", "sha", "main")
     job = mk_job("x")
     await db.complete_attribute(
+        pool,
         build.id,
         AttributeResult(
             attr="x",
@@ -588,10 +597,11 @@ async def test_aggregation_generation_monotonic(
             system=job.system,
         ),
     )
-    status1, gen1 = await db.aggregate_build(build.id)
+    status1, gen1 = await db.aggregate_build(pool, build.id)
     assert status1 == BuildStatus.FAILED
     # Attribute rebuilt successfully: aggregate flips, generation grows.
     await db.complete_attribute(
+        pool,
         build.id,
         AttributeResult(
             attr="x",
@@ -601,7 +611,7 @@ async def test_aggregation_generation_monotonic(
             system=job.system,
         ),
     )
-    status2, gen2 = await db.aggregate_build(build.id)
+    status2, gen2 = await db.aggregate_build(pool, build.id)
     assert status2 == BuildStatus.SUCCEEDED
     assert gen2 > gen1
 
@@ -743,8 +753,9 @@ async def test_rerun_flips_stale_red_eval_status(
         FakeExecutor(outcomes={"a": BuildOutcome.failure}),
         "eval-flip",
     )
-    db = BuildDB(pool)
-    build, _ = await db.get_or_create_build(project.id, "eval-flip-tree", sha, "main")
+    build, _ = await db.get_or_create_build(
+        pool, project.id, "eval-flip-tree", sha, "main"
+    )
     await orchestrator.rerun_pending_attributes(project, build, [mk_job("a")])
     assert ("eval", build.id, True, ()) in reporter.events
 
@@ -767,10 +778,9 @@ async def test_recovery_rerun_failures_not_cached(
     orchestrator.config = orchestrator.config.model_copy(
         update={"cache_failed_builds": True}
     )
-    db = BuildDB(pool)
-    build, _ = await db.get_or_create_build(project.id, "recov-tree", sha, "main")
+    build, _ = await db.get_or_create_build(pool, project.id, "recov-tree", sha, "main")
     await orchestrator.rerun_pending_attributes(project, build, [mk_job("a")])
-    assert await db.get_attribute_statuses(build.id) == {"a": "failed"}
+    assert await attribute_statuses(pool, build.id) == {"a": "failed"}
     assert cache.added == []
 
 
@@ -845,12 +855,11 @@ async def test_rerun_fetches_forge_change_request_refs(
         f"rerun-{forge}",
     )
     project, mr_sha = await setup_forge_mr(orchestrator, project, upstream, forge)
-    db = BuildDB(pool)
     build, _ = await db.get_or_create_build(
-        project.id, "mr-tree", mr_sha, "main", pr_number=7
+        pool, project.id, "mr-tree", mr_sha, "main", pr_number=7
     )
     await orchestrator.rerun_pending_attributes(project, build, [mk_job("a")])
-    assert await db.get_attribute_statuses(build.id) == {"a": "succeeded"}
+    assert await attribute_statuses(pool, build.id) == {"a": "succeeded"}
 
 
 async def test_cancelled_build_reuse_rebuilds(
@@ -1222,31 +1231,36 @@ async def test_eval_failure_settles_streamed_attributes(
 async def test_effect_rows_roundtrip(pool: asyncpg.Pool, tmp_path: Path) -> None:
     """Start, finish and rerun-reset of effect rows."""
 
-    db = BuildDB(pool)
     project = await make_project(pool, name="fx")
-    build, _ = await db.get_or_create_build(project.id, "tree-fx", "sha", "main")
+    build, _ = await db.get_or_create_build(pool, project.id, "tree-fx", "sha", "main")
 
-    await db.start_effect(build.id, "deploy")
-    await db.finish_effect(
-        build.id,
-        "deploy",
-        success=False,
+    await builds_q.start_effect(
+        pool, build_id=build.id, name="deploy", status="running"
+    )
+    await builds_q.finish_effect(
+        pool,
+        build_id=build.id,
+        name="deploy",
+        status="failed",
         error="ssh: connection refused",
         log_path="logs/1/effect-deploy.zst",
         log_size=123,
+        log_truncated=False,
     )
-    effects = await db.effects_for_build(build.id)
-    assert [(e["name"], e["status"], e["error"]) for e in effects] == [
+    effects = await builds_q.effects_for_build(pool, build_id=build.id)
+    assert [(e.name, e.status, e.error) for e in effects] == [
         ("deploy", "failed", "ssh: connection refused")
     ]
-    assert effects[0]["finished_at"] is not None
+    assert effects[0].finished_at is not None
 
     # A rerun resets the row to running with fresh timestamps.
-    await db.start_effect(build.id, "deploy")
-    effects = await db.effects_for_build(build.id)
-    assert effects[0]["status"] == "running"
-    assert effects[0]["finished_at"] is None
-    assert effects[0]["error"] is None
+    await builds_q.start_effect(
+        pool, build_id=build.id, name="deploy", status="running"
+    )
+    effects = await builds_q.effects_for_build(pool, build_id=build.id)
+    assert effects[0].status == "running"
+    assert effects[0].finished_at is None
+    assert effects[0].error is None
 
 
 async def test_effect_items_resume_only_pending(

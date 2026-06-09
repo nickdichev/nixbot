@@ -11,9 +11,11 @@ import asyncio
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
-from . import build_run
+from . import build_run, db
 from .canceller import branch_key
 from .db import BuildStatus
+from .db_gen import builds as builds_q
+from .db_gen import maintenance as q
 from .events import ChangeEvent
 from .gitrepo import pr_refspec
 
@@ -78,7 +80,7 @@ async def rerun_pending_attributes(
     # must not pass the guard together.
     cancel_event = o.cancel_events[build.id] = asyncio.Event()
     try:
-        current = await o.db.get_build(build.id)
+        current = await builds_q.get_build(o.pool, id_=build.id)
         if current is not None and current.status == "cancelled":
             # Cancelled between scheduling the rerun and getting here.
             return
@@ -89,17 +91,16 @@ async def rerun_pending_attributes(
             job for job in pending_jobs if job.system not in o.config.build_systems
         ]
         if unsupported:
-            await o.db.pool.execute(
-                "DELETE FROM build_attributes WHERE build_id = $1 "
-                "AND attr = ANY($2::text[])",
-                build.id,
-                [job.attr for job in unsupported],
+            await q.delete_attributes_by_name(
+                o.pool,
+                build_id=build.id,
+                attrs=[job.attr for job in unsupported],
             )
             pending_jobs = [
                 job for job in pending_jobs if job.system in o.config.build_systems
             ]
         # No re-eval happens on this path; go straight to building.
-        await o.db.set_build_status(build.id, BuildStatus.BUILDING)
+        await db.set_build_status(o.pool, build.id, BuildStatus.BUILDING)
         # Register so supersede/PR-close cancellation also covers
         # recovered and restarted builds.
         o.canceller.register(
@@ -152,15 +153,7 @@ async def rerun_effects(
     try:
         # Reset under the claim: resetting earlier (e.g. in the
         # service) could clobber a rerun already in flight.
-        await o.db.pool.execute(
-            "UPDATE builds SET effects_started = FALSE WHERE id = $1", build.id
-        )
-        await o.db.pool.execute(
-            "UPDATE build_effects SET status = 'pending', error = NULL, "
-            "finished_at = NULL, log_path = NULL, log_size = 0, "
-            "log_truncated = FALSE WHERE build_id = $1",
-            build.id,
-        )
+        await q.reset_effects_state(o.pool, build_id=build.id)
         async with rerun_worktree(o, info, build, "effects", credentials) as (
             event,
             worktree_path,

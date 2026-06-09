@@ -9,7 +9,10 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
+from . import db
 from .db import BuildStatus
+from .db_gen import builds as builds_q
+from .db_gen import maintenance as q
 from .events import ChangeEvent
 from .recovery import check_store_paths, find_unfinished_builds
 from .repos import repo_info
@@ -32,7 +35,7 @@ RESTART_RETRY_SECONDS = 10.0
 async def restart_effects(s: CIService, build_id: int) -> None:
     if build_id in s.orchestrator.cancel_events:
         return  # build (or an effects rerun) still running
-    build = await s.orchestrator.db.get_build(build_id)
+    build = await builds_q.get_build(s.orchestrator.pool, id_=build_id)
     if build is None or build.status != "succeeded":
         return  # effects only ever run after a successful build
     project = await s.repo_store.by_id(build.project_id)
@@ -53,16 +56,12 @@ async def restart(s: CIService, build_id: int, attr: str | None) -> bool:
         await asyncio.sleep(RESTART_RETRY_SECONDS)
         if build_id in s.orchestrator.cancel_events:
             return True
-    if await s.orchestrator.db.get_build(build_id) is None:
+    if await builds_q.get_build(s.orchestrator.pool, id_=build_id) is None:
         return False
     if attr is not None:
         # A stale attr (e.g. after a re-eval renamed it) must not
         # reset the build row and spawn an empty rerun.
-        known = await s.pool.fetchval(
-            "SELECT 1 FROM build_attributes WHERE build_id = $1 AND attr = $2",
-            build_id,
-            attr,
-        )
+        known = await q.attribute_known(s.pool, build_id=build_id, attr=attr)
         if known is None:
             logger.warning(
                 "restart of unknown attribute ignored",
@@ -71,52 +70,14 @@ async def restart(s: CIService, build_id: int, attr: str | None) -> bool:
             return False
     # An explicit rebuild clears cached failures so the attributes
     # actually build again instead of re-skipping.
-    await s.pool.execute(
-        "DELETE FROM failed_builds WHERE project_id = "
-        "(SELECT project_id FROM builds WHERE id = $1) "
-        "AND derivation IN "
-        "(SELECT drv_path FROM build_attributes "
-        "WHERE build_id = $1 AND ($2::text IS NULL OR attr = $2))",
-        build_id,
-        attr,
-    )
-    await s.pool.execute(
-        "UPDATE build_attributes SET status = 'pending', error = NULL, "
-        "started_at = NULL, finished_at = NULL "
-        "WHERE build_id = $1 AND ($2::text IS NULL OR attr = $2)",
-        build_id,
-        attr,
-    )
-    if attr is None:
-        # A full restart re-runs effects; a partial rebuild must
-        # not re-deploy.
-        await s.pool.execute(
-            "UPDATE builds SET effects_started = FALSE WHERE id = $1", build_id
-        )
-        await s.pool.execute(
-            "UPDATE build_effects SET status = 'pending', error = NULL, "
-            "finished_at = NULL, log_path = NULL, log_size = 0, "
-            "log_truncated = FALSE WHERE build_id = $1",
-            build_id,
-        )
-    # Queued, not started: the rerun decides whether this becomes
-    # a re-eval (evaluating) or an attribute rerun (building).
-    # Clearing finished_at keeps retention cleanup off a build
-    # that is about to rerun; clearing error/eval_warnings keeps
-    # a stale failure banner off a restart that succeeds.
-    await s.pool.execute(
-        "UPDATE builds SET status = 'pending', error = NULL, "
-        "eval_warnings = NULL, started_at = NULL, finished_at = NULL "
-        "WHERE id = $1",
-        build_id,
-    )
+    await q.reset_build_for_restart(s.pool, build_id=build_id, attr=attr)
     await rerun(s, build_id)
     return False
 
 
 async def rerun(s: CIService, build_id: int) -> None:
     # Serialized by the work queue's per-build dedup key.
-    build = await s.orchestrator.db.get_build(build_id)
+    build = await builds_q.get_build(s.orchestrator.pool, id_=build_id)
     if build is None:
         return
     project = await s.repo_store.by_id(build.project_id)
@@ -128,11 +89,7 @@ async def rerun(s: CIService, build_id: int) -> None:
     resumable = results[0] if results else None
     if resumable is None:
         return
-    unfinished_count = await s.pool.fetchval(
-        "SELECT count(*) FROM build_attributes "
-        "WHERE build_id = $1 AND status IN ('pending', 'building')",
-        build_id,
-    )
+    unfinished_count = await q.count_unfinished_attributes(s.pool, build_id=build_id)
     if (
         # A crash mid-eval leaves a partial attribute set; resuming
         # it would report success for an incomplete build.
@@ -161,7 +118,8 @@ async def rerun(s: CIService, build_id: int) -> None:
         await _reeval(s, info, build, credentials)
     except Exception:
         logger.exception("re-evaluation failed", extra={"build_id": build_id})
-        await s.orchestrator.db.set_build_status(
+        await db.set_build_status(
+            s.orchestrator.pool,
             build_id,
             BuildStatus.FAILED,
             error="re-evaluation failed; see service logs",
@@ -187,15 +145,7 @@ async def _reeval(
             # The flag must drop before the rows: a concurrent build
             # of the same tree must not reuse the partial set
             # (run_build only clears it after this window).
-            await s.pool.execute(
-                "UPDATE builds SET eval_completed = FALSE WHERE id = $1",
-                build.id,
-            )
-            await s.pool.execute(
-                "DELETE FROM build_attributes WHERE build_id = $1 "
-                "AND (status IN ('pending', 'building') OR drv_path IS NULL)",
-                build.id,
-            )
+            await q.reset_eval_for_reeval(s.pool, build_id=build.id)
             await s.orchestrator.run_build(event, build, worktree_path)
     finally:
         s.orchestrator.cancel_events.pop(build.id, None)
@@ -218,7 +168,7 @@ async def change_event_for(
 async def _report_interrupted(s: CIService, resumable: ResumableBuild) -> None:
     """Post the failure to the forge; otherwise the commit status
     stays pending forever after an interrupted evaluation."""
-    build = await s.orchestrator.db.get_build(resumable.build_id)
+    build = await builds_q.get_build(s.orchestrator.pool, id_=resumable.build_id)
     event = await change_event_for(s, resumable)
     if build is None or event is None:
         return

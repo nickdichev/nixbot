@@ -18,6 +18,7 @@ from nixbot.api_tokens import ApiTokenStore
 from nixbot.auth import AuthzConfig, User
 from nixbot.bootstrap import build_service
 from nixbot.config import Config
+from nixbot.db_gen import builds as builds_q
 from nixbot.events import ChangeEvent, NullStatusReporter
 from nixbot.forge_tokens import ForgeTokenStore
 from nixbot.service import (
@@ -681,7 +682,7 @@ async def test_report_retry(
         wrapper = RetryingReporter(FakeReporter(), service)
         service.orchestrator.reporter = wrapper
 
-        build = await service.orchestrator.db.get_build(build_id)
+        build = await builds_q.get_build(service.pool, id_=build_id)
         assert build is not None
         record = await service.repo_store.by_id(project_id)
         assert record is not None

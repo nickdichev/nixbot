@@ -13,6 +13,9 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter
 from fastapi.responses import PlainTextResponse
 
+from ..db_gen import web as gen  # noqa: TID252
+from ..sql_util import expect  # noqa: TID252
+
 if TYPE_CHECKING:
     import asyncpg
 
@@ -25,54 +28,36 @@ async def render_metrics(pool: asyncpg.Pool) -> str:
     lines.append("# HELP nixbot_builds Builds by final status.")
     lines.append("# TYPE nixbot_builds gauge")
     lines.extend(
-        f'nixbot_builds{{status="{row["status"]}"}} {row["count"]}'
-        for row in await pool.fetch(
-            "SELECT status, count(*) AS count FROM builds GROUP BY status"
-        )
+        f'nixbot_builds{{status="{row.status}"}} {row.count}'
+        for row in await gen.metrics_build_counts(pool)
     )
 
     lines.append("# HELP nixbot_attributes Attribute results by status.")
     lines.append("# TYPE nixbot_attributes gauge")
     lines.extend(
-        f'nixbot_attributes{{status="{row["status"]}"}} {row["count"]}'
-        for row in await pool.fetch(
-            "SELECT status, count(*) AS count FROM build_attributes GROUP BY status"
-        )
+        f'nixbot_attributes{{status="{row.status}"}} {row.count}'
+        for row in await gen.metrics_attribute_counts(pool)
     )
 
-    queue_depth = await pool.fetchval(
-        "SELECT count(*) FROM builds "
-        "WHERE status IN ('pending', 'evaluating', 'building')"
-    )
+    queue_depth = await gen.metrics_queue_depth(pool)
     lines.append("# HELP nixbot_queue_depth Builds pending or running.")
     lines.append("# TYPE nixbot_queue_depth gauge")
     lines.append(f"nixbot_queue_depth {queue_depth}")
 
-    duration = await pool.fetchrow(
-        """
-        SELECT
-            coalesce(sum(extract(epoch FROM finished_at - started_at)), 0) AS total,
-            count(*) AS count
-        FROM builds
-        WHERE started_at IS NOT NULL AND finished_at IS NOT NULL
-        """
-    )
+    duration = expect(await gen.metrics_build_duration(pool))
     lines.append(
         "# HELP nixbot_build_duration_seconds_sum Total wall time of finished builds."
     )
     lines.append("# TYPE nixbot_build_duration_seconds_sum gauge")
-    lines.append(f"nixbot_build_duration_seconds_sum {duration['total']}")
+    lines.append(f"nixbot_build_duration_seconds_sum {duration.total}")
     lines.append("# TYPE nixbot_build_duration_seconds_count gauge")
-    lines.append(f"nixbot_build_duration_seconds_count {duration['count']}")
+    lines.append(f"nixbot_build_duration_seconds_count {duration.count}")
 
-    projects = await pool.fetchrow(
-        "SELECT count(*) FILTER (WHERE enabled) AS enabled, count(*) AS total "
-        "FROM projects"
-    )
+    projects = expect(await gen.metrics_projects(pool))
     lines.append("# HELP nixbot_projects Projects known/enabled.")
     lines.append("# TYPE nixbot_projects gauge")
-    lines.append(f'nixbot_projects{{state="enabled"}} {projects["enabled"]}')
-    lines.append(f'nixbot_projects{{state="total"}} {projects["total"]}')
+    lines.append(f'nixbot_projects{{state="enabled"}} {projects.enabled}')
+    lines.append(f'nixbot_projects{{state="total"}} {projects.total}')
 
     return "\n".join(lines) + "\n"
 

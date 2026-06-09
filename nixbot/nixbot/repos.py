@@ -10,32 +10,21 @@ empty projects table.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from .db_gen import projects as q
 from .events import RepoInfo
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from datetime import datetime
 
     import asyncpg
 
+    from .db_gen.models import Project as RepoRecord
     from .forge import DiscoveredRepo
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class RepoRecord:
-    id: int
-    forge: str
-    forge_repo_id: str
-    owner: str
-    name: str
-    default_branch: str
-    url: str
-    private: bool
-    enabled: bool
 
 
 def repo_info(record: RepoRecord) -> RepoInfo:
@@ -51,20 +40,6 @@ def repo_info(record: RepoRecord) -> RepoInfo:
     )
 
 
-def _record(row: asyncpg.Record) -> RepoRecord:
-    return RepoRecord(
-        id=row["id"],
-        forge=row["forge"],
-        forge_repo_id=row["forge_repo_id"],
-        owner=row["owner"],
-        name=row["name"],
-        default_branch=row["default_branch"],
-        url=row["url"],
-        private=row["private"],
-        enabled=row["enabled"],
-    )
-
-
 class RepoStore:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self.pool = pool
@@ -73,12 +48,7 @@ class RepoStore:
         """No forge-discovered projects yet. Pull-based rows are ignored:
         they come from static config and may be synced before discovery
         runs, which must not suppress the one-shot legacy import."""
-        return (
-            await self.pool.fetchval(
-                "SELECT count(*) FROM projects WHERE forge <> 'pull_based'"
-            )
-            == 0
-        )
+        return await q.count_discovered_projects(self.pool) == 0
 
     async def sync_discovered(
         self,
@@ -92,45 +62,26 @@ class RepoStore:
         one-shot import of the old topic-based project selection."""
         topics = legacy_import_topics or {}
         do_import = bool(topics) and await self.is_empty()
-        async with self.pool.acquire() as conn, conn.transaction():
-            for repo in repos:
-                enabled = bool(do_import and topics.get(repo.forge) in repo.topics)
-                await conn.execute(
-                    """
-                    INSERT INTO projects
-                        (forge, forge_repo_id, owner, name, default_branch,
-                         url, private, enabled)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                    ON CONFLICT (forge, forge_repo_id) DO UPDATE SET
-                        owner = EXCLUDED.owner,
-                        name = EXCLUDED.name,
-                        default_branch = EXCLUDED.default_branch,
-                        url = EXCLUDED.url,
-                        private = EXCLUDED.private,
-                        updated_at = now()
-                    -- Discovery re-upserts every repo every poll cycle;
-                    -- skip no-op updates to avoid WAL/autovacuum churn.
-                    WHERE (projects.owner, projects.name,
-                           projects.default_branch, projects.url,
-                           projects.private)
-                          IS DISTINCT FROM
-                          (EXCLUDED.owner, EXCLUDED.name,
-                           EXCLUDED.default_branch, EXCLUDED.url,
-                           EXCLUDED.private)
-                    """,
-                    repo.forge,
-                    repo.forge_repo_id,
-                    repo.owner,
-                    repo.repo,
-                    repo.default_branch,
-                    repo.clone_url,
-                    repo.private,
-                    enabled,
-                )
-        if do_import:
-            count = await self.pool.fetchval(
-                "SELECT count(*) FROM projects WHERE enabled"
+        # Last entry wins per key: a duplicate inside one batch would
+        # make ON CONFLICT DO UPDATE fail with "cannot affect row a
+        # second time".
+        repos = list({(r.forge, r.forge_repo_id): r for r in repos}.values())
+        if repos:
+            await q.upsert_discovered_projects(
+                self.pool,
+                forges=[r.forge for r in repos],
+                forge_repo_ids=[r.forge_repo_id for r in repos],
+                owners=[r.owner for r in repos],
+                names=[r.repo for r in repos],
+                default_branches=[r.default_branch for r in repos],
+                urls=[r.clone_url for r in repos],
+                privates=[r.private for r in repos],
+                enableds=[
+                    bool(do_import and topics.get(r.forge) in r.topics) for r in repos
+                ],
             )
+        if do_import:
+            count = await q.count_enabled_projects(self.pool)
             logger.info(
                 "legacy topic import complete",
                 extra={"topics": topics, "enabled": count},
@@ -142,70 +93,41 @@ class RepoStore:
         Listing a repository in the static config is the enablement
         decision, so new rows start enabled; the admin toggle is
         preserved on conflict."""
-        for name, url, default_branch in repos:
-            owner, _, repo = name.rpartition("/")
-            await self.pool.execute(
-                """
-                INSERT INTO projects
-                    (forge, forge_repo_id, owner, name, default_branch,
-                     url, private, enabled)
-                VALUES ('pull_based', $1, $2, $3, $4, $5, FALSE, TRUE)
-                ON CONFLICT (forge, forge_repo_id) DO UPDATE SET
-                    default_branch = EXCLUDED.default_branch,
-                    url = EXCLUDED.url,
-                    updated_at = now()
-                -- Same no-op skip as sync_discovered: this runs on
-                -- every reconcile tick for every configured repo.
-                WHERE (projects.default_branch, projects.url)
-                      IS DISTINCT FROM
-                      (EXCLUDED.default_branch, EXCLUDED.url)
-                """,
-                name,
-                owner or "pull_based",
-                repo,
-                default_branch,
-                url,
-            )
+        if not repos:
+            return
+        # Same in-batch dedup as sync_discovered (forge_repo_id = name).
+        repos = list({name: (name, url, db) for name, url, db in repos}.values())
+        split = [(name.rpartition("/"), name, url, db) for name, url, db in repos]
+        await q.upsert_pull_based_projects(
+            self.pool,
+            forge_repo_ids=[name for _, name, _, _ in split],
+            owners=[parts[0] or "pull_based" for parts, _, _, _ in split],
+            names=[parts[2] for parts, _, _, _ in split],
+            default_branches=[db for _, _, _, db in split],
+            urls=[url for _, _, url, _ in split],
+        )
 
     async def set_enabled(self, project_id: int, *, enabled: bool) -> None:
-        await self.pool.execute(
-            "UPDATE projects SET enabled = $2, updated_at = now() WHERE id = $1",
-            project_id,
-            enabled,
-        )
+        await q.set_project_enabled(self.pool, id_=project_id, enabled=enabled)
 
-    async def enabled_repos(self) -> list[RepoRecord]:
-        rows = await self.pool.fetch(
-            "SELECT * FROM projects WHERE enabled ORDER BY owner, name"
-        )
-        return [_record(row) for row in rows]
+    async def enabled_repos(self) -> Sequence[RepoRecord]:
+        return await q.enabled_projects(self.pool)
 
     async def by_id(self, project_id: int) -> RepoRecord | None:
-        row = await self.pool.fetchrow(
-            "SELECT * FROM projects WHERE id = $1", project_id
-        )
-        return _record(row) if row else None
+        return await q.project_by_id(self.pool, id_=project_id)
 
     async def reconcile_watermark(self, project_id: int) -> datetime | None:
-        return await self.pool.fetchval(
-            "SELECT reconcile_watermark FROM projects WHERE id = $1", project_id
-        )
+        return await q.reconcile_watermark(self.pool, id_=project_id)
 
     async def set_reconcile_watermark(
         self, project_id: int, watermark: datetime
     ) -> None:
         """Advance (never rewind) the reconcile watermark."""
-        await self.pool.execute(
-            "UPDATE projects SET reconcile_watermark = $2 WHERE id = $1 "
-            "AND (reconcile_watermark IS NULL OR reconcile_watermark < $2)",
-            project_id,
-            watermark,
+        await q.advance_reconcile_watermark(
+            self.pool, id_=project_id, reconcile_watermark=watermark
         )
 
     async def by_forge_id(self, forge: str, forge_repo_id: str) -> RepoRecord | None:
-        row = await self.pool.fetchrow(
-            "SELECT * FROM projects WHERE forge = $1 AND forge_repo_id = $2",
-            forge,
-            forge_repo_id,
+        return await q.project_by_forge_id(
+            self.pool, forge=forge, forge_repo_id=forge_repo_id
         )
-        return _record(row) if row else None

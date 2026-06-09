@@ -11,14 +11,17 @@ config.ScheduleWhen.resolved. All times are UTC.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from .config import ScheduledEffectConfig, ScheduleWhen
+from .db_gen import scheduled as q
 from .effects import EffectsError, _effects_args, _run, run_effect_command
+from .sql_util import expect
 
 if TYPE_CHECKING:
     import asyncpg
@@ -195,17 +198,12 @@ class ScheduledEffectsStore:
         crashing the update on the primary key."""
         async with self.pool.acquire() as conn, conn.transaction():
             previous = {
-                (row["schedule_name"], row["effect"]): row
-                for row in await conn.fetch(
-                    "SELECT schedule_name, effect, when_spec, last_run "
-                    "FROM scheduled_effects WHERE project_id = $1",
-                    project_id,
-                )
+                (row.schedule_name, row.effect): row
+                for row in await q.schedules_for_update(conn, project_id=project_id)
             }
-            await conn.execute(
-                "DELETE FROM scheduled_effects WHERE project_id = $1", project_id
-            )
+            await q.delete_project_schedules(conn, project_id=project_id)
             seen: set[tuple[str, str]] = set()
+            rows: list[tuple[str, str, str, datetime | None]] = []
             for config in schedules.values():
                 for effect in config.effects:
                     key = (config.name, effect)
@@ -219,121 +217,92 @@ class ScheduledEffectsStore:
                     when_spec = config.when.model_dump_json(exclude_none=True)
                     old = previous.get(key)
                     last_run = (
-                        old["last_run"]
+                        old.last_run
                         if old is not None
-                        and json.loads(old["when_spec"]) == json.loads(when_spec)
+                        and json.loads(old.when_spec) == json.loads(when_spec)
                         else None
                     )
-                    await conn.execute(
-                        """
-                        INSERT INTO scheduled_effects
-                            (project_id, schedule_name, effect, when_spec, last_run)
-                        VALUES ($1, $2, $3, $4::jsonb, $5)
-                        """,
-                        project_id,
-                        config.name,
-                        effect,
-                        when_spec,
-                        last_run,
-                    )
+                    rows.append((config.name, effect, when_spec, last_run))
+            if rows:
+                await q.insert_schedules(
+                    conn,
+                    project_id=project_id,
+                    schedule_names=[r[0] for r in rows],
+                    effects=[r[1] for r in rows],
+                    when_specs=[r[2] for r in rows],
+                    # The generated signature types timestamptz[]
+                    # elements non-null, but Postgres arrays carry
+                    # NULLs fine (last_run is nullable).
+                    last_runs=cast("list[datetime]", [r[3] for r in rows]),
+                )
 
     async def due_effects(self, now: datetime | None = None) -> list[DueEffect]:
         """Effects whose schedule fired within the sweep window and
         which have not run for that occurrence yet."""
         now = now or datetime.now(tz=UTC)
-        rows = await self.pool.fetch(
-            """
-            SELECT project_id, schedule_name, effect, when_spec, last_run
-            FROM scheduled_effects
-            WHERE last_run IS NULL OR last_run < date_trunc('minute', $1::timestamptz)
-            """,
-            now,
-        )
+        rows = await q.due_schedule_rows(self.pool, now=now)
         due = []
         for row in rows:
             try:
-                when = ScheduleWhen.model_validate(json.loads(row["when_spec"]))
-                occurrence = due_occurrence(when, row["schedule_name"], now)
+                when = ScheduleWhen.model_validate(json.loads(row.when_spec))
+                occurrence = due_occurrence(when, row.schedule_name, now)
             except Exception:
                 # when-specs are repo-controlled; one malformed spec
                 # must not abort the sweep for all other projects.
                 logger.exception(
                     "invalid schedule spec, skipping",
                     extra={
-                        "project_id": row["project_id"],
-                        "schedule": row["schedule_name"],
+                        "project_id": row.project_id,
+                        "schedule": row.schedule_name,
                     },
                 )
                 continue
-            last_run = row["last_run"]
+            last_run = row.last_run
             if occurrence is not None and (last_run is None or last_run < occurrence):
                 due.append(
                     DueEffect(
-                        project_id=row["project_id"],
-                        schedule_name=row["schedule_name"],
-                        effect=row["effect"],
+                        project_id=row.project_id,
+                        schedule_name=row.schedule_name,
+                        effect=row.effect,
                         when=when,
                     )
                 )
         return due
 
     async def start_run(self, due: DueEffect) -> int:
-        return await self.pool.fetchval(
-            """
-            INSERT INTO scheduled_effect_runs (project_id, schedule_name, effect)
-            VALUES ($1, $2, $3) RETURNING id
-            """,
-            due.project_id,
-            due.schedule_name,
-            due.effect,
+        return expect(
+            await q.start_scheduled_run(
+                self.pool,
+                project_id=due.project_id,
+                schedule_name=due.schedule_name,
+                effect=due.effect,
+            )
         )
 
     async def finish_run(
         self, run_id: int, *, success: bool, error: str | None = None
     ) -> None:
-        await self.pool.execute(
-            """
-            UPDATE scheduled_effect_runs
-            SET status = $2, error = $3, finished_at = now() WHERE id = $1
-            """,
-            run_id,
-            "succeeded" if success else "failed",
-            error,
+        await q.finish_scheduled_run(
+            self.pool,
+            id_=run_id,
+            status="succeeded" if success else "failed",
+            error=error,
         )
 
     async def latest_runs_for_project(self, project_id: int) -> list[dict]:
         """Most recent run per (schedule, effect)."""
-        rows = await self.pool.fetch(
-            """
-            SELECT DISTINCT ON (schedule_name, effect)
-                   id, schedule_name, effect, status, error,
-                   started_at, finished_at
-            FROM scheduled_effect_runs WHERE project_id = $1
-            ORDER BY schedule_name, effect, started_at DESC
-            """,
-            project_id,
-        )
-        return [dict(row) for row in rows]
+        rows = await q.latest_scheduled_runs(self.pool, project_id=project_id)
+        return [dataclasses.asdict(row) for row in rows]
 
     async def schedules_for_project(self, project_id: int) -> list[dict]:
-        rows = await self.pool.fetch(
-            """
-            SELECT schedule_name, effect, when_spec, last_run
-            FROM scheduled_effects WHERE project_id = $1
-            ORDER BY schedule_name, effect
-            """,
-            project_id,
-        )
-        return [dict(row) for row in rows]
+        rows = await q.project_schedules(self.pool, project_id=project_id)
+        return [dataclasses.asdict(row) for row in rows]
 
     async def mark_run(self, due: DueEffect, now: datetime | None = None) -> None:
-        await self.pool.execute(
-            """
-            UPDATE scheduled_effects SET last_run = $4
-            WHERE project_id = $1 AND schedule_name = $2 AND effect = $3
-            """,
-            due.project_id,
-            due.schedule_name,
-            due.effect,
-            now or datetime.now(tz=UTC),
+        await q.mark_schedule_run(
+            self.pool,
+            project_id=due.project_id,
+            schedule_name=due.schedule_name,
+            effect=due.effect,
+            last_run=now or datetime.now(tz=UTC),
         )

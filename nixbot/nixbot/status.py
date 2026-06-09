@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 import httpx
 
 from .ansi import strip_ansi
+from .db_gen import failed as q
 from .forge import ForgeError
 
 if TYPE_CHECKING:
@@ -221,29 +222,19 @@ class FailedStatusStore:
         self.pool = pool
 
     async def mark_failed(self, revision: str, status_name: str) -> None:
-        await self.pool.execute(
-            """
-            INSERT INTO failed_statuses (revision, status_name, timestamp)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (revision, status_name)
-            DO UPDATE SET timestamp = EXCLUDED.timestamp
-            """,
-            revision,
-            status_name,
-            datetime.now(tz=UTC).timestamp(),
+        await q.upsert_failed_status(
+            self.pool,
+            revision=revision,
+            status_name=status_name,
+            timestamp=datetime.now(tz=UTC).timestamp(),
         )
 
     async def get_failed(self, revision: str) -> set[str]:
-        rows = await self.pool.fetch(
-            "SELECT status_name FROM failed_statuses WHERE revision = $1", revision
-        )
-        return {row["status_name"] for row in rows}
+        return set(await q.failed_status_names(self.pool, revision=revision))
 
     async def clear(self, revision: str, status_name: str) -> None:
-        await self.pool.execute(
-            "DELETE FROM failed_statuses WHERE revision = $1 AND status_name = $2",
-            revision,
-            status_name,
+        await q.clear_failed_status(
+            self.pool, revision=revision, status_name=status_name
         )
 
 

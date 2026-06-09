@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 
 import httpx
 import pytest
 
-from nixbot.db import BuildRecord
+from nixbot.db_gen.models import Build as BuildRecord
 from nixbot.events import ChangeEvent, RepoInfo
 from nixbot.forge import GitlabClient
 from nixbot.models import NixEvalJobError
@@ -87,9 +88,15 @@ BUILD = BuildRecord(
     commit_sha="sha1",
     branch="main",
     pr_number=None,
+    pr_author=None,
     status="building",
     status_generation=0,
     effects_started=False,
+    error=None,
+    created_at=datetime(2024, 1, 1, tzinfo=UTC),
+    started_at=None,
+    finished_at=None,
+    eval_warnings=None,
     eval_completed=False,
 )
 

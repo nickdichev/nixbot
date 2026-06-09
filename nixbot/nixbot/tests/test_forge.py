@@ -1109,3 +1109,29 @@ async def test_gitea_legacy_hook_delete_failure_warns(
             "https://ci.example.com",
         )
     assert any("failed to remove legacy" in record.message for record in caplog.records)
+
+
+async def test_sync_tolerates_in_batch_duplicates(pool: asyncpg.Pool) -> None:
+    """A forge listing (or static config) repeating the same repo must
+    not abort the batch upsert: ON CONFLICT DO UPDATE raises "cannot
+    affect row a second time" on in-batch duplicates, so the store
+    dedupes with last-entry-wins."""
+
+    await pool.execute("TRUNCATE projects CASCADE")
+    store = RepoStore(pool)
+    first = repo("acme", "dup")
+    renamed = DiscoveredRepo(**{**first.__dict__, "repo": "dup-renamed"})
+    await store.sync_discovered([first, renamed])
+    row = await store.by_forge_id("github", "acme-dup")
+    assert row is not None
+    assert row.name == "dup-renamed"
+
+    await store.sync_pull_based(
+        [
+            ("pull/two", "https://x/old.git", "main"),
+            ("pull/two", "https://x/new.git", "main"),
+        ]
+    )
+    row = await store.by_forge_id("pull_based", "pull/two")
+    assert row is not None
+    assert row.url == "https://x/new.git"

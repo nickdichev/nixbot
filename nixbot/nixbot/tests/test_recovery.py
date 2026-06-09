@@ -7,7 +7,8 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-from nixbot.db import BuildDB
+from nixbot import db
+from nixbot.db_gen import builds as builds_q
 from nixbot.recovery import (
     check_store_paths,
     cleanup_old_builds,
@@ -73,7 +74,7 @@ async def test_settle_already_built(pool: asyncpg.Pool) -> None:
     async def checker(paths: list[str]) -> set[str]:
         return {p for p in paths if "present" in p}
 
-    remaining, settled = await settle_already_built(BuildDB(pool), target, checker)
+    remaining, settled = await settle_already_built(pool, target, checker)
     assert [j.attr for j in remaining] == ["missing"]
     assert settled == [("present", "/nix/store/present-out")]
     statuses = {
@@ -121,10 +122,12 @@ class _FakePool:
         self.ids = ids
         self.on_fetch = on_fetch
 
-    async def fetch(self, _query: str) -> list[dict]:
+    async def fetch(self, _query: str) -> list[tuple[int]]:
         if self.on_fetch is not None:
             self.on_fetch()
-        return [{"id": build_id} for build_id in self.ids]
+        # Positional access like asyncpg.Record (the sqlc-generated
+        # decode hooks index by column position).
+        return [(build_id,) for build_id in self.ids]
 
 
 async def test_orphan_log_dirs(tmp_path: Path) -> None:
@@ -255,7 +258,7 @@ async def test_failed_rebuild_settles_pending_effects(pool: asyncpg.Pool) -> Non
         "VALUES ($1, 'deploy', 'pending')",
         build_id,
     )
-    await BuildDB(pool).set_build_status(build_id, "failed")
+    await db.set_build_status(pool, build_id, "failed")
     row = await pool.fetchrow(
         "SELECT status, error FROM build_effects WHERE build_id = $1",
         build_id,
@@ -268,15 +271,16 @@ async def test_eval_start_clears_stale_eval_warnings(pool: asyncpg.Pool) -> None
     """A re-run build must not show the previous attempt's warnings."""
 
     build_id = await make_build(pool, "lw-rerun")
-    db = BuildDB(pool)
-    await db.set_eval_warnings(
-        build_id, '[{"level": "warning", "message": "old", "count": 3}]'
+    await builds_q.set_eval_warnings(
+        pool,
+        id_=build_id,
+        warnings='[{"level": "warning", "message": "old", "count": 3}]',
     )
-    await db.set_build_status(build_id, "failed")
+    await db.set_build_status(pool, build_id, "failed")
     assert await pool.fetchval(
         "SELECT eval_warnings FROM builds WHERE id = $1", build_id
     )
-    await db.set_build_status(build_id, "evaluating")
+    await db.set_build_status(pool, build_id, "evaluating")
     assert (
         await pool.fetchval("SELECT eval_warnings FROM builds WHERE id = $1", build_id)
         is None

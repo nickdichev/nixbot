@@ -11,15 +11,16 @@ import json
 import asyncpg
 import pytest
 
+from nixbot import build_run, db
 from nixbot import migrations as migrations_mod
-from nixbot.db import BuildDB
+from nixbot.db_gen import builds as builds_q
 from nixbot.failed_builds import PostgresFailedBuildCache
 from nixbot.migrations import apply_migrations, load_migrations
 from nixbot.models import CacheStatus
 from nixbot.scheduler import AttributeResult, AttributeStatus
 from nixbot.status import FailedStatusStore
 
-from .support import db_pool, insert_build, insert_project, mk_job
+from .support import attribute_statuses, db_pool, insert_build, insert_project, mk_job
 
 
 async def _connect(dsn: str) -> asyncpg.Connection:
@@ -185,10 +186,9 @@ async def test_get_or_create_build_concurrent_no_duplicates(postgres_dsn: str) -
     # concurrent change events for the same tree create two builds.
     async with db_pool(postgres_dsn, min_size=5, max_size=5) as pool:
         project_id = await insert_project(pool, "race")
-        db = BuildDB(pool)
         results = await asyncio.gather(
             *(
-                db.get_or_create_build(project_id, "tree-r", "sha", "main")
+                db.get_or_create_build(pool, project_id, "tree-r", "sha", "main")
                 for _ in range(5)
             )
         )
@@ -204,11 +204,14 @@ async def test_cancelled_build_not_reused(pool: asyncpg.Pool) -> None:
     # A cancelled build carries no verdict; re-pushing the same tree
     # must build again instead of re-reporting "cancelled".
     project_id = await insert_project(pool, "cancelled-reuse")
-    db = BuildDB(pool)
-    first, created = await db.get_or_create_build(project_id, "tree-c", "sha", "main")
+    first, created = await db.get_or_create_build(
+        pool, project_id, "tree-c", "sha", "main"
+    )
     assert created
     await pool.execute("UPDATE builds SET status = 'cancelled' WHERE id = $1", first.id)
-    second, created = await db.get_or_create_build(project_id, "tree-c", "sha2", "main")
+    second, created = await db.get_or_create_build(
+        pool, project_id, "tree-c", "sha2", "main"
+    )
     assert created
     assert second.id != first.id
 
@@ -218,10 +221,12 @@ async def test_reuse_backfills_pr_fields(pool: asyncpg.Pool) -> None:
     # tree must backfill pr_number/pr_author so the PR author keeps
     # restart/cancel rights.
     project_id = await insert_project(pool, "pr-backfill")
-    db = BuildDB(pool)
-    first, _ = await db.get_or_create_build(project_id, "tree-p", "sha", "feature")
+    first, _ = await db.get_or_create_build(
+        pool, project_id, "tree-p", "sha", "feature"
+    )
     assert first.pr_number is None
     second, created = await db.get_or_create_build(
+        pool,
         project_id,
         "tree-p",
         "sha",
@@ -246,8 +251,8 @@ async def test_reuse_by_other_pr_clears_both_identity_fields(
     # event must not leave a row mixing PR A's number with no author,
     # nor attach PR B's author to PR A's number.
     project_id = await insert_project(pool, "pr-cross")
-    db = BuildDB(pool)
     first, _ = await db.get_or_create_build(
+        pool,
         project_id,
         "tree-x",
         "sha",
@@ -256,6 +261,7 @@ async def test_reuse_by_other_pr_clears_both_identity_fields(
         pr_author="github:alice",
     )
     second, created = await db.get_or_create_build(
+        pool,
         project_id,
         "tree-x",
         "sha2",
@@ -281,8 +287,8 @@ async def test_branch_push_takes_over_reused_pr_build(pool: asyncpg.Pool) -> Non
     # the merge) sheds the PR identity and takes over the branch field,
     # else the UI and the pr_number guards keep pointing at the PR.
     project_id = await insert_project(pool, "pr-shed")
-    db = BuildDB(pool)
     first, _ = await db.get_or_create_build(
+        pool,
         project_id,
         "tree-d",
         "sha",
@@ -290,7 +296,9 @@ async def test_branch_push_takes_over_reused_pr_build(pool: asyncpg.Pool) -> Non
         pr_number=4,
         pr_author="github:alice",
     )
-    second, created = await db.get_or_create_build(project_id, "tree-d", "sha", "main")
+    second, created = await db.get_or_create_build(
+        pool, project_id, "tree-d", "sha", "main"
+    )
     assert not created
     assert second.id == first.id
     assert second.pr_number is None
@@ -307,9 +315,9 @@ async def test_pr_does_not_capture_branch_push_build(pool: asyncpg.Pool) -> None
     # branch sharing the tree hash must not gain pr_author authz
     # (restart/cancel control) over it.
     project_id = await insert_project(pool, "pr-capture")
-    db = BuildDB(pool)
-    first, _ = await db.get_or_create_build(project_id, "tree-m", "sha", "main")
+    first, _ = await db.get_or_create_build(pool, project_id, "tree-m", "sha", "main")
     second, created = await db.get_or_create_build(
+        pool,
         project_id,
         "tree-m",
         "sha",
@@ -332,8 +340,7 @@ async def test_complete_attribute_preserves_eval_outputs(pool: asyncpg.Pool) -> 
     # map, and must never NULL an existing map when no out path is
     # known (restarted/cancelled attributes).
     project_id = await insert_project(pool, "multi-out")
-    db = BuildDB(pool)
-    build, _ = await db.get_or_create_build(project_id, "tree-o", "sha", "main")
+    build, _ = await db.get_or_create_build(pool, project_id, "tree-o", "sha", "main")
     job = mk_job("foo")
     job = job.model_copy(
         update={
@@ -343,7 +350,7 @@ async def test_complete_attribute_preserves_eval_outputs(pool: asyncpg.Pool) -> 
             }
         }
     )
-    await db.record_attributes(build.id, [job])
+    await build_run.record_attributes(pool, build.id, [job])
 
     async def outputs() -> dict:
         return json.loads(
@@ -356,6 +363,7 @@ async def test_complete_attribute_preserves_eval_outputs(pool: asyncpg.Pool) -> 
 
     # Completion without an out path (e.g. cancelled) keeps the map.
     await db.complete_attribute(
+        pool,
         build.id,
         AttributeResult(
             attr="foo",
@@ -372,6 +380,7 @@ async def test_complete_attribute_preserves_eval_outputs(pool: asyncpg.Pool) -> 
 
     # Successful completion updates "out" but keeps "dev".
     await db.complete_attribute(
+        pool,
         build.id,
         AttributeResult(
             attr="foo",
@@ -395,8 +404,7 @@ async def test_complete_attribute_marks_substituted_as_cached(
     # substituted from a binary cache must set it, not only ones
     # skipped because they were already in the local store.
     project_id = await insert_project(pool, "cached-flag")
-    db = BuildDB(pool)
-    build, _ = await db.get_or_create_build(project_id, "tree-s", "sha", "main")
+    build, _ = await db.get_or_create_build(pool, project_id, "tree-s", "sha", "main")
 
     async def cached(attr: str) -> bool:
         return await pool.fetchval(
@@ -412,6 +420,7 @@ async def test_complete_attribute_marks_substituted_as_cached(
     ):
         job = mk_job(attr, cache_status=cache_status)
         await db.complete_attribute(
+            pool,
             build.id,
             AttributeResult(
                 attr=attr,
@@ -431,11 +440,11 @@ async def test_complete_attribute_replaces_log_row(pool: asyncpg.Pool) -> None:
     # Attribute restarts rewrite the same log file; the metadata row
     # must be replaced, not duplicated with stale sizes.
     project_id = await insert_project(pool, "log-dup")
-    db = BuildDB(pool)
-    build, _ = await db.get_or_create_build(project_id, "tree-l", "sha", "main")
+    build, _ = await db.get_or_create_build(pool, project_id, "tree-l", "sha", "main")
     job = mk_job("foo")
     for size in (10, 20):
         await db.complete_attribute(
+            pool,
             build.id,
             AttributeResult(
                 attr="foo",
@@ -464,9 +473,8 @@ async def test_record_attributes_persists_pending_rows_with_outputs(
     pool: asyncpg.Pool,
 ) -> None:
     project_id = await insert_project(pool, "record-attrs")
-    db = BuildDB(pool)
-    build, _ = await db.get_or_create_build(project_id, "tree-ra", "sha", "main")
-    await db.record_attributes(build.id, [mk_job("a"), mk_job("b")])
+    build, _ = await db.get_or_create_build(pool, project_id, "tree-ra", "sha", "main")
+    await build_run.record_attributes(pool, build.id, [mk_job("a"), mk_job("b")])
     rows = {
         r["attr"]: r
         for r in await pool.fetch(
@@ -479,6 +487,7 @@ async def test_record_attributes_persists_pending_rows_with_outputs(
     assert '"/nix/store/a-out"' in rows["a"]["outputs"]
     # Re-recording (rerun) must not reset completed rows.
     await db.complete_attribute(
+        pool,
         build.id,
         AttributeResult(
             attr="a",
@@ -487,7 +496,7 @@ async def test_record_attributes_persists_pending_rows_with_outputs(
             out_path="/nix/store/a-out",
         ),
     )
-    await db.record_attributes(build.id, [mk_job("a")])
+    await build_run.record_attributes(pool, build.id, [mk_job("a")])
     status = await pool.fetchval(
         "SELECT status FROM build_attributes WHERE build_id = $1 AND attr = 'a'",
         build.id,
@@ -502,13 +511,18 @@ async def test_mark_attribute_building_does_not_resurrect_cancelled_rows(
     scheduler later dispatches it."""
 
     project_id = await insert_project(pool, "no-resurrect")
-    db = BuildDB(pool)
-    build, _ = await db.get_or_create_build(project_id, "tree-c", "sha", "main")
+    build, _ = await db.get_or_create_build(pool, project_id, "tree-c", "sha", "main")
     job = mk_job("foo")
-    await db.record_attributes(build.id, [job])
+    await build_run.record_attributes(pool, build.id, [job])
     assert (
-        await db.mark_attribute_building(build.id, "foo", job.system, job.drv_path)
-        is True
+        await builds_q.mark_attribute_building(
+            pool,
+            build_id=build.id,
+            attr="foo",
+            system=job.system,
+            drv_path=job.drv_path,
+        )
+        is not None
     )
     await pool.execute(
         "UPDATE build_attributes SET status = 'cancelled', "
@@ -516,8 +530,14 @@ async def test_mark_attribute_building_does_not_resurrect_cancelled_rows(
         build.id,
     )
     assert (
-        await db.mark_attribute_building(build.id, "foo", job.system, job.drv_path)
-        is False
+        await builds_q.mark_attribute_building(
+            pool,
+            build_id=build.id,
+            attr="foo",
+            system=job.system,
+            drv_path=job.drv_path,
+        )
+        is None
     )
     status = await pool.fetchval(
         "SELECT status FROM build_attributes WHERE build_id = $1 AND attr = 'foo'",
@@ -530,11 +550,12 @@ async def test_mark_attribute_building_sets_status_and_started_at(
     pool: asyncpg.Pool,
 ) -> None:
     project_id = await insert_project(pool, "building-status")
-    db = BuildDB(pool)
-    build, _ = await db.get_or_create_build(project_id, "tree-b", "sha", "main")
+    build, _ = await db.get_or_create_build(pool, project_id, "tree-b", "sha", "main")
     job = mk_job("foo")
-    await db.record_attributes(build.id, [job])
-    await db.mark_attribute_building(build.id, "foo", job.system, job.drv_path)
+    await build_run.record_attributes(pool, build.id, [job])
+    await builds_q.mark_attribute_building(
+        pool, build_id=build.id, attr="foo", system=job.system, drv_path=job.drv_path
+    )
     row = await pool.fetchrow(
         "SELECT status, started_at FROM build_attributes "
         "WHERE build_id = $1 AND attr = 'foo'",
@@ -543,6 +564,7 @@ async def test_mark_attribute_building_sets_status_and_started_at(
     assert row["status"] == "building"
     assert row["started_at"] is not None
     await db.complete_attribute(
+        pool,
         build.id,
         AttributeResult(
             attr="foo",
@@ -568,8 +590,7 @@ async def test_complete_attribute_if_unfinished_skips_terminal_rows(
     already settled, without a per-result status round trip."""
 
     project_id = await insert_project(pool, "if-unfinished")
-    db = BuildDB(pool)
-    build, _ = await db.get_or_create_build(project_id, "tree-u", "sha", "main")
+    build, _ = await db.get_or_create_build(pool, project_id, "tree-u", "sha", "main")
     job = mk_job("foo")
 
     def result(status: AttributeStatus) -> AttributeResult:
@@ -581,17 +602,18 @@ async def test_complete_attribute_if_unfinished_skips_terminal_rows(
             system=job.system,
         )
 
-    await db.record_attributes(build.id, [job])
+    await build_run.record_attributes(pool, build.id, [job])
     await db.complete_attribute(
-        build.id, result(AttributeStatus.succeeded), if_unfinished=True
+        pool, build.id, result(AttributeStatus.succeeded), if_unfinished=True
     )
-    assert await db.get_attribute_statuses(build.id) == {"foo": "succeeded"}
+    assert await attribute_statuses(pool, build.id) == {"foo": "succeeded"}
     await db.complete_attribute(
-        build.id, result(AttributeStatus.cancelled), if_unfinished=True
+        pool, build.id, result(AttributeStatus.cancelled), if_unfinished=True
     )
-    assert await db.get_attribute_statuses(build.id) == {"foo": "succeeded"}
+    assert await attribute_statuses(pool, build.id) == {"foo": "succeeded"}
     job_b = mk_job("bar")
     await db.complete_attribute(
+        pool,
         build.id,
         AttributeResult(
             attr="bar",
@@ -602,7 +624,7 @@ async def test_complete_attribute_if_unfinished_skips_terminal_rows(
         ),
         if_unfinished=True,
     )
-    statuses = await db.get_attribute_statuses(build.id)
+    statuses = await attribute_statuses(pool, build.id)
     assert statuses["bar"] == "skipped_local"
 
 

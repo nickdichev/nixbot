@@ -19,6 +19,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 from ..auth import can_control_build, is_admin, same_origin  # noqa: TID252
+from ..db_gen import maintenance as maint_gen  # noqa: TID252
+from ..db_gen import projects as proj_gen  # noqa: TID252
 from ..hook_secrets import WebhookSecrets  # noqa: TID252
 
 if TYPE_CHECKING:
@@ -116,10 +118,8 @@ class _ControlRoutes:
         attr: str,
     ) -> RedirectResponse:
         build = await self._authorize(request, forge, owner, name, number)
-        known = await self.ctx.pool.fetchval(
-            "SELECT 1 FROM build_attributes WHERE build_id = $1 AND attr = $2",
-            build["id"],
-            attr,
+        known = await maint_gen.attribute_known(
+            self.ctx.pool, build_id=build["id"], attr=attr
         )
         if known is None:
             raise HTTPException(status_code=404, detail="unknown attribute")
@@ -162,11 +162,9 @@ class _ControlRoutes:
             raise HTTPException(status_code=403, detail="cross-origin request")
         if not is_admin(await self.ctx.request_user(request), self.authz):
             raise HTTPException(status_code=403, detail="not authorized")
-        rows = await self.ctx.pool.fetch(
-            "SELECT id FROM builds WHERE status IN ('pending', 'evaluating', 'building')"
-        )
-        for row in rows:
-            await self.backend.cancel_build(row["id"])
+        build_ids = await maint_gen.running_build_ids(self.ctx.pool)
+        for build_id in build_ids:
+            await self.backend.cancel_build(build_id)
         return RedirectResponse("/builds", status_code=303)
 
     async def _require_repo_admin(self, request: Request, project_id: int) -> None:
@@ -201,10 +199,8 @@ class _ControlRoutes:
         project = await self.ctx.repo_or_404(forge, owner, name, request)
         await self._require_repo_admin(request, project["id"])
         enabled = request.url.path.endswith("/enable")
-        await self.ctx.pool.execute(
-            "UPDATE projects SET enabled = $2, updated_at = now() WHERE id = $1",
-            project["id"],
-            enabled,
+        await proj_gen.set_project_enabled(
+            self.ctx.pool, id_=project["id"], enabled=enabled
         )
         return {"owner": owner, "name": name, "enabled": enabled}
 
@@ -227,11 +223,7 @@ class _ControlRoutes:
         self, request: Request, project_id: int, q: Annotated[str, Form()] = ""
     ) -> RedirectResponse:
         await self._require_repo_admin(request, project_id)
-        await self.ctx.pool.execute(
-            "UPDATE projects SET enabled = NOT enabled, updated_at = now() "
-            "WHERE id = $1",
-            project_id,
-        )
+        await proj_gen.toggle_project_enabled(self.ctx.pool, id_=project_id)
         # Back to the dashboard with the project filter intact.
         return RedirectResponse(f"/?q={quote(q)}" if q else "/", status_code=303)
 

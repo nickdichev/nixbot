@@ -14,6 +14,7 @@ in
 {
   treefmt = (inputs.treefmt-nix.lib.evalModule pkgs ../formatter/treefmt.nix).config.build.check self;
   nixbot-tests = self.packages.${pkgs.stdenv.hostPlatform.system}.nixbot.tests.pytest;
+  sqlc-generated = import ./sqlc.nix checkArgs;
 }
 // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
   nixbot = import ./nixbot.nix checkArgs;
