@@ -9,14 +9,11 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
 from nixbot_effects.tests.support import init_repo
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 # Minimal flake that defines a herculesCI output with named effects.
 # No external dependencies — uses builtins only.
@@ -62,6 +59,9 @@ def test_list_via_flake_ref(flake_repo: Path) -> None:
         check=True,
         text=True,
         capture_output=True,
+        # The package is importable from the source tree, not the
+        # pytest invocation directory.
+        cwd=Path(__file__).parents[2],
     )
     effects = json.loads(result.stdout)
     assert sorted(effects) == ["deploy", "notify"]
