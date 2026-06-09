@@ -41,11 +41,21 @@ PR_REF_MAX_AGE = 90 * 86400
 ORPHAN_FILE_MAX_AGE = 86400
 
 
+def pr_refspec(forge: str, pr_number: int) -> str:
+    """GitLab serves MR heads under refs/merge-requests/<iid>/*;
+    GitHub and Gitea use refs/pull/<number>/*."""
+    ref = (
+        f"refs/merge-requests/{pr_number}"
+        if forge == "gitlab"
+        else f"refs/pull/{pr_number}"
+    )
+    return f"+{ref}/*:{ref}/*"
+
+
 class GitError(Exception):
     """A git command failed."""
 
     def __init__(self, args: list[str], returncode: int, stderr: str) -> None:
-        self.args_list = args
         self.returncode = returncode
         self.stderr = stderr
         super().__init__(f"git {' '.join(args)} failed ({returncode}): {stderr}")

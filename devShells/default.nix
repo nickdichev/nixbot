@@ -25,6 +25,7 @@ in
         ps:
         [
           ps.pytest
+          ps.pytest-asyncio
           ps.pytest-timeout
           ps.pytest-xdist
           ps.pytest-benchmark

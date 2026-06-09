@@ -9,12 +9,11 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
-if TYPE_CHECKING:
-    from pathlib import Path
+from nixbot_effects.tests.support import init_repo
 
 # Minimal flake that defines a herculesCI output with named effects.
 # No external dependencies — uses builtins only.
@@ -37,27 +36,10 @@ FLAKE_NIX = """\
 """
 
 
-def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=True,
-        text=True,
-        capture_output=True,
-    ).stdout.strip()
-
-
 @pytest.fixture
 def flake_repo(tmp_path: Path) -> Path:
     """Create a git repo with a minimal flake that has effects."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-b", "main")
-    _git(repo, "config", "user.name", "test")
-    _git(repo, "config", "user.email", "test@test")
-
-    (repo / "flake.nix").write_text(FLAKE_NIX)
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-m", "init")
+    repo, _rev = init_repo(tmp_path, {"flake.nix": FLAKE_NIX})
     return repo
 
 
@@ -77,6 +59,9 @@ def test_list_via_flake_ref(flake_repo: Path) -> None:
         check=True,
         text=True,
         capture_output=True,
+        # The package is importable from the source tree, not the
+        # pytest invocation directory.
+        cwd=Path(__file__).parents[2],
     )
     effects = json.loads(result.stdout)
     assert sorted(effects) == ["deploy", "notify"]

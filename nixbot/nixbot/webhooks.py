@@ -28,6 +28,9 @@ from dataclasses import dataclass
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any, Protocol
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 from fastapi import APIRouter, HTTPException, Request, Response
 
 if TYPE_CHECKING:
@@ -354,6 +357,50 @@ class SecretStore(Protocol):
     async def secret_for_repo(self, forge_repo_id: str) -> str | None: ...
 
 
+@dataclass(frozen=True)
+class _TokenForge:
+    """Per-forge knobs for the token-forge webhook flow (per-repository
+    secrets in the database: Gitea, GitLab). GitHub keeps its own
+    handler: deployment-wide App secret, signature checked before
+    parsing."""
+
+    name: str
+    repo_id_key: str  # payload key holding the repo object with "id"
+    auth_header: str
+    verify: Callable[[str, bytes, str], bool]  # (secret, body, header) -> ok
+    auth_error: str
+    guid_header: str
+    event_header: str
+    parse: Callable[[str, dict[str, Any]], WebhookEvent | None]
+
+
+def _verify_gitlab_token(secret: str, _body: bytes, token: str) -> bool:
+    return _constant_time_eq(token, secret)
+
+
+GITEA_FORGE = _TokenForge(
+    name="gitea",
+    repo_id_key="repository",
+    auth_header="X-Gitea-Signature",
+    verify=verify_gitea_signature,
+    auth_error="invalid signature",
+    guid_header="X-Gitea-Delivery",
+    event_header="X-Gitea-Event",
+    parse=parse_gitea_event,
+)
+
+GITLAB_FORGE = _TokenForge(
+    name="gitlab",
+    repo_id_key="project",
+    auth_header="X-Gitlab-Token",
+    verify=_verify_gitlab_token,
+    auth_error="invalid token",
+    guid_header="X-Gitlab-Event-UUID",
+    event_header="X-Gitlab-Event",
+    parse=parse_gitlab_event,
+)
+
+
 class _WebhookHandlers:
     def __init__(
         self,
@@ -388,42 +435,33 @@ class _WebhookHandlers:
         return await self._dispatch(guid, event)
 
     async def handle_gitea(self, request: Request) -> Response:
-        if self.gitea_secrets is None:
-            raise HTTPException(status_code=404, detail="gitea not configured")
-        body = await read_body(request)
-        payload = parse_webhook_body(request, body)
-        repo_id = str((payload.get("repository") or {}).get("id", ""))
-        try:
-            secret = await self.gitea_secrets.secret_for_repo(repo_id)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail="database unavailable") from e
-        if secret is None or not verify_gitea_signature(
-            secret, body, request.headers.get("X-Gitea-Signature", "")
-        ):
-            raise HTTPException(status_code=403, detail="invalid signature")
-        guid = request.headers.get("X-Gitea-Delivery", "")
-        if self.deduper.is_duplicate(guid):
-            return Response(status_code=202, content="duplicate delivery")
-        event = parse_gitea_event(request.headers.get("X-Gitea-Event", ""), payload)
-        return await self._dispatch(guid, event)
+        return await self._handle_token_forge(request, GITEA_FORGE, self.gitea_secrets)
 
     async def handle_gitlab(self, request: Request) -> Response:
-        if self.gitlab_secrets is None:
-            raise HTTPException(status_code=404, detail="gitlab not configured")
+        return await self._handle_token_forge(
+            request, GITLAB_FORGE, self.gitlab_secrets
+        )
+
+    async def _handle_token_forge(
+        self, request: Request, forge: _TokenForge, secrets: SecretStore | None
+    ) -> Response:
+        if secrets is None:
+            raise HTTPException(status_code=404, detail=f"{forge.name} not configured")
         body = await read_body(request)
         payload = parse_webhook_body(request, body)
-        repo_id = str((payload.get("project") or {}).get("id", ""))
+        repo_id = str((payload.get(forge.repo_id_key) or {}).get("id", ""))
         try:
-            secret = await self.gitlab_secrets.secret_for_repo(repo_id)
+            secret = await secrets.secret_for_repo(repo_id)
         except Exception as e:
             raise HTTPException(status_code=500, detail="database unavailable") from e
-        token = request.headers.get("X-Gitlab-Token", "")
-        if secret is None or not _constant_time_eq(token, secret):
-            raise HTTPException(status_code=403, detail="invalid token")
-        guid = request.headers.get("X-Gitlab-Event-UUID", "")
+        if secret is None or not forge.verify(
+            secret, body, request.headers.get(forge.auth_header, "")
+        ):
+            raise HTTPException(status_code=403, detail=forge.auth_error)
+        guid = request.headers.get(forge.guid_header, "")
         if self.deduper.is_duplicate(guid):
             return Response(status_code=202, content="duplicate delivery")
-        event = parse_gitlab_event(request.headers.get("X-Gitlab-Event", ""), payload)
+        event = forge.parse(request.headers.get(forge.event_header, ""), payload)
         return await self._dispatch(guid, event)
 
     async def _dispatch(self, guid: str, event: WebhookEvent | None) -> Response:

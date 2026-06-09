@@ -20,15 +20,15 @@ recovery (deploys are not idempotent).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import os
-import signal
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from .proc import ProcessGroup
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -195,14 +195,14 @@ async def _run(
     $HOME for ~/.ssh). On timeout or read errors the process group is
     killed so no effect keeps running detached.
     """
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
+    group = await ProcessGroup.start(
+        cmd,
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=STREAM_LIMIT,
-        start_new_session=True,  # own process group for clean kill
     )
+    proc = group.proc
     assert proc.stdout is not None  # noqa: S101
     assert proc.stderr is not None  # noqa: S101
     stdout_chunks: list[bytes] = []
@@ -215,9 +215,7 @@ async def _run(
                 proc.wait(),
             )
     except BaseException as e:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        await proc.wait()
+        await group.reap()
         if isinstance(e, TimeoutError):
             msg = f"{cmd[0]} {cmd[1]} timed out after {time_limit}s"
             raise EffectsError(msg) from e

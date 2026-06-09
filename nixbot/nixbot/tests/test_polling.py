@@ -38,33 +38,30 @@ class RecordingSink:
         self.changes.append((repo.name, branch, commit_sha))
 
 
-def test_poll_head(upstream: Path) -> None:
+async def test_poll_head(upstream: Path) -> None:
     repo = PolledRepository(name="r", url=str(upstream), default_branch="main")
-    sha = asyncio.run(poll_head(repo))
+    sha = await poll_head(repo)
     assert sha == git(upstream, "rev-parse", "HEAD")
     # Unknown branch: None.
     missing = PolledRepository(name="r", url=str(upstream), default_branch="nope")
-    assert asyncio.run(poll_head(missing)) is None
+    assert await poll_head(missing) is None
 
 
-def test_polling_detects_changes(upstream: Path) -> None:
+async def test_polling_detects_changes(upstream: Path) -> None:
     repo = PolledRepository(name="r", url=str(upstream), default_branch="main")
     sink = RecordingSink()
     service = PollingService([repo], sink)
 
-    async def run() -> None:
-        assert await service.poll_repo_once(repo)  # initial head
-        assert not await service.poll_repo_once(repo)  # unchanged
-        (upstream / "f").write_text("2")
-        git(upstream, "commit", "-am", "c2")
-        assert await service.poll_repo_once(repo)
-
-    asyncio.run(run())
+    assert await service.poll_repo_once(repo)  # initial head
+    assert not await service.poll_repo_once(repo)  # unchanged
+    (upstream / "f").write_text("2")
+    git(upstream, "commit", "-am", "c2")
+    assert await service.poll_repo_once(repo)
     assert len(sink.changes) == 2
     assert sink.changes[1][2] == git(upstream, "rev-parse", "HEAD")
 
 
-def test_poll_loop_survives_sink_errors(upstream: Path) -> None:
+async def test_poll_loop_survives_sink_errors(upstream: Path) -> None:
     """A sink failure must not kill the loop; the head is retried."""
 
     @dataclass
@@ -86,17 +83,14 @@ def test_poll_loop_survives_sink_errors(upstream: Path) -> None:
     sink = FlakySink()
     service = PollingService([repo], sink)
 
-    async def run() -> None:
-        service.start()
-        try:
-            for _ in range(200):
-                if sink.changes:
-                    break
-                await asyncio.sleep(0.05)
-        finally:
-            await service.stop()
-
-    asyncio.run(run())
+    service.start()
+    try:
+        for _ in range(200):
+            if sink.changes:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        await service.stop()
     assert sink.failures == 0  # first submit attempt failed
     assert sink.changes == [("r", "main", git(upstream, "rev-parse", "HEAD"))]
 

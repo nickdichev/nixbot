@@ -13,6 +13,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from .events import RepoInfo
+
 if TYPE_CHECKING:
     import asyncpg
 
@@ -32,6 +34,19 @@ class RepoRecord:
     url: str
     private: bool
     enabled: bool
+
+
+def repo_info(record: RepoRecord) -> RepoInfo:
+    return RepoInfo(
+        id=record.id,
+        key=f"{record.forge}/{record.owner}/{record.name}",
+        name=f"{record.owner}/{record.name}",
+        owner=record.owner,
+        repo=record.name,
+        forge=record.forge,
+        clone_url=record.url,
+        default_branch=record.default_branch,
+    )
 
 
 def _record(row: asyncpg.Record) -> RepoRecord:
@@ -161,10 +176,6 @@ class RepoStore:
         rows = await self.pool.fetch(
             "SELECT * FROM projects WHERE enabled ORDER BY owner, name"
         )
-        return [_record(row) for row in rows]
-
-    async def all_repos(self) -> list[RepoRecord]:
-        rows = await self.pool.fetch("SELECT * FROM projects ORDER BY owner, name")
         return [_record(row) for row in rows]
 
     async def by_id(self, project_id: int) -> RepoRecord | None:

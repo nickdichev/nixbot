@@ -94,19 +94,19 @@ def test_interpolate_secret_without_credentials_dir(
         interpolate(Interpolate("%(secret:x)s"), PROPS)
 
 
-def test_run_steps_success_and_env(tmp_path: Path) -> None:
+async def test_run_steps_success_and_env(tmp_path: Path) -> None:
     step = PostBuildStep(
         name="upload",
         environment={"TARGET": Interpolate("%(prop:out_path)s")},
         command=["sh", "-c", "echo uploading $TARGET"],
     )
-    results = asyncio.run(run_post_build_steps([step], PROPS, tmp_path))
+    results = await run_post_build_steps([step], PROPS, tmp_path)
     assert len(results) == 1
     assert results[0].success
     assert "uploading /nix/store/abc-foo" in results[0].output
 
 
-def test_run_steps_warn_only_failure_continues(tmp_path: Path) -> None:
+async def test_run_steps_warn_only_failure_continues(tmp_path: Path) -> None:
     steps = [
         PostBuildStep(
             name="cachix push",
@@ -116,7 +116,7 @@ def test_run_steps_warn_only_failure_continues(tmp_path: Path) -> None:
         ),
         PostBuildStep(name="after", environment={}, command=["true"]),
     ]
-    results = asyncio.run(run_post_build_steps(steps, PROPS, tmp_path))
+    results = await run_post_build_steps(steps, PROPS, tmp_path)
     assert len(results) == 2
     assert not results[0].success
     assert not results[0].failed  # warn-only: does not fail the attribute
@@ -124,20 +124,20 @@ def test_run_steps_warn_only_failure_continues(tmp_path: Path) -> None:
     assert results[1].success
 
 
-def test_run_steps_hard_failure_continues(tmp_path: Path) -> None:
+async def test_run_steps_hard_failure_continues(tmp_path: Path) -> None:
     # flunkOnFailure semantics: a hard failure fails the attribute but
     # the remaining steps still run (buildbot never set haltOnFailure).
     steps = [
         PostBuildStep(name="boom", environment={}, command=["false"]),
         PostBuildStep(name="after", environment={}, command=["true"]),
     ]
-    results = asyncio.run(run_post_build_steps(steps, PROPS, tmp_path))
+    results = await run_post_build_steps(steps, PROPS, tmp_path)
     assert len(results) == 2
     assert results[0].failed
     assert results[1].success
 
 
-def test_run_steps_inherit_service_environment(
+async def test_run_steps_inherit_service_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Tools like cachix need HOME/XDG_*; the service environment must
@@ -149,14 +149,14 @@ def test_run_steps_inherit_service_environment(
         environment={"EXTRA": "x"},
         command=["sh", "-c", "echo home=$HOME inherited=$INHERITED_VAR extra=$EXTRA"],
     )
-    results = asyncio.run(run_post_build_steps([step], PROPS, tmp_path))
+    results = await run_post_build_steps([step], PROPS, tmp_path)
     assert results[0].success
     assert f"home={tmp_path}" in results[0].output
     assert "inherited=from-service" in results[0].output
     assert "extra=x" in results[0].output
 
 
-def test_run_step_timeout_kills_process(tmp_path: Path) -> None:
+async def test_run_step_timeout_kills_process(tmp_path: Path) -> None:
     # A hung upload step must not block the attribute forever: the
     # step is killed (whole process group) and reported as a failure.
     pidfile = tmp_path / "pid"
@@ -165,7 +165,7 @@ def test_run_step_timeout_kills_process(tmp_path: Path) -> None:
         environment={},
         command=["sh", "-c", f"echo $$ > {pidfile}; sleep 60"],
     )
-    result = asyncio.run(run_post_build_step(step, PROPS, tmp_path, step_timeout=0.2))
+    result = await run_post_build_step(step, PROPS, tmp_path, step_timeout=0.2)
     assert not result.success
     assert "timed out" in result.output
     pid = int(pidfile.read_text())
@@ -173,7 +173,7 @@ def test_run_step_timeout_kills_process(tmp_path: Path) -> None:
         os.kill(pid, 0)
 
 
-def test_run_step_cancel_kills_process(tmp_path: Path) -> None:
+async def test_run_step_cancel_kills_process(tmp_path: Path) -> None:
     # Build cancellation must kill the running step's process group.
     pidfile = tmp_path / "pid"
     step = PostBuildStep(
@@ -182,23 +182,20 @@ def test_run_step_cancel_kills_process(tmp_path: Path) -> None:
         command=["sh", "-c", f"echo $$ > {pidfile}; sleep 60"],
     )
 
-    async def run() -> None:
-        task = asyncio.create_task(run_post_build_step(step, PROPS, tmp_path))
-        for _ in range(100):
-            if pidfile.exists() and pidfile.read_text().strip():
-                break
-            await asyncio.sleep(0.05)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    asyncio.run(run())
+    task = asyncio.create_task(run_post_build_step(step, PROPS, tmp_path))
+    for _ in range(100):
+        if pidfile.exists() and pidfile.read_text().strip():
+            break
+        await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
     pid = int(pidfile.read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
 
 
-def test_run_step_missing_binary_is_failure(tmp_path: Path) -> None:
+async def test_run_step_missing_binary_is_failure(tmp_path: Path) -> None:
     # A nonexistent step binary is a post-build failure result, not an
     # unhandled internal error.
     step = PostBuildStep(
@@ -206,6 +203,6 @@ def test_run_step_missing_binary_is_failure(tmp_path: Path) -> None:
         environment={},
         command=["/nonexistent/upload-tool"],
     )
-    result = asyncio.run(run_post_build_step(step, PROPS, tmp_path))
+    result = await run_post_build_step(step, PROPS, tmp_path)
     assert not result.success
     assert "upload-tool" in result.output

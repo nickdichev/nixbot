@@ -9,11 +9,13 @@ on the project; without it the hook must be created manually.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from .forge import ForgeError
+from .hook_registration import register_hook
 
 if TYPE_CHECKING:
+    import httpx
+
     from .forge import GitlabClient
     from .hook_secrets import WebhookSecrets
 
@@ -39,21 +41,6 @@ async def register_repo_hook(  # noqa: PLR0913
     target_url = hook_url(webhook_base_url)
     api = client.project_api_url(owner, repo)
 
-    try:
-        hooks: list[dict[str, Any]] = await client.paginated(f"{api}/hooks")
-    except ForgeError as e:
-        if e.status_code != 403:  # noqa: PLR2004
-            raise
-        logger.warning(
-            "no maintainer permission to manage webhooks; create one "
-            "manually for push and merge request events",
-            extra={"repo": f"{owner}/{repo}", "url": target_url},
-        )
-        return
-    existing_id = next(
-        (hook["id"] for hook in hooks if hook.get("url") == target_url), None
-    )
-
     hook_body = {
         "url": target_url,
         "token": secret,
@@ -61,28 +48,28 @@ async def register_repo_hook(  # noqa: PLR0913
         "merge_requests_events": True,
         "enable_ssl_verification": True,
     }
-    if existing_id is not None:
-        # The existing hook may carry a stale secret (e.g. after a
-        # database reset) and GitLab never exposes it, so re-sync in place.
-        response = await client.http.put(
+
+    async def update_hook(existing_id: int) -> httpx.Response:
+        return await client.http.put(
             f"{api}/hooks/{existing_id}",
             headers=client.auth_headers(),
             json=hook_body,
         )
-        if response.status_code >= 400:  # noqa: PLR2004
-            logger.error(
-                "failed to update webhook",
-                extra={"repo": f"{owner}/{repo}", "status": response.status_code},
-            )
-        return
-    logger.info("registering webhook", extra={"repo": f"{owner}/{repo}"})
-    response = await client.http.post(
-        f"{api}/hooks",
-        headers=client.auth_headers(),
-        json=hook_body,
-    )
-    if response.status_code >= 400:  # noqa: PLR2004
-        logger.error(
-            "failed to register webhook",
-            extra={"repo": f"{owner}/{repo}", "status": response.status_code},
+
+    async def create_hook() -> httpx.Response:
+        return await client.http.post(
+            f"{api}/hooks", headers=client.auth_headers(), json=hook_body
         )
+
+    await register_hook(
+        repo_name=f"{owner}/{repo}",
+        target_url=target_url,
+        list_hooks=lambda: client.paginated(f"{api}/hooks"),
+        hook_url_of=lambda hook: hook.get("url", ""),
+        update_hook=update_hook,
+        create_hook=create_hook,
+        permission_warning=(
+            "no maintainer permission to manage webhooks; create one "
+            "manually for push and merge request events"
+        ),
+    )

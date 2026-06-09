@@ -8,7 +8,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import httpx
 
@@ -26,6 +26,57 @@ class ForgeError(Exception):
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+def check_response(response: httpx.Response, forge_name: str) -> None:
+    """Raise ForgeError for HTTP error responses."""
+    if response.status_code >= 400:  # noqa: PLR2004
+        msg = f"{forge_name} request failed: {response.status_code} {response.text}"
+        raise ForgeError(msg, status_code=response.status_code)
+
+
+async def paginate_link(
+    http: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    forge_name: str,
+    subkey: str | None = None,
+) -> list[dict[str, Any]]:
+    """Collect all pages of a Link-header (RFC 5988) paginated endpoint.
+    `subkey` extracts a nested list from each page (GitHub wraps some
+    collections in an object)."""
+    results: list[dict[str, Any]] = []
+    next_url: str | None = url
+    while next_url:
+        response = await http.get(next_url, headers=headers)
+        check_response(response, forge_name)
+        data = response.json()
+        results.extend(data[subkey] if subkey else data)
+        next_url = response.links.get("next", {}).get("url")
+    return results
+
+
+class TokenForgeClient:
+    """Token-authenticated forge client (Gitea, GitLab): instance URL +
+    static token + httpx client."""
+
+    forge_name: ClassVar[str]
+
+    def __init__(
+        self,
+        instance_url: str,
+        token: str,
+        http: httpx.AsyncClient | None = None,
+    ) -> None:
+        self.instance_url = instance_url.rstrip("/")
+        self.token = token
+        self.http = http or httpx.AsyncClient()
+
+    def auth_headers(self) -> dict[str, str]:
+        raise NotImplementedError
+
+    async def paginated(self, url: str) -> list[dict[str, Any]]:
+        return await paginate_link(self.http, url, self.auth_headers(), self.forge_name)
 
 
 @dataclass(frozen=True)

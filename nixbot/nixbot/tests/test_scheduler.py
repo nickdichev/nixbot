@@ -24,7 +24,7 @@ from nixbot.scheduler import (
     sort_jobs_by_closures,
 )
 
-from .support import mk_job
+from .support import FakeCache, mk_job
 
 SYSTEM = "x86_64-linux"
 
@@ -42,27 +42,15 @@ class FakeExecutor:
         return self.outcomes.get(job.attr, BuildOutcome.success)
 
 
-class FakeCache:
-    def __init__(self, entries: dict[str, CachedFailure] | None = None) -> None:
-        self.entries = entries or {}
-        self.added: list[tuple[str, str]] = []
-
-    async def check(self, drv_path: str) -> CachedFailure | None:
-        return self.entries.get(drv_path)
-
-    async def add(self, drv_path: str, url: str) -> None:
-        self.added.append((drv_path, url))
-
-
-def run_scheduler(scheduler: JobScheduler, jobs: list) -> ScheduleResult:
-    return asyncio.run(scheduler.run(jobs))
+async def run_scheduler(scheduler: JobScheduler, jobs: list) -> ScheduleResult:
+    return await scheduler.run(jobs)
 
 
 def by_attr(result: ScheduleResult) -> dict[str, AttributeStatus]:
     return {r.attr: r.status for r in result.results}
 
 
-def test_topological_order() -> None:
+async def test_topological_order() -> None:
     # c depends on b depends on a.
     a, b, c = mk_job("a"), mk_job("b", deps=["a"]), mk_job("c", deps=["b"])
     closures = compute_job_closures([c, a, b])
@@ -72,7 +60,7 @@ def test_topological_order() -> None:
     assert [j.attr for j in order] == ["a", "b", "c"]
 
     executor = FakeExecutor()
-    result = run_scheduler(JobScheduler(executor, [SYSTEM]), [c, a, b])
+    result = await run_scheduler(JobScheduler(executor, [SYSTEM]), [c, a, b])
     assert executor.built.index("a") < executor.built.index("b")
     assert executor.built.index("b") < executor.built.index("c")
     assert result.success
@@ -90,7 +78,7 @@ def test_get_failed_dependents_transitive() -> None:
     assert {j.attr for j in removed} == {"b", "c"}
 
 
-def test_dependency_failure_propagation() -> None:
+async def test_dependency_failure_propagation() -> None:
     a, b, c, d = (
         mk_job("a"),
         mk_job("b", deps=["a"]),
@@ -98,7 +86,7 @@ def test_dependency_failure_propagation() -> None:
         mk_job("d"),
     )
     executor = FakeExecutor({"a": BuildOutcome.failure})
-    result = run_scheduler(JobScheduler(executor, [SYSTEM]), [a, b, c, d])
+    result = await run_scheduler(JobScheduler(executor, [SYSTEM]), [a, b, c, d])
     statuses = by_attr(result)
     assert statuses["a"] == AttributeStatus.failed
     assert statuses["b"] == AttributeStatus.dependency_failed
@@ -112,46 +100,46 @@ def test_dependency_failure_propagation() -> None:
     assert not result.success
 
 
-def test_supported_systems_filter() -> None:
+async def test_supported_systems_filter() -> None:
     native = mk_job("native")
     foreign = mk_job("foreign", system="riscv64-linux")
     executor = FakeExecutor()
-    result = run_scheduler(JobScheduler(executor, [SYSTEM]), [native, foreign])
+    result = await run_scheduler(JobScheduler(executor, [SYSTEM]), [native, foreign])
     assert executor.built == ["native"]
     assert "foreign" not in by_attr(result)
 
 
-def test_local_jobs_skipped_with_out_path_recorded() -> None:
+async def test_local_jobs_skipped_with_out_path_recorded() -> None:
     local = mk_job("local", cache_status=CacheStatus.local)
     executor = FakeExecutor()
-    result = run_scheduler(JobScheduler(executor, [SYSTEM]), [local])
+    result = await run_scheduler(JobScheduler(executor, [SYSTEM]), [local])
     assert executor.built == []
     assert by_attr(result)["local"] == AttributeStatus.skipped_local
     assert result.skipped_out_paths == [("local", "/nix/store/local-out")]
     assert result.success
 
 
-def test_local_job_unblocks_dependents() -> None:
+async def test_local_job_unblocks_dependents() -> None:
     base = mk_job("base", cache_status=CacheStatus.local)
     top = mk_job("top", deps=["base"])
     executor = FakeExecutor()
-    result = run_scheduler(JobScheduler(executor, [SYSTEM]), [base, top])
+    result = await run_scheduler(JobScheduler(executor, [SYSTEM]), [base, top])
     assert executor.built == ["top"]
     assert result.success
 
 
-def test_cached_jobs_scheduled_for_substitution() -> None:
+async def test_cached_jobs_scheduled_for_substitution() -> None:
     cached = mk_job("cached", cache_status=CacheStatus.cached)
     executor = FakeExecutor()
-    run_scheduler(JobScheduler(executor, [SYSTEM]), [cached])
+    await run_scheduler(JobScheduler(executor, [SYSTEM]), [cached])
     assert executor.built == ["cached"]
 
 
-def test_failed_eval_records() -> None:
+async def test_failed_eval_records() -> None:
     bad = NixEvalJobError(error="boom", attr="bad", attr_path=["bad"])
     good = mk_job("good")
     executor = FakeExecutor()
-    result = run_scheduler(JobScheduler(executor, [SYSTEM]), [bad, good])
+    result = await run_scheduler(JobScheduler(executor, [SYSTEM]), [bad, good])
     statuses = by_attr(result)
     assert statuses["bad"] == AttributeStatus.failed_eval
     assert statuses["good"] == AttributeStatus.succeeded
@@ -160,7 +148,7 @@ def test_failed_eval_records() -> None:
     assert not result.success
 
 
-def test_cached_failure_skip() -> None:
+async def test_cached_failure_skip() -> None:
     job = mk_job("flaky")
     cache = FakeCache(
         {
@@ -172,7 +160,7 @@ def test_cached_failure_skip() -> None:
         }
     )
     executor = FakeExecutor()
-    result = run_scheduler(
+    result = await run_scheduler(
         JobScheduler(executor, [SYSTEM], failed_build_cache=cache), [job]
     )
     assert executor.built == []
@@ -182,7 +170,7 @@ def test_cached_failure_skip() -> None:
     assert not result.success
 
 
-def test_cached_failure_propagates_to_dependents() -> None:
+async def test_cached_failure_propagates_to_dependents() -> None:
     base = mk_job("base")
     top = mk_job("top", deps=["base"])
     cache = FakeCache(
@@ -193,7 +181,7 @@ def test_cached_failure_propagates_to_dependents() -> None:
         }
     )
     executor = FakeExecutor()
-    result = run_scheduler(
+    result = await run_scheduler(
         JobScheduler(executor, [SYSTEM], failed_build_cache=cache), [base, top]
     )
     statuses = by_attr(result)
@@ -202,11 +190,11 @@ def test_cached_failure_propagates_to_dependents() -> None:
     assert executor.built == []
 
 
-def test_failure_recorded_in_cache() -> None:
+async def test_failure_recorded_in_cache() -> None:
     job = mk_job("breaks")
     cache = FakeCache()
     executor = FakeExecutor({"breaks": BuildOutcome.failure})
-    run_scheduler(
+    await run_scheduler(
         JobScheduler(
             executor, [SYSTEM], failed_build_cache=cache, build_url="http://ci/b/2"
         ),
@@ -215,12 +203,12 @@ def test_failure_recorded_in_cache() -> None:
     assert cache.added == [(job.drv_path, "http://ci/b/2")]
 
 
-def test_cancelled_not_recorded_in_cache_and_propagates_cancelled() -> None:
+async def test_cancelled_not_recorded_in_cache_and_propagates_cancelled() -> None:
     a = mk_job("a")
     b = mk_job("b", deps=["a"])
     cache = FakeCache()
     executor = FakeExecutor({"a": BuildOutcome.cancelled})
-    result = run_scheduler(
+    result = await run_scheduler(
         JobScheduler(executor, [SYSTEM], failed_build_cache=cache), [a, b]
     )
     assert cache.added == []
@@ -230,12 +218,12 @@ def test_cancelled_not_recorded_in_cache_and_propagates_cancelled() -> None:
     assert statuses["b"] == AttributeStatus.cancelled
 
 
-def test_mixed_eval_results_independent() -> None:
+async def test_mixed_eval_results_independent() -> None:
     bad = NixEvalJobError(error="nope", attr="bad", attr_path=["bad"])
     a = mk_job("a")
     b = mk_job("b", deps=["a"])
     executor = FakeExecutor()
-    result = run_scheduler(JobScheduler(executor, [SYSTEM]), [bad, a, b])
+    result = await run_scheduler(JobScheduler(executor, [SYSTEM]), [bad, a, b])
     statuses = by_attr(result)
     assert statuses == {
         "bad": AttributeStatus.failed_eval,
@@ -245,7 +233,7 @@ def test_mixed_eval_results_independent() -> None:
     assert not result.success
 
 
-def test_skipped_local_frees_dependents_immediately() -> None:
+async def test_skipped_local_frees_dependents_immediately() -> None:
     # parent is already in the local store (skipped); its dependent must
     # be dispatched right away, not only after the unrelated running
     # build finishes.
@@ -265,20 +253,17 @@ def test_skipped_local_frees_dependents_immediately() -> None:
                 started_child.set()
             return BuildOutcome.success
 
-    async def run() -> ScheduleResult:
-        executor = BlockingExecutor()
-        return await asyncio.wait_for(
-            JobScheduler(executor, [SYSTEM]).run([other, parent, child]), timeout=5
-        )
-
-    result = asyncio.run(run())
+    executor = BlockingExecutor()
+    result = await asyncio.wait_for(
+        JobScheduler(executor, [SYSTEM]).run([other, parent, child]), timeout=5
+    )
     statuses = by_attr(result)
     assert statuses["parent"] == AttributeStatus.skipped_local
     assert statuses["child"] == AttributeStatus.succeeded
     assert statuses["other"] == AttributeStatus.succeeded
 
 
-def test_post_build_failure_not_cached_and_dependents_build() -> None:
+async def test_post_build_failure_not_cached_and_dependents_build() -> None:
     # A post-build-step failure fails the attribute but must not poison
     # the failed-build cache (the derivation built fine) nor fail
     # dependents.
@@ -286,7 +271,7 @@ def test_post_build_failure_not_cached_and_dependents_build() -> None:
     child = mk_job("child", deps=["parent"])
     cache = FakeCache()
     executor = FakeExecutor({"parent": BuildOutcome.post_build_failure})
-    result = run_scheduler(
+    result = await run_scheduler(
         JobScheduler(executor, [SYSTEM], failed_build_cache=cache), [parent, child]
     )
     statuses = by_attr(result)
@@ -296,7 +281,7 @@ def test_post_build_failure_not_cached_and_dependents_build() -> None:
     assert cache.added == []
 
 
-def test_cached_failure_error_includes_url() -> None:
+async def test_cached_failure_error_includes_url() -> None:
     job = mk_job("a")
     cached = CachedFailure(
         drv_path=job.drv_path,
@@ -304,7 +289,7 @@ def test_cached_failure_error_includes_url() -> None:
         url="https://ci.example/builds/1",
     )
     cache = FakeCache({job.drv_path: cached})
-    result = run_scheduler(
+    result = await run_scheduler(
         JobScheduler(FakeExecutor(), [SYSTEM], failed_build_cache=cache), [job]
     )
     (res,) = result.results
@@ -313,7 +298,7 @@ def test_cached_failure_error_includes_url() -> None:
     assert "https://ci.example/builds/1" in res.error
 
 
-def test_on_result_reports_skips_before_builds_finish() -> None:
+async def test_on_result_reports_skips_before_builds_finish() -> None:
     """on_result fires for skips while other jobs are still running."""
     reported: list[tuple[str, str]] = []
     skip_seen = asyncio.Event()
@@ -334,13 +319,13 @@ def test_on_result_reports_skips_before_builds_finish() -> None:
         mk_job("local", cache_status=CacheStatus.local),
         mk_job("fresh", cache_status=CacheStatus.not_built),
     ]
-    result = asyncio.run(scheduler.run(jobs))
+    result = await scheduler.run(jobs)
     assert ("local", "skipped_local") in reported
     assert ("fresh", "succeeded") in reported
     assert {r.attr for r in result.results} == {"local", "fresh"}
 
 
-def test_streaming_builds_start_before_eval_finishes() -> None:
+async def test_streaming_builds_start_before_eval_finishes() -> None:
     # Jobs from early batches must be dispatched while later batches
     # (and the end-of-eval sentinel) are still outstanding.
     first_built = asyncio.Event()
@@ -364,10 +349,10 @@ def test_streaming_builds_start_before_eval_finishes() -> None:
         assert {r.attr for r in result.results} == {"early", "late"}
         assert all(r.status == AttributeStatus.succeeded for r in result.results)
 
-    asyncio.run(main())
+    await main()
 
 
-def test_streaming_dependency_across_batches() -> None:
+async def test_streaming_dependency_across_batches() -> None:
     # A job arriving in a later batch can depend on one from an
     # earlier batch that already finished; it must still build.
     async def main() -> None:
@@ -383,10 +368,10 @@ def test_streaming_dependency_across_batches() -> None:
         assert {r.attr for r in result.results} == {"dep", "top"}
         assert all(r.status == AttributeStatus.succeeded for r in result.results)
 
-    asyncio.run(main())
+    await main()
 
 
-def test_streaming_failed_dep_fails_late_dependent() -> None:
+async def test_streaming_failed_dep_fails_late_dependent() -> None:
     # A later-batch job depending on an already-failed job must be
     # marked dependency_failed, not built.
     dep_failed = asyncio.Event()
@@ -411,10 +396,10 @@ def test_streaming_failed_dep_fails_late_dependent() -> None:
         assert statuses["top"] == AttributeStatus.dependency_failed
         assert "top" not in executor.built
 
-    asyncio.run(main())
+    await main()
 
 
-def test_streaming_cancelled_dep_cancels_late_dependent() -> None:
+async def test_streaming_cancelled_dep_cancels_late_dependent() -> None:
     # A later-batch job depending on an already-cancelled (superseded)
     # job must settle as cancelled, not dependency_failed: batch timing
     # must not flip a superseded build from CANCELLED to FAILED.
@@ -440,10 +425,10 @@ def test_streaming_cancelled_dep_cancels_late_dependent() -> None:
         assert statuses["top"] == AttributeStatus.cancelled
         assert "top" not in executor.built
 
-    asyncio.run(main())
+    await main()
 
 
-def test_streaming_batch_order_does_not_leak_failed_dependency() -> None:
+async def test_streaming_batch_order_does_not_leak_failed_dependency() -> None:
     # Within one batch, a dependent listed before its dependency-failed
     # sibling must still settle as dependency_failed, not build.
     dep_failed = asyncio.Event()
@@ -469,10 +454,10 @@ def test_streaming_batch_order_does_not_leak_failed_dependency() -> None:
         assert statuses["top"] == AttributeStatus.dependency_failed
         assert executor.built == ["f"]
 
-    asyncio.run(main())
+    await main()
 
 
-def test_streaming_pending_dependent_fails_when_late_dep_arrives_failed() -> None:
+async def test_streaming_pending_dependent_fails_when_late_dep_arrives_failed() -> None:
     # A pending job whose dependency arrives in a later batch already
     # dependency-failed must settle as dependency_failed, not dispatch.
     f_failed = asyncio.Event()
@@ -515,10 +500,10 @@ def test_streaming_pending_dependent_fails_when_late_dep_arrives_failed() -> Non
         assert statuses["top"] == AttributeStatus.dependency_failed
         assert "top" not in executor.built
 
-    asyncio.run(main())
+    await main()
 
 
-def test_local_store_skip_wins_over_failure_cache() -> None:
+async def test_local_store_skip_wins_over_failure_cache() -> None:
     # An attribute whose output already exists in the local store is
     # not a failure, even when the failed-build cache still carries a
     # stale entry for its drv: skip it, do not fail its dependents.
@@ -534,7 +519,7 @@ def test_local_store_skip_wins_over_failure_cache() -> None:
         }
     )
     executor = FakeExecutor()
-    result = run_scheduler(
+    result = await run_scheduler(
         JobScheduler(executor, [SYSTEM], failed_build_cache=cache), [a, b]
     )
     statuses = by_attr(result)
@@ -543,7 +528,7 @@ def test_local_store_skip_wins_over_failure_cache() -> None:
     assert executor.built == ["b"]
 
 
-def test_missing_cache_status_means_build() -> None:
+async def test_missing_cache_status_means_build() -> None:
     # nix-eval-jobs output without cacheStatus must not be treated as
     # "already in the local store": a whole eval would report success
     # without building anything.
@@ -561,12 +546,12 @@ def test_missing_cache_status_means_build() -> None:
     )
     assert job.cache_status is None
     executor = FakeExecutor()
-    result = run_scheduler(JobScheduler(executor, [SYSTEM]), [job])
+    result = await run_scheduler(JobScheduler(executor, [SYSTEM]), [job])
     assert executor.built == ["foo"]
     assert by_attr(result)["foo"] == AttributeStatus.succeeded
 
 
-def test_resent_jobs_are_not_rebuilt() -> None:
+async def test_resent_jobs_are_not_rebuilt() -> None:
     """At-least-once delivery: a re-sent batch must not rebuild."""
 
     async def main() -> None:
@@ -582,4 +567,4 @@ def test_resent_jobs_are_not_rebuilt() -> None:
         assert sorted(executor.built) == ["a", "b"]
         assert sorted(r.attr for r in result.results) == ["a", "b"]
 
-    asyncio.run(main())
+    await main()

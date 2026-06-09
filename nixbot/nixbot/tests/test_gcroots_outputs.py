@@ -3,7 +3,6 @@ config gating."""
 
 from __future__ import annotations
 
-import asyncio
 import os
 from pathlib import Path
 
@@ -25,6 +24,8 @@ from nixbot.outputs import (
 
 
 def test_gcroot_path_layout() -> None:
+    # gcroots_dir is configurable (dev setups use a user-writable dir);
+    # the layout below it is dir/project/attr.
     assert (
         str(
             gcroot_path(
@@ -35,11 +36,6 @@ def test_gcroot_path_layout() -> None:
         )
         == "/nix/var/nix/gcroots/per-user/ci-user/owner/repo/checks.x.foo"
     )
-
-
-def test_gcroot_path_custom_dir(tmp_path: Path) -> None:
-    # Dev setups point gcroots_dir at a user-writable directory.
-    assert gcroot_path(tmp_path, "o/r", "a") == tmp_path / "o" / "r" / "a"
 
 
 def test_safe_attr_filename_preserves_normal_attrs() -> None:
@@ -59,7 +55,7 @@ def test_safe_attr_filename_blocks_traversal() -> None:
         assert root.parent == base
 
 
-def test_register_gcroot_refreshes_mtime(
+async def test_register_gcroot_refreshes_mtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Unchanged store path: no nix-store call, but the symlink mtime is
@@ -71,7 +67,7 @@ def test_register_gcroot_refreshes_mtime(
     os.utime(root, (old, old), follow_symlinks=False)
     monkeypatch.setattr(gcroots_mod, "gcroot_path", lambda *_a: root)
     # No fake nix-store on PATH: re-registration would fail loudly.
-    asyncio.run(register_gcroot(tmp_path, "proj", "attr", "/nix/store/abc"))
+    await register_gcroot(tmp_path, "proj", "attr", "/nix/store/abc")
     assert root.lstat().st_mtime > old
 
 

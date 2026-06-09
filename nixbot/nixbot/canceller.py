@@ -176,7 +176,3 @@ class CancellationManager:
             return None
         build = self._builds.get(build_id)
         return build.commit_sha if build else None
-
-    def cancel_event_for(self, build_id: int) -> asyncio.Event | None:
-        build = self._builds.get(build_id)
-        return build.cancel_event if build else None

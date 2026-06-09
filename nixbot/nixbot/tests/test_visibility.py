@@ -5,10 +5,8 @@ unauthorized access on HTML, fragment, log, and SSE endpoints."""
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING
 
-import asyncpg
 import httpx
 import pytest
 
@@ -26,6 +24,7 @@ from nixbot.web.auth_routes import SESSION_COOKIE, create_auth_router
 from .support import (
     WebHarness,
     cookie_header,
+    db_pool,
     insert_build,
     insert_project,
     web_harness,
@@ -34,6 +33,7 @@ from .support import (
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    import asyncpg
     from fastapi import FastAPI
 
 
@@ -57,14 +57,13 @@ class FakeFetcher:
 
 
 @pytest.fixture(scope="module")
-def postgres_dsn(postgres_dsn: str) -> str:
-    asyncio.run(seed(postgres_dsn))
+async def postgres_dsn(postgres_dsn: str) -> str:
+    await seed(postgres_dsn)
     return postgres_dsn
 
 
 async def seed(dsn: str) -> None:
-    pool = await asyncpg.create_pool(dsn)
-    try:
+    async with db_pool(dsn) as pool:
         for repo_id, name, private in [
             ("pub-1", "public", False),
             ("priv-1", "secret", True),
@@ -78,8 +77,6 @@ async def seed(dsn: str) -> None:
                 "VALUES ($1, 'a.x', 'x86_64-linux', 'succeeded')",
                 build_id,
             )
-    finally:
-        await pool.close()
 
 
 FETCHER = FakeFetcher({"github:carol:tok-carol": frozenset({"github:priv-1"})})
@@ -301,10 +298,9 @@ def test_api_token_inherits_login_groups(harness: WebHarness) -> None:
         assert restored is not None
         assert restored.groups == ("auditors",)
 
-        response = harness.get(
-            "/api/repos/github/acme/secret/builds",
-            headers={"Authorization": f"Bearer {token}"},
-        )
+        url = "/api/repos/github/acme/secret/builds"
+        assert harness.get(url).status_code == 404  # anonymous API access
+        response = harness.get(url, headers={"Authorization": f"Bearer {token}"})
         assert response.status_code == 200
     finally:
         ctx.visibility.authz = saved
@@ -351,7 +347,7 @@ def test_logout_invalidates_access_cache(postgres_dsn: str) -> None:
         assert visibility.cache.get(CAROL.qualified) is None
 
 
-def test_gitlab_repo_access_fetcher() -> None:
+async def test_gitlab_repo_access_fetcher() -> None:
     """Private GitLab projects were invisible to everyone but admins
     because no GitLab access fetcher existed."""
 
@@ -384,12 +380,12 @@ def test_gitlab_repo_access_fetcher() -> None:
         gitlab_url="https://gitlab.example.com",
     )
     user = User(provider="gitlab", username="dora")
-    access = asyncio.run(fetcher.repo_access(user, "tok-gl"))
+    access = await fetcher.repo_access(user, "tok-gl")
     assert access.accessible == frozenset({"gitlab:31", "gitlab:32"})
     assert access.admin == frozenset({"gitlab:31"})
 
 
-def test_github_repo_access_fetcher_enterprise_api_url() -> None:
+async def test_github_repo_access_fetcher_enterprise_api_url() -> None:
     """GitHub Enterprise: the fetch must hit the configured API base,
     not hardcoded api.github.com."""
 
@@ -403,6 +399,6 @@ def test_github_repo_access_fetcher_enterprise_api_url() -> None:
         github_api_url="https://ghe.example.com/api/v3",
     )
     user = User(provider="github", username="erik")
-    access = asyncio.run(fetcher.repo_access(user, "tok"))
+    access = await fetcher.repo_access(user, "tok")
     assert access.accessible == frozenset({"github:5"})
     assert access.admin == frozenset({"github:5"})

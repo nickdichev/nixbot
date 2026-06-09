@@ -27,9 +27,7 @@ import contextlib
 import io
 import json
 import logging
-import os
 import re
-import signal
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -38,6 +36,7 @@ import zstandard
 
 from .ansi import strip_ansi
 from .gcroots import safe_attr_filename
+from .proc import ProcessGroup
 from .scheduler import BuildOutcome
 
 if TYPE_CHECKING:
@@ -443,11 +442,6 @@ def is_transient_error(output_tail: str) -> bool:
     return any(marker in output_tail for marker in TRANSIENT_ERROR_MARKERS)
 
 
-def _kill_pg(pid: int) -> None:
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(pid, signal.SIGKILL)
-
-
 async def _pump_output(
     stream: asyncio.StreamReader, output_tail: deque[bytes], log_writer: LogWriter
 ) -> None:
@@ -536,14 +530,14 @@ class NixBuildExecutor:
             return BuildOutcome.cancelled, False
         out_link = cwd / f"result-{safe_attr_filename(job.attr)}"
         cmd = build_nix_command(job, self.settings, out_link)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
+        group = await ProcessGroup.start(
+            cmd,
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,  # own process group for clean kill
             limit=STREAM_LIMIT,
         )
+        proc = group.proc
         assert proc.stdout is not None  # noqa: S101
 
         output_tail: deque[bytes] = deque(maxlen=100)
@@ -560,8 +554,7 @@ class NixBuildExecutor:
             )
             timed_out = not done
             if wait_task not in done:  # cancel requested or timeout
-                _kill_pg(proc.pid)
-                await proc.wait()
+                await group.reap()
             await pump_task
             if timed_out:
                 await log_writer.write(
@@ -586,11 +579,10 @@ class NixBuildExecutor:
                 # Hard cancel of the surrounding task: the nix process
                 # group must not outlive the build (cancel_event covers
                 # only the cooperative path).
-                _kill_pg(proc.pid)
                 pump_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await pump_task
-                await proc.wait()
+                await group.reap()
 
 
 def read_log(path: Path) -> bytes:

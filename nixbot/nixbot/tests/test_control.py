@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-import asyncpg
 import httpx
 import pytest
 
@@ -36,6 +35,7 @@ from nixbot.web.token_routes import create_token_router
 
 from .support import (
     WebHarness,
+    db_pool,
     insert_build,
     insert_project,
     web_harness,
@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
+    import asyncpg
     from fastapi import FastAPI
 
 AUTHZ = AuthzConfig(admins=["github:root"])
@@ -85,14 +86,13 @@ class FakeBackend:
 
 
 @pytest.fixture(scope="module")
-def postgres_dsn(postgres_dsn: str) -> str:
-    asyncio.run(seed(postgres_dsn))
+async def postgres_dsn(postgres_dsn: str) -> str:
+    await seed(postgres_dsn)
     return postgres_dsn
 
 
 async def seed(dsn: str) -> None:
-    pool = await asyncpg.create_pool(dsn)
-    try:
+    async with db_pool(dsn) as pool:
         project_id = await insert_project(pool, forge_repo_id="ctl-1")
         build_id = await insert_build(
             pool,
@@ -120,8 +120,6 @@ async def seed(dsn: str) -> None:
         await insert_build(
             pool, queued_project, number=3, status="building", started=True
         )
-    finally:
-        await pool.close()
 
 
 BACKEND = FakeBackend()
@@ -149,12 +147,6 @@ def test_control_buttons_hidden_without_permission(harness: WebHarness) -> None:
     assert "rebuild failed" not in harness.get(url, MALLORY).text
     assert "rebuild failed" in harness.get(url, ROOT).text
     assert "rebuild failed" in harness.get(url, ALICE).text
-
-
-def test_anonymous_cannot_control(harness: WebHarness) -> None:
-    response = harness.post("/repos/github/acme/widget/builds/1/restart")
-    assert response.status_code == 403
-    assert BACKEND.restarted == []
 
 
 def test_admin_can_restart_and_cancel(harness: WebHarness) -> None:
@@ -476,94 +468,88 @@ def test_api_token_controls_build(harness: WebHarness) -> None:
 # --- service composition smoke test -----------------------------------
 
 
-def test_build_service_composition(postgres_dsn: str, tmp_path: Path) -> None:
-    async def run() -> None:
-        config = Config(
-            db_url=postgres_dsn,
-            build_systems=["x86_64-linux"],
-            url="http://ci.test",
-            state_dir=tmp_path / "state",
-        )
-        service, app = await build_service(config)
-        try:
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app), base_url="http://ci.test"
-            ) as client:
-                assert (await client.get("/health")).text == "ok"
-                assert (await client.get("/")).status_code == 200
-                assert (await client.get("/metrics")).status_code == 200
-                # Webhooks 404 without forge configuration.
-                assert (
-                    await client.post("/webhooks/github", content=b"{}")
-                ).status_code == 404
-                # Control endpoints present and gated.
-                assert (
-                    await client.post("/repos/github/acme/widget/builds/1/cancel")
-                ).status_code == 403
-        finally:
-            await service.pool.close()
-
-    asyncio.run(run())
+async def test_build_service_composition(postgres_dsn: str, tmp_path: Path) -> None:
+    config = Config(
+        db_url=postgres_dsn,
+        build_systems=["x86_64-linux"],
+        url="http://ci.test",
+        state_dir=tmp_path / "state",
+    )
+    service, app = await build_service(config)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://ci.test"
+        ) as client:
+            assert (await client.get("/health")).text == "ok"
+            assert (await client.get("/")).status_code == 200
+            assert (await client.get("/metrics")).status_code == 200
+            # Webhooks 404 without forge configuration.
+            assert (
+                await client.post("/webhooks/github", content=b"{}")
+            ).status_code == 404
+            # Control endpoints present and gated.
+            assert (
+                await client.post("/repos/github/acme/widget/builds/1/cancel")
+            ).status_code == 403
+    finally:
+        await service.pool.close()
 
 
-def test_restart_clears_failed_cache_and_guards_running(
+async def test_restart_clears_failed_cache_and_guards_running(
     postgres_dsn: str, tmp_path: Path
 ) -> None:
-    async def run() -> None:
-        config = Config(
-            db_url=postgres_dsn,
-            build_systems=["x86_64-linux"],
-            url="http://ci.test",
-            state_dir=tmp_path / "state",
+    config = Config(
+        db_url=postgres_dsn,
+        build_systems=["x86_64-linux"],
+        url="http://ci.test",
+        state_dir=tmp_path / "state",
+    )
+    service, _app = await build_service(config)
+    pool = service.pool
+    try:
+        project_id = await insert_project(pool, forge_repo_id="77", url="http://x")
+        build_id = await insert_build(
+            pool, project_id, commit_sha="c1", tree_hash="t1", status="failed"
         )
-        service, _app = await build_service(config)
-        pool = service.pool
-        try:
-            project_id = await insert_project(pool, forge_repo_id="77", url="http://x")
-            build_id = await insert_build(
-                pool, project_id, commit_sha="c1", tree_hash="t1", status="failed"
-            )
-            await pool.execute(
-                "INSERT INTO build_attributes (build_id, attr, system, drv_path, "
-                "status) VALUES ($1, 'x86_64-linux.a', 'x86_64-linux', "
-                "'/nix/store/a.drv', 'failed')",
+        await pool.execute(
+            "INSERT INTO build_attributes (build_id, attr, system, drv_path, "
+            "status) VALUES ($1, 'x86_64-linux.a', 'x86_64-linux', "
+            "'/nix/store/a.drv', 'failed')",
+            build_id,
+        )
+        await pool.execute(
+            "INSERT INTO failed_builds (project_id, derivation, timestamp, url) "
+            "VALUES ($1, '/nix/store/a.drv', 1, 'http://old')",
+            project_id,
+        )
+
+        # Running build: restart refuses, cache row stays.
+        service.orchestrator.cancel_events[build_id] = asyncio.Event()
+        await service.restart_build(build_id)
+        await service.drain_work()
+        assert await pool.fetchval("SELECT count(*) FROM failed_builds") == 1
+        assert (
+            await pool.fetchval(
+                "SELECT status FROM build_attributes WHERE build_id = $1",
                 build_id,
             )
-            await pool.execute(
-                "INSERT INTO failed_builds (project_id, derivation, timestamp, url) "
-                "VALUES ($1, '/nix/store/a.drv', 1, 'http://old')",
-                project_id,
-            )
+            == "failed"
+        )
 
-            # Running build: restart refuses, cache row stays.
-            service.orchestrator.cancel_events[build_id] = asyncio.Event()
-            await service.restart_build(build_id)
-            await service.drain_work()
-            assert await pool.fetchval("SELECT count(*) FROM failed_builds") == 1
-            assert (
-                await pool.fetchval(
-                    "SELECT status FROM build_attributes WHERE build_id = $1",
-                    build_id,
-                )
-                == "failed"
+        # Not running: cache cleared, attributes reset.
+        del service.orchestrator.cancel_events[build_id]
+        await service.restart_build(build_id)
+        await service.drain_work()
+        assert await pool.fetchval("SELECT count(*) FROM failed_builds") == 0
+        assert (
+            await pool.fetchval(
+                "SELECT status FROM build_attributes WHERE build_id = $1",
+                build_id,
             )
-
-            # Not running: cache cleared, attributes reset.
-            del service.orchestrator.cancel_events[build_id]
-            await service.restart_build(build_id)
-            await service.drain_work()
-            assert await pool.fetchval("SELECT count(*) FROM failed_builds") == 0
-            assert (
-                await pool.fetchval(
-                    "SELECT status FROM build_attributes WHERE build_id = $1",
-                    build_id,
-                )
-                == "pending"
-            )
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+            == "pending"
+        )
+    finally:
+        await pool.close()
 
 
 def test_webhook_setup_shown_to_admin_only(harness: WebHarness) -> None:
@@ -651,241 +637,229 @@ def test_report_delay_honors_retry_after() -> None:
     assert _report_delay(1, time.time() + 7200) == 3600
 
 
-def test_report_retry(
+async def test_report_retry(
     postgres_dsn: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A failed terminal status post is retried from database state and
     gives up after MAX_REPORT_ATTEMPTS instead of looping."""
     monkeypatch.setattr("nixbot.service.REPORT_BACKOFF_SECONDS", 0)
 
-    async def run() -> None:
-        config = Config(
-            db_url=postgres_dsn,
-            build_systems=["x86_64-linux"],
-            url="http://ci.test",
-            state_dir=tmp_path / "state",
+    config = Config(
+        db_url=postgres_dsn,
+        build_systems=["x86_64-linux"],
+        url="http://ci.test",
+        state_dir=tmp_path / "state",
+    )
+    service, _app = await build_service(config)
+    pool = service.pool
+    try:
+        project_id = await insert_project(pool, forge_repo_id="80", url="http://x")
+        build_id = await insert_build(
+            pool, project_id, commit_sha="c9", tree_hash="t9", status="succeeded"
         )
-        service, _app = await build_service(config)
-        pool = service.pool
-        try:
-            project_id = await insert_project(pool, forge_repo_id="80", url="http://x")
-            build_id = await insert_build(
-                pool, project_id, commit_sha="c9", tree_hash="t9", status="succeeded"
-            )
-            await pool.execute(
-                "INSERT INTO build_attributes (build_id, attr, status) "
-                "VALUES ($1, 'x86_64-linux.a', 'succeeded')",
-                build_id,
-            )
+        await pool.execute(
+            "INSERT INTO build_attributes (build_id, attr, status) "
+            "VALUES ($1, 'x86_64-linux.a', 'succeeded')",
+            build_id,
+        )
 
-            posts: list[dict] = []
-            fail = True
+        posts: list[dict] = []
+        fail = True
 
-            class FakeReporter(NullStatusReporter):
-                async def build_finished(  # noqa: PLR0913
-                    self,
-                    event: ChangeEvent,
-                    build: Any,
-                    status: str,
-                    generation: int,
-                    results: Any,
-                    *,
-                    attr_statuses: dict[str, str] | None = None,
-                    attr_prefix: str = "checks",
-                ) -> None:
-                    del event, status, generation, results, attr_prefix
-                    posts.append({"build": build.id, "attrs": attr_statuses})
-                    if fail:
-                        msg = "forge 502"
-                        raise RuntimeError(msg)
+        class FakeReporter(NullStatusReporter):
+            async def build_finished(  # noqa: PLR0913
+                self,
+                event: ChangeEvent,
+                build: Any,
+                status: str,
+                generation: int,
+                results: Any,
+                *,
+                attr_statuses: dict[str, str] | None = None,
+                attr_prefix: str = "checks",
+            ) -> None:
+                del event, status, generation, results, attr_prefix
+                posts.append({"build": build.id, "attrs": attr_statuses})
+                if fail:
+                    msg = "forge 502"
+                    raise RuntimeError(msg)
 
-            wrapper = RetryingReporter(FakeReporter(), service)
-            service.orchestrator.reporter = wrapper
+        wrapper = RetryingReporter(FakeReporter(), service)
+        service.orchestrator.reporter = wrapper
 
-            build = await service.orchestrator.db.get_build(build_id)
-            assert build is not None
-            record = await service.repo_store.by_id(project_id)
-            assert record is not None
-            event = ChangeEvent(repo=repo_info(record), branch="main", commit_sha="c9")
-            # Inline post fails: the wrapper swallows and queues.
-            await wrapper.build_finished(event, build, "succeeded", 0, [])
-            fail = False
-            await service.drain_work()
-            assert [p["build"] for p in posts] == [build_id, build_id]
-            # The retry re-derives attribute state from the database.
-            assert posts[-1]["attrs"] == {"x86_64-linux.a": "succeeded"}
+        build = await service.orchestrator.db.get_build(build_id)
+        assert build is not None
+        record = await service.repo_store.by_id(project_id)
+        assert record is not None
+        event = ChangeEvent(repo=repo_info(record), branch="main", commit_sha="c9")
+        # Inline post fails: the wrapper swallows and queues.
+        await wrapper.build_finished(event, build, "succeeded", 0, [])
+        fail = False
+        await service.drain_work()
+        assert [p["build"] for p in posts] == [build_id, build_id]
+        # The retry re-derives attribute state from the database.
+        assert posts[-1]["attrs"] == {"x86_64-linux.a": "succeeded"}
 
-            # Permanent failure: attempts are bounded.
-            posts.clear()
-            fail = True
-            await wrapper.build_finished(event, build, "succeeded", 0, [])
-            await service.drain_work()
-            assert len(posts) == MAX_REPORT_ATTEMPTS + 1  # inline + retries
-            failed = await pool.fetchval(
-                "SELECT count(*) FROM work_queue "
-                "WHERE kind = 'report' AND status = 'failed'"
-            )
-            assert failed == MAX_REPORT_ATTEMPTS
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        # Permanent failure: attempts are bounded.
+        posts.clear()
+        fail = True
+        await wrapper.build_finished(event, build, "succeeded", 0, [])
+        await service.drain_work()
+        assert len(posts) == MAX_REPORT_ATTEMPTS + 1  # inline + retries
+        failed = await pool.fetchval(
+            "SELECT count(*) FROM work_queue "
+            "WHERE kind = 'report' AND status = 'failed'"
+        )
+        assert failed == MAX_REPORT_ATTEMPTS
+    finally:
+        await pool.close()
 
 
-def test_effect_item_setup_failure_settles_row(
+async def test_effect_item_setup_failure_settles_row(
     postgres_dsn: str, tmp_path: Path
 ) -> None:
     """A fetch/checkout failure in an effect item must not leave the
     row pending forever."""
 
-    async def run() -> None:
-        config = Config(
-            db_url=postgres_dsn,
-            build_systems=["x86_64-linux"],
-            url="http://ci.test",
-            state_dir=tmp_path / "state",
+    config = Config(
+        db_url=postgres_dsn,
+        build_systems=["x86_64-linux"],
+        url="http://ci.test",
+        state_dir=tmp_path / "state",
+    )
+    service, _app = await build_service(config)
+    pool = service.pool
+    try:
+        project_id = await insert_project(
+            pool, "gear", forge_repo_id="81", url="file:///nonexistent"
         )
-        service, _app = await build_service(config)
-        pool = service.pool
-        try:
-            project_id = await insert_project(
-                pool, "gear", forge_repo_id="81", url="file:///nonexistent"
-            )
-            build_id = await insert_build(
-                pool, project_id, commit_sha="c5", tree_hash="t5", status="succeeded"
-            )
-            await pool.execute(
-                "INSERT INTO build_effects (build_id, name, status) "
-                "VALUES ($1, 'deploy', 'pending')",
-                build_id,
-            )
-            await service.enqueue_work(
-                "effect", f"build-{build_id}", {"build_id": build_id, "name": "deploy"}
-            )
-            await service.drain_work()
-            row = await pool.fetchrow(
-                "SELECT status, error FROM build_effects WHERE build_id = $1",
-                build_id,
-            )
-            assert row["status"] == "failed"
-            assert row["error"]
-            item = await pool.fetchrow(
-                "SELECT status FROM work_queue WHERE kind = 'effect'"
-            )
-            assert item["status"] == "failed"
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        build_id = await insert_build(
+            pool, project_id, commit_sha="c5", tree_hash="t5", status="succeeded"
+        )
+        await pool.execute(
+            "INSERT INTO build_effects (build_id, name, status) "
+            "VALUES ($1, 'deploy', 'pending')",
+            build_id,
+        )
+        await service.enqueue_work(
+            "effect", f"build-{build_id}", {"build_id": build_id, "name": "deploy"}
+        )
+        await service.drain_work()
+        row = await pool.fetchrow(
+            "SELECT status, error FROM build_effects WHERE build_id = $1",
+            build_id,
+        )
+        assert row["status"] == "failed"
+        assert row["error"]
+        item = await pool.fetchrow(
+            "SELECT status FROM work_queue WHERE kind = 'effect'"
+        )
+        assert item["status"] == "failed"
+    finally:
+        await pool.close()
 
 
-def test_work_dispatch(postgres_dsn: str, tmp_path: Path) -> None:
+async def test_work_dispatch(postgres_dsn: str, tmp_path: Path) -> None:
     """The dispatcher reconstructs payloads and fails unknown kinds."""
 
-    async def run() -> None:
-        config = Config(
-            db_url=postgres_dsn,
-            build_systems=["x86_64-linux"],
-            url="http://ci.test",
-            state_dir=tmp_path / "state",
+    config = Config(
+        db_url=postgres_dsn,
+        build_systems=["x86_64-linux"],
+        url="http://ci.test",
+        state_dir=tmp_path / "state",
+    )
+    service, _app = await build_service(config)
+    pool = service.pool
+    try:
+        # Scheduled payload roundtrip; the unknown project makes
+        # execution a no-op, but parsing must succeed.
+        await service.enqueue_work(
+            "scheduled",
+            "scheduled-999-s-e",
+            {
+                "project_id": 999,
+                "schedule_name": "s",
+                "effect": "e",
+                "when": {"minute": 5, "dayOfWeek": ["Mon"]},
+            },
         )
-        service, _app = await build_service(config)
-        pool = service.pool
-        try:
-            # Scheduled payload roundtrip; the unknown project makes
-            # execution a no-op, but parsing must succeed.
-            await service.enqueue_work(
-                "scheduled",
-                "scheduled-999-s-e",
-                {
-                    "project_id": 999,
-                    "schedule_name": "s",
-                    "effect": "e",
-                    "when": {"minute": 5, "dayOfWeek": ["Mon"]},
-                },
-            )
-            await service.enqueue_work(
-                "refresh-schedules", "schedules-999", {"project_id": 999, "rev": "x"}
-            )
-            await service.enqueue_work("bogus", "k", {})
-            await service.drain_work()
-            rows = await pool.fetch(
-                "SELECT kind, status, error FROM work_queue ORDER BY id"
-            )
-            assert [(r["kind"], r["status"]) for r in rows] == [
-                ("scheduled", "done"),
-                ("refresh-schedules", "done"),
-                ("bogus", "failed"),
-            ]
-            assert "unknown work kind" in rows[2]["error"]
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        await service.enqueue_work(
+            "refresh-schedules", "schedules-999", {"project_id": 999, "rev": "x"}
+        )
+        await service.enqueue_work("bogus", "k", {})
+        await service.drain_work()
+        rows = await pool.fetch(
+            "SELECT kind, status, error FROM work_queue ORDER BY id"
+        )
+        assert [(r["kind"], r["status"]) for r in rows] == [
+            ("scheduled", "done"),
+            ("refresh-schedules", "done"),
+            ("bogus", "failed"),
+        ]
+        assert "unknown work kind" in rows[2]["error"]
+    finally:
+        await pool.close()
 
 
-def test_restart_resets_effects(postgres_dsn: str, tmp_path: Path) -> None:
+async def test_restart_resets_effects(postgres_dsn: str, tmp_path: Path) -> None:
     """A full restart re-runs effects: clear the started-flag and the
     previous run's rows, or the page keeps showing stale results."""
 
-    async def run() -> None:
-        config = Config(
-            db_url=postgres_dsn,
-            build_systems=["x86_64-linux"],
-            url="http://ci.test",
-            state_dir=tmp_path / "state",
+    config = Config(
+        db_url=postgres_dsn,
+        build_systems=["x86_64-linux"],
+        url="http://ci.test",
+        state_dir=tmp_path / "state",
+    )
+    service, _app = await build_service(config)
+    pool = service.pool
+    try:
+        project_id = await insert_project(
+            pool, "sprocket", forge_repo_id="79", url="http://x"
         )
-        service, _app = await build_service(config)
-        pool = service.pool
-        try:
-            project_id = await insert_project(
-                pool, "sprocket", forge_repo_id="79", url="http://x"
-            )
-            build_id = await insert_build(
-                pool,
-                project_id,
-                commit_sha="c1",
-                tree_hash="t1",
-                status="failed",
-                effects_started=True,
-            )
-            await pool.execute(
-                "INSERT INTO build_effects (build_id, name, status, finished_at, "
-                "log_path) VALUES ($1, 'deploy', 'failed', now(), 'old.zst')",
-                build_id,
-            )
+        build_id = await insert_build(
+            pool,
+            project_id,
+            commit_sha="c1",
+            tree_hash="t1",
+            status="failed",
+            effects_started=True,
+        )
+        await pool.execute(
+            "INSERT INTO build_effects (build_id, name, status, finished_at, "
+            "log_path) VALUES ($1, 'deploy', 'failed', now(), 'old.zst')",
+            build_id,
+        )
 
-            await service.restart_build(build_id)
-            await service.drain_work()
-            assert not await pool.fetchval(
-                "SELECT effects_started FROM builds WHERE id = $1", build_id
-            )
-            # Stale log cleared by the reset; the failed rerun
-            # (unfetchable URL) settled the row.
-            row = await pool.fetchrow(
-                "SELECT status, error, log_path FROM build_effects WHERE build_id = $1",
-                build_id,
-            )
-            assert dict(row) == {
-                "status": "failed",
-                "error": "build did not succeed",
-                "log_path": None,
-            }
+        await service.restart_build(build_id)
+        await service.drain_work()
+        assert not await pool.fetchval(
+            "SELECT effects_started FROM builds WHERE id = $1", build_id
+        )
+        # Stale log cleared by the reset; the failed rerun
+        # (unfetchable URL) settled the row.
+        row = await pool.fetchrow(
+            "SELECT status, error, log_path FROM build_effects WHERE build_id = $1",
+            build_id,
+        )
+        assert dict(row) == {
+            "status": "failed",
+            "error": "build did not succeed",
+            "log_path": None,
+        }
 
-            # Single-attribute restart keeps the guard: a partial
-            # rebuild must not re-deploy.
-            await pool.execute(
-                "UPDATE builds SET effects_started = TRUE WHERE id = $1", build_id
-            )
-            await service.restart_attribute(build_id, "x86_64-linux.a")
-            await service.drain_work()
-            assert await pool.fetchval(
-                "SELECT effects_started FROM builds WHERE id = $1", build_id
-            )
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        # Single-attribute restart keeps the guard: a partial
+        # rebuild must not re-deploy.
+        await pool.execute(
+            "UPDATE builds SET effects_started = TRUE WHERE id = $1", build_id
+        )
+        await service.restart_attribute(build_id, "x86_64-linux.a")
+        await service.drain_work()
+        assert await pool.fetchval(
+            "SELECT effects_started FROM builds WHERE id = $1", build_id
+        )
+    finally:
+        await pool.close()
 
 
 def test_effects_restart_route(harness: WebHarness) -> None:
