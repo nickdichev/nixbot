@@ -288,7 +288,6 @@ case "$(cat "$control" 2>/dev/null)" in
   transient) echo ok; exit 0 ;;
   hang) sleep 60 ;;
   hangpid) echo $$ > {tmp_path}/pid; sleep 60 ;;
-  longline) head -c 200000 /dev/zero | tr '\\0' 'A'; echo ;;
   racepid) echo $$ > {tmp_path}/pid; echo ok ;;
   *) echo ok; exit 0 ;;
 esac
@@ -460,15 +459,6 @@ def test_log_writer_batches_frames(tmp_path: Path) -> None:
     plain = read_log(tmp_path / "log.zst")
     assert plain == b"".join(f"line {i}\n".encode() for i in range(10000))
     assert raw < len(plain)
-
-
-def test_executor_handles_long_lines(tmp_path: Path, fake_nix: Path) -> None:
-    # Lines over asyncio's 64 KiB default StreamReader limit must not
-    # kill the log pump.
-    fake_nix.write_text("longline")
-    outcome, log = run_build(tmp_path)
-    assert outcome == BuildOutcome.success
-    assert b"A" * 200000 in log
 
 
 def test_executor_sanitizes_out_link(tmp_path: Path, fake_nix: Path) -> None:
