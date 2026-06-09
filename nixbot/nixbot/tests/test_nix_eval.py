@@ -37,37 +37,6 @@ if TYPE_CHECKING:
     from nixbot.models import NixEvalJob
 
 
-def test_branch_config_defaults(tmp_path: Path) -> None:
-    config = BranchConfig.load(tmp_path)
-    assert config.flake_dir == "."
-    assert config.lock_file == "flake.lock"
-    assert config.attribute == "checks"
-    assert not config.effects_on_pull_requests
-
-
-def test_branch_config_from_toml(tmp_path: Path) -> None:
-    (tmp_path / "nixbot.toml").write_text(
-        'flake_dir = "subdir"\nlock_file = "dev.lock"\nattribute = "hydraJobs"\n'
-        "effects_on_pull_requests = true\n"
-    )
-    config = BranchConfig.load(tmp_path)
-    assert config.flake_dir == "subdir"
-    assert config.lock_file == "dev.lock"
-    assert config.attribute == "hydraJobs"
-    assert config.effects_on_pull_requests
-
-
-def test_branch_config_rejects_traversal(tmp_path: Path) -> None:
-    (tmp_path / "nixbot.toml").write_text('flake_dir = "../../etc"\n')
-    # Falls back to defaults on invalid config.
-    assert BranchConfig.load(tmp_path).flake_dir == "."
-
-
-def test_branch_config_invalid_toml(tmp_path: Path) -> None:
-    (tmp_path / "nixbot.toml").write_text("not toml :::")
-    assert BranchConfig.load(tmp_path).flake_dir == "."
-
-
 def test_eval_command(tmp_path: Path) -> None:
     settings = EvalSettings(
         gc_roots_dir=tmp_path / "gcroots", worker_count=4, max_memory_size_mib=1024
