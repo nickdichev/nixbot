@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from . import discovery, restarts, scheduled_runs
+from . import db, discovery, restarts, scheduled_runs
 from .config import ScheduleWhen
 from .db import BuildStatus
 from .db_gen import builds as builds_q
@@ -357,7 +357,7 @@ class CIService:
         delay = _report_delay(attempt, retry_at)
         if delay > 0:
             await asyncio.sleep(delay)
-        build = await self.orchestrator.db.get_build(build_id)
+        build = await builds_q.get_build(self.orchestrator.pool, id_=build_id)
         if build is None:
             return
         project = await self.repo_store.by_id(build.project_id)
@@ -396,7 +396,7 @@ class CIService:
             raise
 
     async def _run_effect_item(self, build_id: int, name: str) -> None:
-        build = await self.orchestrator.db.get_build(build_id)
+        build = await builds_q.get_build(self.orchestrator.pool, id_=build_id)
         if build is None:
             return
         project = await self.repo_store.by_id(build.project_id)
@@ -409,8 +409,15 @@ class CIService:
         except Exception as e:
             # Setup failures (fetch/checkout) happen before the
             # runner settles the row.
-            await self.orchestrator.db.finish_effect(
-                build_id, name, success=False, error=str(e) or type(e).__name__
+            await builds_q.finish_effect(
+                self.pool,
+                build_id=build_id,
+                name=name,
+                status="failed",
+                error=str(e) or type(e).__name__,
+                log_path=None,
+                log_size=0,
+                log_truncated=False,
             )
             raise
 
@@ -423,9 +430,7 @@ class CIService:
         rows) re-evaluate via the rerun path."""
         await fail_interrupted_effects(self.pool, self._started_at)
         for resumable in await find_unfinished_builds(self.pool):
-            remaining, settled = await settle_already_built(
-                self.orchestrator.db, resumable
-            )
+            remaining, settled = await settle_already_built(self.pool, resumable)
             if settled:
                 # Recovered results still need gcroots/outputs updates.
                 event = await restarts.change_event_for(self, resumable)
@@ -453,7 +458,7 @@ class CIService:
             return
         # No running pipeline re-aggregates for us; without this the
         # build stays non-terminal forever once all rows are settled.
-        status, generation = await self.orchestrator.db.aggregate_build(build_id)
+        status, generation = await db.aggregate_build(self.pool, build_id)
         if status in BuildStatus.TERMINAL:
             await self._report_direct_finish(build_id, status, generation)
 
@@ -476,7 +481,7 @@ class CIService:
         """Post the terminal forge status for a build settled outside a
         running pipeline; otherwise the commit status stays pending
         forever."""
-        build = await self.orchestrator.db.get_build(build_id)
+        build = await builds_q.get_build(self.orchestrator.pool, id_=build_id)
         if build is None:
             return
         project = await self.repo_store.by_id(build.project_id)

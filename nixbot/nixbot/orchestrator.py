@@ -17,7 +17,16 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
-from . import build_reuse, build_run, effects_run, gcroots, outputs, recovery, reruns
+from . import (
+    build_reuse,
+    build_run,
+    db,
+    effects_run,
+    gcroots,
+    outputs,
+    recovery,
+    reruns,
+)
 from .canceller import (
     CancellationManager,
     RegisterOutcome,
@@ -37,8 +46,10 @@ if TYPE_CHECKING:
     from contextlib import AbstractAsyncContextManager
     from pathlib import Path
 
+    import asyncpg
+
     from .config import Config
-    from .db import BuildDB, BuildRecord
+    from .db import BuildRecord
     from .gitrepo import FetchCredentials, RepoManager
     from .models import NixEvalJobSuccess
     from .nix_eval import (
@@ -85,7 +96,7 @@ class AttributeExecutor(Protocol):
 @dataclass
 class Orchestrator:
     config: Config
-    db: BuildDB
+    pool: asyncpg.Pool
     repos: RepoManager
     eval_runner: EvalRunnerLike
     executor: AttributeExecutor
@@ -153,7 +164,8 @@ class Orchestrator:
             )
         except MergeConflictError as e:
             # Merge conflict: failed build, status on the head SHA.
-            build = await self.db.create_failed_build(
+            build = await db.create_failed_build(
+                self.pool,
                 repo.id,
                 event.commit_sha,
                 event.branch,
@@ -167,7 +179,8 @@ class Orchestrator:
 
         try:
             tree_hash = await worktree.tree_hash()
-            build, created = await self.db.get_or_create_build(
+            build, created = await db.get_or_create_build(
+                self.pool,
                 repo.id,
                 tree_hash,
                 event.commit_sha,
@@ -252,7 +265,7 @@ class Orchestrator:
             if rebuild:
                 self.cancel_events.pop(build.id, None)
             if created:
-                await self.db.set_build_status(build.id, BuildStatus.CANCELLED)
+                await db.set_build_status(self.pool, build.id, BuildStatus.CANCELLED)
                 await self.reporter.build_finished(
                     event, build, BuildStatus.CANCELLED, build.status_generation, []
                 )
@@ -284,7 +297,7 @@ class Orchestrator:
         sweeps what the executor stores."""
         if event.pr_number is not None or event.branch != event.repo.default_branch:
             return
-        await WorkQueue(self.db.pool).enqueue(
+        await WorkQueue(self.pool).enqueue(
             "refresh-schedules",
             f"schedules-{event.repo.id}",
             {"project_id": event.repo.id, "rev": event.commit_sha},

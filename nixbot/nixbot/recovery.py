@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 
 import asyncpg
 
+from . import db
 from .db_gen import maintenance as q
 from .models import CacheStatus, NixEvalJobSuccess
 from .scheduler import AttributeResult, AttributeStatus
@@ -42,7 +43,6 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from datetime import datetime
 
-    from .db import BuildDB
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +179,7 @@ async def check_store_paths(paths: list[str], nix_db: Path = NIX_DB) -> set[str]
 
 
 async def settle_already_built(
-    db: BuildDB,
+    pool: asyncpg.Pool,
     build: ResumableBuild,
     path_checker: Callable[[list[str]], Awaitable[set[str]]] = check_store_paths,
 ) -> tuple[list[NixEvalJobSuccess], list[tuple[str, str]]]:
@@ -195,6 +195,7 @@ async def settle_already_built(
         out_path = job.outputs.get("out")
         if out_path and out_path in valid:
             await db.complete_attribute(
+                pool,
                 build.build_id,
                 AttributeResult(
                     attr=job.attr,

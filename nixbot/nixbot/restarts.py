@@ -9,7 +9,9 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
+from . import db
 from .db import BuildStatus
+from .db_gen import builds as builds_q
 from .db_gen import maintenance as q
 from .events import ChangeEvent
 from .recovery import check_store_paths, find_unfinished_builds
@@ -33,7 +35,7 @@ RESTART_RETRY_SECONDS = 10.0
 async def restart_effects(s: CIService, build_id: int) -> None:
     if build_id in s.orchestrator.cancel_events:
         return  # build (or an effects rerun) still running
-    build = await s.orchestrator.db.get_build(build_id)
+    build = await builds_q.get_build(s.orchestrator.pool, id_=build_id)
     if build is None or build.status != "succeeded":
         return  # effects only ever run after a successful build
     project = await s.repo_store.by_id(build.project_id)
@@ -54,7 +56,7 @@ async def restart(s: CIService, build_id: int, attr: str | None) -> bool:
         await asyncio.sleep(RESTART_RETRY_SECONDS)
         if build_id in s.orchestrator.cancel_events:
             return True
-    if await s.orchestrator.db.get_build(build_id) is None:
+    if await builds_q.get_build(s.orchestrator.pool, id_=build_id) is None:
         return False
     if attr is not None:
         # A stale attr (e.g. after a re-eval renamed it) must not
@@ -75,7 +77,7 @@ async def restart(s: CIService, build_id: int, attr: str | None) -> bool:
 
 async def rerun(s: CIService, build_id: int) -> None:
     # Serialized by the work queue's per-build dedup key.
-    build = await s.orchestrator.db.get_build(build_id)
+    build = await builds_q.get_build(s.orchestrator.pool, id_=build_id)
     if build is None:
         return
     project = await s.repo_store.by_id(build.project_id)
@@ -116,7 +118,8 @@ async def rerun(s: CIService, build_id: int) -> None:
         await _reeval(s, info, build, credentials)
     except Exception:
         logger.exception("re-evaluation failed", extra={"build_id": build_id})
-        await s.orchestrator.db.set_build_status(
+        await db.set_build_status(
+            s.orchestrator.pool,
             build_id,
             BuildStatus.FAILED,
             error="re-evaluation failed; see service logs",
@@ -165,7 +168,7 @@ async def change_event_for(
 async def _report_interrupted(s: CIService, resumable: ResumableBuild) -> None:
     """Post the failure to the forge; otherwise the commit status
     stays pending forever after an interrupted evaluation."""
-    build = await s.orchestrator.db.get_build(resumable.build_id)
+    build = await builds_q.get_build(s.orchestrator.pool, id_=resumable.build_id)
     event = await change_event_for(s, resumable)
     if build is None or event is None:
         return

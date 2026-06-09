@@ -16,11 +16,13 @@ import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
+from . import db
 from .db import BuildStatus
+from .db_gen import builds as q
 from .executor import failure_excerpt
 from .live_warnings import LiveWarningAggregator
 from .memory import calculate_eval_workers
-from .models import NixEvalJobSuccess
+from .models import CacheStatus, NixEvalJobSuccess
 from .nix_eval import EvalError, EvalSettings
 from .post_build import build_props, run_post_build_steps
 from .repo_config import BranchConfig
@@ -35,6 +37,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
+    import asyncpg
+
     from .db import BuildRecord
     from .events import ChangeEvent
     from .gitrepo import FetchCredentials
@@ -45,6 +49,54 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 LIVE_WARNINGS_FLUSH_INTERVAL = 2.0
+
+
+async def record_attributes(
+    pool: asyncpg.Pool, build_id: int, jobs: Sequence[NixEvalJob]
+) -> None:
+    """Persist eval results as pending rows (with statically-known
+    outputs) so crash recovery can resume without a re-eval; eval
+    failures are settled by the scheduler."""
+    successes = [job for job in jobs if isinstance(job, NixEvalJobSuccess)]
+    if not successes:
+        return
+    await q.record_attributes(
+        pool,
+        build_id=build_id,
+        attrs=[job.attr for job in successes],
+        systems=[job.system for job in successes],
+        drv_paths=[job.drv_path for job in successes],
+        outputs=[json.dumps(job.outputs) for job in successes],
+    )
+
+
+async def get_eval_jobs(
+    pool: asyncpg.Pool, build_id: int
+) -> list[NixEvalJobSuccess] | None:
+    """Reconstruct the eval job set from the build's attribute rows;
+    None when any row lacks a drv_path (eval failures must be
+    reproduced by a fresh evaluation). Reconstructed jobs carry no
+    dependency closures, like the crash-recovery rerun path."""
+    rows = await q.eval_job_rows(pool, build_id=build_id)
+    jobs = []
+    for row in rows:
+        if not row.drv_path:
+            return None
+        outputs = json.loads(row.outputs) if row.outputs else {}
+        jobs.append(
+            NixEvalJobSuccess(
+                attr=row.attr,
+                attr_path=row.attr.split("."),
+                cache_status=CacheStatus.not_built,
+                needed_builds=[],
+                needed_substitutes=[],
+                drv_path=row.drv_path,
+                name=row.attr,
+                outputs=outputs or {"out": None},
+                system=row.system or "",
+            )
+        )
+    return jobs
 
 
 async def run_build(
@@ -74,7 +126,7 @@ async def run_build(
         # Skip settling when the final fan-out already happened
         # (e.g. the effects phase failed): the build's aggregated
         # result must not be overwritten with a failure.
-        current = await o.db.get_build(build.id)
+        current = await q.get_build(o.pool, id_=build.id)
         if current is None or current.status not in BuildStatus.TERMINAL:
             await _settle_aborted(o, event, build, BuildStatus.FAILED, error=str(e))
     finally:
@@ -131,8 +183,10 @@ async def _settle_aborted(
 ) -> None:
     """Terminal bookkeeping and status fan-out for a build that
     ended without a normal aggregation (failure or cancellation)."""
-    await o.db.settle_unfinished_attributes(build.id)
-    await o.db.set_build_status(build.id, status, error=error)
+    # Otherwise pending/building attribute rows would look like they
+    # are still running.
+    await q.settle_unfinished_attributes(o.pool, build_id=build.id)
+    await db.set_build_status(o.pool, build.id, status, error=error)
     if status == BuildStatus.CANCELLED:
         await o.reporter.eval_cancelled(event, build)
     else:
@@ -164,7 +218,7 @@ async def _run_build_inner(
     credentials: FetchCredentials | None,
 ) -> None:
     await o.reporter.build_started(event, build)
-    await o.db.set_build_status(build.id, BuildStatus.EVALUATING)
+    await db.set_build_status(o.pool, build.id, BuildStatus.EVALUATING)
 
     if await _try_reuse_eval(o, event, build, worktree_path, credentials):
         return
@@ -179,7 +233,8 @@ async def _run_build_inner(
 
     async def record_job_batch(jobs: list[NixEvalJob]) -> None:
         # Pending rows appear in the UI while the eval is running.
-        await o.db.record_attributes(
+        await record_attributes(
+            o.pool,
             build.id,
             [
                 job
@@ -203,7 +258,9 @@ async def _run_build_inner(
         now = time.monotonic()
         if now - last_flush >= LIVE_WARNINGS_FLUSH_INTERVAL:
             last_flush = now
-            await o.db.set_eval_warnings(build.id, json.dumps(live_warnings.snapshot()))
+            await q.set_eval_warnings(
+                o.pool, id_=build.id, warnings=json.dumps(live_warnings.snapshot())
+            )
 
     eval_task = asyncio.ensure_future(
         o.eval_runner.run(
@@ -237,15 +294,16 @@ async def _run_build_inner(
             eval_result = await eval_task
         finally:
             if live_warnings:
-                await o.db.set_eval_warnings(
-                    build.id, json.dumps(live_warnings.snapshot())
+                await q.set_eval_warnings(
+                    o.pool, id_=build.id, warnings=json.dumps(live_warnings.snapshot())
                 )
-        await o.db.set_build_status(build.id, BuildStatus.BUILDING)
+        await db.set_build_status(o.pool, build.id, BuildStatus.BUILDING)
         # Idempotent backstop for the streaming inserts above;
         # pending rows are what crash recovery resumes from. The
         # scheduler drops unsupported systems; their pending rows
         # would never turn terminal, so don't record them.
-        await o.db.record_attributes(
+        await record_attributes(
+            o.pool,
             build.id,
             [
                 job
@@ -254,7 +312,9 @@ async def _run_build_inner(
                 and job.system in o.config.build_systems
             ],
         )
-        await o.db.mark_eval_completed(build.id)
+        # The full eval result is recorded in build_attributes; a later
+        # build of the same tree may reuse it instead of re-evaluating.
+        await q.mark_eval_completed(o.pool, id_=build.id)
         await o.reporter.eval_finished(
             event,
             build,
@@ -287,12 +347,15 @@ async def _reusable_eval_jobs(
     are still in the store; None means evaluate afresh."""
     if build.tree_hash is None:
         return None
-    source_id = await o.db.find_completed_eval(
-        build.project_id, build.tree_hash, build.id
+    source_id = await q.find_completed_eval(
+        o.pool,
+        project_id=build.project_id,
+        tree_hash=build.tree_hash,
+        exclude_build_id=build.id,
     )
     if source_id is None:
         return None
-    jobs = await o.db.get_eval_jobs(source_id)
+    jobs = await get_eval_jobs(o.pool, source_id)
     if jobs is None:
         return None
     # The recorded set may predate a build_systems config change.
@@ -319,9 +382,9 @@ async def _try_reuse_eval(
     reused = await _reusable_eval_jobs(o, build)
     if reused is None:
         return False
-    await o.db.record_attributes(build.id, reused)
-    await o.db.mark_eval_completed(build.id)
-    await o.db.set_build_status(build.id, BuildStatus.BUILDING)
+    await record_attributes(o.pool, build.id, reused)
+    await q.mark_eval_completed(o.pool, id_=build.id)
+    await db.set_build_status(o.pool, build.id, BuildStatus.BUILDING)
     await o.reporter.eval_finished(event, build, success=True, warnings=[])
     # cache_failures=False: see _ReadOnlyFailedBuildCache.
     status = await build_attributes(
@@ -350,7 +413,7 @@ async def build_attributes(  # noqa: PLR0913
     async def record_early(result: AttributeResult) -> None:
         """Persist skips and dependency failures as they happen;
         otherwise they stay pending until the whole build ends."""
-        await o.db.complete_attribute(build.id, result, if_unfinished=True)
+        await db.complete_attribute(o.pool, build.id, result, if_unfinished=True)
 
     failed_build_cache: FailedBuildCache | None = (
         o.failed_build_cache(build.project_id)
@@ -374,7 +437,7 @@ async def build_attributes(  # noqa: PLR0913
     # Persist results the executor adapter didn't already write
     # (failed_eval, dependency_failed, cached_failure, skips).
     for result in schedule_result.results:
-        await o.db.complete_attribute(build.id, result, if_unfinished=True)
+        await db.complete_attribute(o.pool, build.id, result, if_unfinished=True)
 
     # Skipped-as-local attributes still get gcroots/outputs
     # updates. A filesystem error here must not skip the final
@@ -389,11 +452,11 @@ async def build_attributes(  # noqa: PLR0913
         )
         post_process_error = str(e)
 
-    status, generation = await o.db.aggregate_build(build.id)
+    status, generation = await db.aggregate_build(o.pool, build.id)
     if post_process_error is not None:
         status = BuildStatus.FAILED
-        await o.db.set_build_status(
-            build.id, BuildStatus.FAILED, error=post_process_error
+        await db.set_build_status(
+            o.pool, build.id, BuildStatus.FAILED, error=post_process_error
         )
     await o.reporter.build_finished(
         event,
@@ -401,7 +464,10 @@ async def build_attributes(  # noqa: PLR0913
         status,
         generation,
         schedule_result.results,
-        attr_statuses=await o.db.get_attribute_statuses(build.id),
+        attr_statuses={
+            r.attr: r.status
+            for r in await q.attribute_statuses(o.pool, build_id=build.id)
+        },
         attr_prefix=BranchConfig.load(worktree_path).attribute,
     )
     await o.finish_linked(
@@ -466,14 +532,22 @@ class _OrchestratorExecutor:
                 drv_path=job.drv_path,
                 system=job.system,
             )
-            await self.o.db.complete_attribute(self.build_record.id, result)
+            await db.complete_attribute(self.o.pool, self.build_record.id, result)
             # Internal errors are not derivation failures: don't cache.
             return BuildOutcome.failure_no_cache
 
     async def _build_inner(self, job: NixEvalJobSuccess) -> BuildOutcome:
-        if not await self.o.db.mark_attribute_building(
-            self.build_record.id, job.attr, job.system, job.drv_path
-        ):
+        # Flip to 'building' and stamp started_at so the web UI can
+        # distinguish running attributes from queued ones; returns no
+        # row when the attribute is already terminal.
+        marked = await q.mark_attribute_building(
+            self.o.pool,
+            build_id=self.build_record.id,
+            attr=job.attr,
+            system=job.system,
+            drv_path=job.drv_path,
+        )
+        if marked is None:
             # Cancelled externally while waiting on dependencies: do
             # not resurrect the row by building it anyway.
             return BuildOutcome.cancelled
@@ -541,7 +615,8 @@ class _OrchestratorExecutor:
             drv_path=job.drv_path,
             system=job.system,
         )
-        await self.o.db.complete_attribute(
+        await db.complete_attribute(
+            self.o.pool,
             self.build_record.id,
             result,
             log_path=str(writer.path.relative_to(self.o.config.state_dir)),

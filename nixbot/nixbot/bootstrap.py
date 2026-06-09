@@ -34,7 +34,6 @@ from .config import (
     read_secret_file,
     resolve_credential_path,
 )
-from .db import BuildDB
 from .executor import BuildSettings, FairScheduler, NixBuildExecutor
 from .failed_builds import PostgresFailedBuildCache
 from .forge import (
@@ -263,7 +262,7 @@ async def build_service(config: Config) -> tuple[CIService, FastAPI]:
     )
     orchestrator = Orchestrator(
         config=config,
-        db=BuildDB(pool),
+        pool=pool,
         repos=RepoManager(config.state_dir),
         eval_runner=EvalRunner(config.eval_concurrency, limiter=CgroupLimiter.create()),
         executor=executor,

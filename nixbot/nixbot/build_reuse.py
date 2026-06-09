@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from .canceller import RegisterOutcome
 from .db import BuildStatus
+from .db_gen import builds as builds_q
 from .db_gen import maintenance as q
 from .gitrepo import GitError, run_git
 
@@ -41,7 +42,7 @@ async def attach_linked_event(
     # The build may have turned terminal between the record fetch
     # and the attach: the final fan-out already happened and would
     # never cover this event. Replay the final status instead.
-    current = await o.db.get_build(build.id)
+    current = await builds_q.get_build(o.pool, id_=build.id)
     if current is not None and current.status in BuildStatus.TERMINAL:
         with contextlib.suppress(KeyError, ValueError):
             o.linked_events[build.id].remove(event)
@@ -60,7 +61,7 @@ async def replay_terminal_status(
         await o.reporter.eval_cancelled(event, build)
     else:
         eval_success = build.status == BuildStatus.SUCCEEDED or bool(
-            await o.db.get_attribute_statuses(build.id)
+            await builds_q.attribute_statuses(o.pool, build_id=build.id)
         )
         await o.reporter.eval_finished(event, build, success=eval_success, warnings=[])
     await o.reporter.build_finished(
@@ -161,7 +162,7 @@ async def _post_process_existing(
 ) -> None:
     """Gcroots/outputs updates for a context reusing an already
     succeeded build (e.g. default-branch push reusing a PR build)."""
-    rows = await q.succeeded_attribute_outputs(o.db.pool, build_id=build.id)
+    rows = await q.succeeded_attribute_outputs(o.pool, build_id=build.id)
     pairs = []
     for row in rows:
         out = (json.loads(row.outputs) if row.outputs else {}).get("out")

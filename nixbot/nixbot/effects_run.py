@@ -67,7 +67,7 @@ async def maybe_run_effects(
         return
     # The started-flag guards against auto-re-running effects on
     # crash recovery (deploys are not idempotent).
-    if not await o.db.mark_effects_started(build.id):
+    if await builds_q.mark_effects_started(o.pool, id_=build.id) is None:
         return
     task_token = o.task_tokens.issue(build.project_id)
     ctx = effects_context(
@@ -90,7 +90,7 @@ async def maybe_run_effects(
         o.task_tokens.revoke(task_token)
     # Effects removed from the flake since the last run would
     # otherwise linger as stale pending rows.
-    await q.drop_removed_effects(o.db.pool, build_id=build.id, names=names)
+    await q.drop_removed_effects(o.pool, build_id=build.id, names=names)
     await _enqueue_effects(o, build, names)
 
 
@@ -104,9 +104,9 @@ async def _enqueue_effects(
     names = list(dict.fromkeys(names))
     if not names:
         return
-    await builds_q.start_pending_effects(o.db.pool, build_id=build.id, names=names)
+    await builds_q.start_pending_effects(o.pool, build_id=build.id, names=names)
     await wq.enqueue_effect_items(
-        o.db.pool,
+        o.pool,
         dedup_key=f"build-{build.id}",
         build_id=build.id,
         names=names,
@@ -121,7 +121,7 @@ async def run_effect_item(
     credentials: FetchCredentials | None = None,
 ) -> None:
     """Dispatcher entry for one queued effect."""
-    row = await q.effect_status(o.db.pool, build_id=build.id, name=name)
+    row = await q.effect_status(o.pool, build_id=build.id, name=name)
     if row != "pending":
         # Swept after a crash mid-run, or already terminal; started
         # effects never auto-re-run (deploys are not idempotent).
@@ -150,7 +150,8 @@ async def _run_one_effect(
     o: Orchestrator, ctx: EffectsContext, build: BuildRecord, name: str
 ) -> None:
     """One effect with its own row and log."""
-    await o.db.start_effect(build.id, name)
+    # A rerun resets the existing effect row.
+    await builds_q.start_effect(o.pool, build_id=build.id, name=name, status="running")
     # Effect names come from untrusted flakes; percent-encode so
     # the log file cannot escape the log directory. The "effects/"
     # subdirectory keeps them apart from attribute logs (a flat
@@ -174,10 +175,11 @@ async def _run_one_effect(
     if not success:
         logger.error("effect failed", extra={"build_id": build.id, "effect": name})
         error = failure_excerpt(writer.tail_lines()) or None
-    await o.db.finish_effect(
-        build.id,
-        name,
-        success=success,
+    await builds_q.finish_effect(
+        o.pool,
+        build_id=build.id,
+        name=name,
+        status="succeeded" if success else "failed",
         error=error,
         log_path=str(writer.path.relative_to(o.config.state_dir)),
         log_size=writer.bytes_seen,

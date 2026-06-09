@@ -11,9 +11,10 @@ import asyncio
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
-from . import build_run
+from . import build_run, db
 from .canceller import branch_key
 from .db import BuildStatus
+from .db_gen import builds as builds_q
 from .db_gen import maintenance as q
 from .events import ChangeEvent
 from .gitrepo import pr_refspec
@@ -79,7 +80,7 @@ async def rerun_pending_attributes(
     # must not pass the guard together.
     cancel_event = o.cancel_events[build.id] = asyncio.Event()
     try:
-        current = await o.db.get_build(build.id)
+        current = await builds_q.get_build(o.pool, id_=build.id)
         if current is not None and current.status == "cancelled":
             # Cancelled between scheduling the rerun and getting here.
             return
@@ -91,7 +92,7 @@ async def rerun_pending_attributes(
         ]
         if unsupported:
             await q.delete_attributes_by_name(
-                o.db.pool,
+                o.pool,
                 build_id=build.id,
                 attrs=[job.attr for job in unsupported],
             )
@@ -99,7 +100,7 @@ async def rerun_pending_attributes(
                 job for job in pending_jobs if job.system in o.config.build_systems
             ]
         # No re-eval happens on this path; go straight to building.
-        await o.db.set_build_status(build.id, BuildStatus.BUILDING)
+        await db.set_build_status(o.pool, build.id, BuildStatus.BUILDING)
         # Register so supersede/PR-close cancellation also covers
         # recovered and restarted builds.
         o.canceller.register(
@@ -152,7 +153,7 @@ async def rerun_effects(
     try:
         # Reset under the claim: resetting earlier (e.g. in the
         # service) could clobber a rerun already in flight.
-        await q.reset_effects_state(o.db.pool, build_id=build.id)
+        await q.reset_effects_state(o.pool, build_id=build.id)
         async with rerun_worktree(o, info, build, "effects", credentials) as (
             event,
             worktree_path,
