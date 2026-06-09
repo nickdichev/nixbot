@@ -25,7 +25,7 @@ from .secrets import (
 )
 
 
-class BuildbotEffectsError(Exception):
+class NixbotEffectsError(Exception):
     pass
 
 
@@ -104,7 +104,7 @@ def effects_args(opts: EffectsOptions) -> dict[str, Any]:
         rev = get_git_rev(opts.path)
     else:
         msg = "No --rev specified and path is not a git repository"
-        raise BuildbotEffectsError(msg)
+        raise NixbotEffectsError(msg)
     short_rev = rev[:7]
     branch = opts.branch or (get_git_branch(opts.path) if has_git else None)
     repo = opts.repo or opts.path.name
@@ -367,7 +367,7 @@ def virtual_ids(drv_env: dict[str, str]) -> tuple[int, int]:
             return int(value)
         except ValueError as e:
             msg = f"invalid {name} in the derivation: {value!r} is not an integer"
-            raise BuildbotEffectsError(msg) from e
+            raise NixbotEffectsError(msg) from e
 
     uid = parse("__hci_effect_virtual_uid", 0)
     gid = parse("__hci_effect_virtual_gid", uid)
@@ -431,7 +431,7 @@ def run_effects(  # noqa: PLR0913
     bwrap = shutil.which("bwrap")
     if bwrap is None:
         msg = "bwrap executable not found"
-        raise BuildbotEffectsError(msg)
+        raise NixbotEffectsError(msg)
     work_dir, build_dir, etc_dir = _work_dirs()
     pass_env, pass_clear = pass_as_file_env(drv_env, build_dir)
     env.update(pass_env)
@@ -530,4 +530,4 @@ def run_effects(  # noqa: PLR0913
             shutil.rmtree(work_dir, ignore_errors=True)
         if proc.returncode != 0:
             msg = f"command failed with exit code {proc.returncode}"
-            raise BuildbotEffectsError(msg)
+            raise NixbotEffectsError(msg)
