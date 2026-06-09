@@ -9,7 +9,7 @@
 {% endblock bodyattrs %}
 {% block body %}
   {# sseOpen re-checks state rendered before the stream connected; a
-     status change in that gap (eval start, rebuild-failed) would
+     status change in that gap (eval start, attr restart) would
      otherwise be lost. #}
   {% set trigger = "sse:message delay:300ms, htmx:sseOpen from:body" %}
   {# hx-disinherit: the lazy attribute-row fetches inside would
@@ -65,10 +65,6 @@
             <form method="post"
                   action="{{ build_path(project, build.number) }}/restart">
               <button>restart</button>
-            </form>
-            <form method="post"
-                  action="{{ build_path(project, build.number) }}/rebuild-failed">
-              <button>rebuild failed</button>
             </form>
           {% endif %}
         </div>

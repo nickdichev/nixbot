@@ -76,9 +76,9 @@ examples to guide you:
 
 Anonymous users get read-only access to public projects; private repositories
 and their builds are only visible to users with access on the forge. For write
-actions (restart, cancel, rebuild) a login is required. Every enabled forge with
-OAuth credentials configured offers a login, OIDC via
-`services.nixbot.oidc.enable`; several providers can be active at once.
+actions (restart, cancel) a login is required. Every enabled forge with OAuth
+credentials configured offers a login, OIDC via `services.nixbot.oidc.enable`;
+several providers can be active at once.
 
 We have the following two roles:
 

@@ -1,5 +1,5 @@
 """Build control endpoints: restart build, restart a single
-attribute without re-eval, rebuild-all-failed, cancel build or a
+attribute without re-eval, cancel build or a
 single attribute — gated by authz
 (admins, PR authors for their own PR, allowUnauthenticatedControl) and
 CSRF same-origin checks. Admin-only project enable/disable toggle.
@@ -38,9 +38,6 @@ class ControlBackend(Protocol):
     async def cancel_attribute(self, build_id: int, attr: str) -> None: ...
 
     async def refresh_projects(self) -> None: ...
-
-
-FAILED_STATUSES = ("failed", "failed_eval", "dependency_failed", "cached_failure")
 
 
 class ControlAction(BaseModel):
@@ -135,20 +132,6 @@ class _ControlRoutes:
     ) -> RedirectResponse:
         build = await self._authorize(request, forge, owner, name, number)
         await self.backend.restart_effects(build["id"])
-        return _back(forge, owner, name, number)
-
-    async def rebuild_failed(
-        self, request: Request, forge: str, owner: str, name: str, number: int
-    ) -> RedirectResponse:
-        build = await self._authorize(request, forge, owner, name, number)
-        rows = await self.ctx.pool.fetch(
-            "SELECT attr FROM build_attributes "
-            "WHERE build_id = $1 AND status = ANY($2::text[])",
-            build["id"],
-            list(FAILED_STATUSES),
-        )
-        for row in rows:
-            await self.backend.restart_attribute(build["id"], row["attr"])
         return _back(forge, owner, name, number)
 
     async def cancel_attribute(  # noqa: PLR0913
@@ -276,7 +259,6 @@ def create_control_router(
     router.post(f"{base}/restart")(routes.restart)
     # :path — attribute names may contain slashes.
     router.post(f"{base}/attrs/{{attr:path}}/restart")(routes.restart_attribute)
-    router.post(f"{base}/rebuild-failed")(routes.rebuild_failed)
     router.post(f"{base}/effects/restart")(routes.restart_effects)
     router.post(f"{base}/attrs/{{attr:path}}/cancel")(routes.cancel_attribute)
     router.post(f"{base}/cancel")(routes.cancel)

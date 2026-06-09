@@ -143,10 +143,10 @@ def harness(postgres_dsn: str) -> Iterator[WebHarness]:
 
 def test_control_buttons_hidden_without_permission(harness: WebHarness) -> None:
     url = "/repos/github/acme/widget/builds/1"
-    assert "rebuild failed" not in harness.get(url).text
-    assert "rebuild failed" not in harness.get(url, MALLORY).text
-    assert "rebuild failed" in harness.get(url, ROOT).text
-    assert "rebuild failed" in harness.get(url, ALICE).text
+    assert ">restart</button>" not in harness.get(url).text
+    assert ">restart</button>" not in harness.get(url, MALLORY).text
+    assert ">restart</button>" in harness.get(url, ROOT).text
+    assert ">restart</button>" in harness.get(url, ALICE).text
 
 
 def test_admin_can_restart_and_cancel(harness: WebHarness) -> None:
@@ -253,17 +253,6 @@ def test_restart_attribute_with_special_chars_redirects_encoded(
     assert response.status_code == 303
     assert response.headers["location"].endswith(f"/logs/{encoded}")
     assert [a for _, a in BACKEND.attr_restarts] == [attr]
-
-
-def test_rebuild_all_failed(harness: WebHarness) -> None:
-    BACKEND.attr_restarts.clear()
-    assert (
-        harness.post(
-            "/repos/github/acme/widget/builds/1/rebuild-failed", ROOT
-        ).status_code
-        == 303
-    )
-    assert sorted(a for _, a in BACKEND.attr_restarts) == ["bad1", "bad2"]
 
 
 def project_enabled(harness: WebHarness) -> bool:
