@@ -158,18 +158,18 @@ def test_context_prefix_configurable() -> None:
         context_prefix="buildbot",
     )
 
+    # The eval and build contexts are built at separate call sites;
+    # both must honor the prefix. The phase ordering itself is covered
+    # by test_phase_statuses_and_target_url.
     async def run() -> None:
         await reporter.build_started(EVENT, BUILD)
-        await reporter.eval_finished(EVENT, BUILD, success=True, warnings=[])
         await reporter.build_finished(EVENT, BUILD, "succeeded", 1, [])
 
     asyncio.run(run())
-    assert [p.context for p in poster.posts] == [
-        "buildbot/nix-eval",
+    assert {p.context for p in poster.posts} == {
         "buildbot/nix-eval",
         "buildbot/nix-build",
-        "buildbot/nix-build",
-    ]
+    }
 
 
 def test_eval_description_warning_count() -> None:
