@@ -32,6 +32,7 @@ from nixbot.web.control_routes import (
     create_control_router,
 )
 from nixbot.web.token_routes import create_token_router
+from nixbot.work_queue import WorkQueue
 
 from .support import (
     WebHarness,
@@ -485,8 +486,9 @@ async def test_build_service_composition(postgres_dsn: str, tmp_path: Path) -> N
 
 
 async def test_restart_clears_failed_cache_and_guards_running(
-    postgres_dsn: str, tmp_path: Path
+    postgres_dsn: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr("nixbot.restarts.RESTART_RETRY_SECONDS", 0.0)
     config = Config(
         db_url=postgres_dsn,
         build_systems=["x86_64-linux"],
@@ -512,10 +514,13 @@ async def test_restart_clears_failed_cache_and_guards_running(
             project_id,
         )
 
-        # Running build: restart refuses, cache row stays.
+        # Running build: restart defers (stays queued), cache row stays.
         service.orchestrator.cancel_events[build_id] = asyncio.Event()
         await service.restart_build(build_id)
-        await service.drain_work()
+        queue = WorkQueue(pool)
+        item = await queue.claim_next()
+        assert item is not None
+        await service._execute_work(queue, item)  # noqa: SLF001
         assert await pool.fetchval("SELECT count(*) FROM failed_builds") == 1
         assert (
             await pool.fetchval(
@@ -525,9 +530,9 @@ async def test_restart_clears_failed_cache_and_guards_running(
             == "failed"
         )
 
-        # Not running: cache cleared, attributes reset.
+        # Not running: the deferred intent goes through, cache
+        # cleared, attributes reset.
         del service.orchestrator.cancel_events[build_id]
-        await service.restart_build(build_id)
         await service.drain_work()
         assert await pool.fetchval("SELECT count(*) FROM failed_builds") == 0
         assert (

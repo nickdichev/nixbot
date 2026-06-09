@@ -315,7 +315,13 @@ class CIService:
         if item.kind == "change":
             await self._process_change(ChangeRequest(**payload))
         elif item.kind == "restart":
-            await restarts.restart(self, payload["build_id"], payload.get("attr"))
+            retry = await restarts.restart(
+                self, payload["build_id"], payload.get("attr")
+            )
+            if retry:
+                # Still running (e.g. restart right after a cancel,
+                # while the old run unwinds): retry, don't drop.
+                await self.enqueue_work("restart", item.dedup_key, payload)
         elif item.kind == "rerun":
             # Crash recovery: resume pending attributes, no reset.
             await self._rerun(payload["build_id"])

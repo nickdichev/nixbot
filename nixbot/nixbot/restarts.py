@@ -5,6 +5,7 @@ back to re-evaluation, and effects-only restarts.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -22,6 +23,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Pause before handing a restart of a still-running build back to the
+# work queue; bounds the retry cadence without holding the dedup key
+# for the whole build.
+RESTART_RETRY_SECONDS = 10.0
+
 
 async def restart_effects(s: CIService, build_id: int) -> None:
     if build_id in s.orchestrator.cancel_events:
@@ -37,13 +43,18 @@ async def restart_effects(s: CIService, build_id: int) -> None:
     await s.orchestrator.rerun_effects(info, build, credentials)
 
 
-async def restart(s: CIService, build_id: int, attr: str | None) -> None:
+async def restart(s: CIService, build_id: int, attr: str | None) -> bool:
     """Reset attributes (one or all) and re-run only the pending jobs
-    from the stored eval results — no re-eval."""
+    from the stored eval results — no re-eval.
+
+    Returns True when the build is still running and the restart
+    must be retried later (restarting now would double-build)."""
     if build_id in s.orchestrator.cancel_events:
-        return  # still running; a restart would double-build
+        await asyncio.sleep(RESTART_RETRY_SECONDS)
+        if build_id in s.orchestrator.cancel_events:
+            return True
     if await s.orchestrator.db.get_build(build_id) is None:
-        return
+        return False
     if attr is not None:
         # A stale attr (e.g. after a re-eval renamed it) must not
         # reset the build row and spawn an empty rerun.
@@ -57,7 +68,7 @@ async def restart(s: CIService, build_id: int, attr: str | None) -> None:
                 "restart of unknown attribute ignored",
                 extra={"build_id": build_id, "attr": attr},
             )
-            return
+            return False
     # An explicit rebuild clears cached failures so the attributes
     # actually build again instead of re-skipping.
     await s.pool.execute(
@@ -100,6 +111,7 @@ async def restart(s: CIService, build_id: int, attr: str | None) -> None:
         build_id,
     )
     await rerun(s, build_id)
+    return False
 
 
 async def rerun(s: CIService, build_id: int) -> None:

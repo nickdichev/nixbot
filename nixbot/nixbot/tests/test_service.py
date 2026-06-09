@@ -25,6 +25,7 @@ from nixbot.forge import DiscoveredRepo
 from nixbot.scheduled import DueEffect, ScheduleWhen
 from nixbot.scheduled_runs import scheduled_worktree_id
 from nixbot.webhooks import ChangeRequest, PrClosed
+from nixbot.work_queue import WorkQueue
 
 from .support import FakeGitlab, git, insert_build, insert_project, make_config
 
@@ -388,6 +389,99 @@ async def test_restart_failed_eval_attribute_reevaluates(
         build_id,
     )
     assert count == 0
+
+
+async def test_restart_cancelled_build_reschedules_attributes(
+    service: CIService,
+    git_repo: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restarting a cancelled build must rebuild its cancelled
+    attributes from the stored eval results."""
+    repo, sha = git_repo
+
+    pool = service.pool
+    project_id = await seed_project(pool, str(repo))
+    build_id = await insert_build(pool, project_id, commit_sha=sha, status="cancelled")
+    await pool.execute(
+        "INSERT INTO build_attributes (build_id, attr, system, status, drv_path) "
+        "VALUES ($1, 'a', 'x86_64-linux', 'cancelled', '/nix/store/a.drv'), "
+        "($1, 'b', 'x86_64-linux', 'cancelled', '/nix/store/b.drv')",
+        build_id,
+    )
+
+    async def fake_check_store_paths(drvs: list[str]) -> set[str]:
+        return set(drvs)
+
+    monkeypatch.setattr("nixbot.restarts.check_store_paths", fake_check_store_paths)
+
+    rescheduled: list[list[str]] = []
+
+    async def fake_rerun_pending_attributes(
+        info: Any, build: Any, pending_jobs: Any, credentials: Any = None
+    ) -> None:
+        rescheduled.append(sorted(job.attr for job in pending_jobs))
+
+    service.orchestrator.rerun_pending_attributes = fake_rerun_pending_attributes  # type: ignore[method-assign]
+    await service.restart_build(build_id)
+    await service.drain_work()
+    await asyncio.gather(*service._tasks)  # noqa: SLF001
+
+    assert rescheduled == [["a", "b"]]
+
+
+async def test_restart_while_running_is_requeued_not_dropped(
+    service: CIService,
+    git_repo: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restart clicked while the build is still in flight (e.g. right
+    after a cancel, while the old run unwinds) must stay queued and
+    run once the build is gone, not be dropped silently."""
+    repo, sha = git_repo
+    monkeypatch.setattr("nixbot.restarts.RESTART_RETRY_SECONDS", 0.0)
+
+    pool = service.pool
+    project_id = await seed_project(pool, str(repo))
+    build_id = await insert_build(pool, project_id, commit_sha=sha, status="cancelled")
+    await pool.execute(
+        "INSERT INTO build_attributes (build_id, attr, system, status, drv_path) "
+        "VALUES ($1, 'a', 'x86_64-linux', 'cancelled', '/nix/store/a.drv')",
+        build_id,
+    )
+
+    async def fake_check_store_paths(drvs: list[str]) -> set[str]:
+        return set(drvs)
+
+    monkeypatch.setattr("nixbot.restarts.check_store_paths", fake_check_store_paths)
+
+    rescheduled: list[int] = []
+
+    async def fake_rerun_pending_attributes(
+        info: Any, build: Any, pending_jobs: Any, credentials: Any = None
+    ) -> None:
+        rescheduled.append(build.id)
+
+    service.orchestrator.rerun_pending_attributes = fake_rerun_pending_attributes  # type: ignore[method-assign]
+
+    # Simulate the cancelled run still unwinding.
+    service.orchestrator.cancel_events[build_id] = asyncio.Event()
+    await service.restart_build(build_id)
+    queue = WorkQueue(pool)
+    item = await queue.claim_next()
+    assert item is not None
+    await service._execute_work(queue, item)  # noqa: SLF001
+    assert rescheduled == []  # deferred, not executed
+    pending = await pool.fetchval(
+        "SELECT count(*) FROM work_queue WHERE kind = 'restart' AND status = 'pending'"
+    )
+    assert pending == 1  # the intent survived
+
+    # Old run finished; the queued restart now goes through.
+    del service.orchestrator.cancel_events[build_id]
+    await service.drain_work()
+    await asyncio.gather(*service._tasks)  # noqa: SLF001
+    assert rescheduled == [build_id]
 
 
 # --- cancel of a non-running build ---------------------------------------
