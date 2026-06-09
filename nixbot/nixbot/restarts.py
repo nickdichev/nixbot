@@ -172,6 +172,13 @@ async def _reeval(
             # wedge the aggregate; the re-eval rewrites them. Finished
             # rows with a drv_path are kept: their results are valid
             # and the re-eval skips already-built attributes.
+            # The flag must drop before the rows: a concurrent build
+            # of the same tree must not reuse the partial set
+            # (run_build only clears it after this window).
+            await s.pool.execute(
+                "UPDATE builds SET eval_completed = FALSE WHERE id = $1",
+                build.id,
+            )
             await s.pool.execute(
                 "DELETE FROM build_attributes WHERE build_id = $1 "
                 "AND (status IN ('pending', 'building') OR drv_path IS NULL)",

@@ -390,6 +390,81 @@ async def test_tree_hash_reuse(run_event: EventRunner, upstream: Path) -> None:
     assert [e[0] for e in reporter2.events] == ["eval", "finished"]
 
 
+type TreeRebuildRunner = Callable[..., Awaitable[BuildRecord]]
+
+
+@pytest.fixture
+def rebuild_same_tree_after_cancel(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> TreeRebuildRunner:
+    """Build once, cancel the build after the fact (as a supersede
+    would), then push a new commit with the identical tree."""
+
+    async def run(
+        eval_runner: FakeEvalRunner, name: str, *, drvs_valid: bool
+    ) -> BuildRecord:
+        add_commit(upstream, name)
+        sha1 = git(upstream, "rev-parse", "HEAD")
+        orchestrator, _, project = await make_env(eval_runner, FakeExecutor(), name)
+
+        async def check(paths: list[str]) -> set[str]:
+            return set(paths) if drvs_valid else set()
+
+        orchestrator.check_store_paths = check
+        build1 = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha1)
+        )
+        assert build1 is not None
+        assert eval_runner.calls == 1
+        await pool.execute(
+            "UPDATE builds SET status = 'cancelled' WHERE id = $1", build1.id
+        )
+        git(upstream, "commit", "--allow-empty", "-m", "same tree")
+        sha2 = git(upstream, "rev-parse", "HEAD")
+        build2 = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha2)
+        )
+        assert build2 is not None
+        assert build2.id != build1.id
+        return build2
+
+    return run
+
+
+async def test_eval_reuse_from_cancelled_build(
+    pool: asyncpg.Pool, rebuild_same_tree_after_cancel: TreeRebuildRunner
+) -> None:
+    """A new build for a tree whose eval already completed in an
+    earlier (cancelled) build reuses the stored jobs instead of
+    re-evaluating, as long as the derivations are still in the store."""
+    eval_runner = FakeEvalRunner([mk_job("a"), mk_job("b")])
+    build2 = await rebuild_same_tree_after_cancel(
+        eval_runner, "evalreuse", drvs_valid=True
+    )
+    assert eval_runner.calls == 1  # eval skipped
+    assert await build_status(pool, build2.id) == BuildStatus.SUCCEEDED
+    attrs = await pool.fetch(
+        "SELECT attr, status FROM build_attributes WHERE build_id = $1",
+        build2.id,
+    )
+    assert {r["attr"]: r["status"] for r in attrs} == {
+        "a": "succeeded",
+        "b": "succeeded",
+    }
+
+
+async def test_eval_reuse_skipped_when_drvs_gone(
+    pool: asyncpg.Pool, rebuild_same_tree_after_cancel: TreeRebuildRunner
+) -> None:
+    """Garbage-collected derivations force a fresh evaluation."""
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    build2 = await rebuild_same_tree_after_cancel(
+        eval_runner, "evalreuse2", drvs_valid=False
+    )
+    assert eval_runner.calls == 2  # re-evaluated
+    assert await build_status(pool, build2.id) == BuildStatus.SUCCEEDED
+
+
 async def test_main_push_promotes_reused_pr_build(
     pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
 ) -> None:

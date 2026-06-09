@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
-from . import build_reuse, build_run, effects_run, gcroots, outputs, reruns
+from . import build_reuse, build_run, effects_run, gcroots, outputs, recovery, reruns
 from .canceller import (
     CancellationManager,
     RegisterOutcome,
@@ -103,6 +103,10 @@ class Orchestrator:
     # Injectable for tests; defaults to the real implementations.
     register_gcroot: GcrootRegistrar = gcroots.register_gcroot
     write_output_path: OutputWriter = outputs.write_output_path
+    # Store-path validity probe for eval reuse; injectable for tests.
+    check_store_paths: Callable[[list[str]], Awaitable[set[str]]] = (
+        recovery.check_store_paths
+    )
     canceller: CancellationManager = field(default_factory=CancellationManager)
     # Live log fan-out for the web frontend's SSE endpoints.
     log_registry: LogRegistry = field(default_factory=LogRegistry)

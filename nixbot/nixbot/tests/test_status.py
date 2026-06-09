@@ -90,6 +90,7 @@ BUILD = BuildRecord(
     status="building",
     status_generation=0,
     effects_started=False,
+    eval_completed=False,
 )
 
 
