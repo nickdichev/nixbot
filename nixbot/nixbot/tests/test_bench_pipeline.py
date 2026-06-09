@@ -109,6 +109,8 @@ def flake(tmp_path: Path) -> Path:
     return tmp_path
 
 
+# benchmark.pedantic needs a sync callable, so this test drives its
+# own event loop via asyncio.run instead of pytest-asyncio.
 @pytest.mark.timeout(1800)
 def test_bench_full_pipeline(
     benchmark: BenchmarkFixture, flake: Path, tmp_path: Path

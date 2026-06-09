@@ -41,122 +41,105 @@ if TYPE_CHECKING:
 # --- FairScheduler ---------------------------------------------------------
 
 
-def test_fair_round_robin_across_builds() -> None:
-    async def run() -> list[str]:
-        queue = FairScheduler(1)
-        order: list[str] = []
-        await queue.acquire("seed")  # occupy the only slot
+async def test_fair_round_robin_across_builds() -> None:
+    queue = FairScheduler(1)
+    order: list[str] = []
+    await queue.acquire("seed")  # occupy the only slot
 
-        async def worker(name: str, key: str) -> None:
-            await queue.acquire(key)
-            order.append(name)
-            queue.release()
+    async def worker(name: str, key: str) -> None:
+        await queue.acquire(key)
+        order.append(name)
+        queue.release()
 
-        # Build A enqueues three attrs first, build B two: fairness must
-        # interleave instead of draining A first; FIFO within a build.
-        tasks = [
-            asyncio.create_task(worker("a1", "A")),
-            asyncio.create_task(worker("a2", "A")),
-            asyncio.create_task(worker("a3", "A")),
-            asyncio.create_task(worker("b1", "B")),
-            asyncio.create_task(worker("b2", "B")),
-        ]
-        await asyncio.sleep(0)  # let all enqueue
-        queue.release()  # free the seed slot
-        await asyncio.gather(*tasks)
-        return order
-
-    order = asyncio.run(run())
+    # Build A enqueues three attrs first, build B two: fairness must
+    # interleave instead of draining A first; FIFO within a build.
+    tasks = [
+        asyncio.create_task(worker("a1", "A")),
+        asyncio.create_task(worker("a2", "A")),
+        asyncio.create_task(worker("a3", "A")),
+        asyncio.create_task(worker("b1", "B")),
+        asyncio.create_task(worker("b2", "B")),
+    ]
+    await asyncio.sleep(0)  # let all enqueue
+    queue.release()  # free the seed slot
+    await asyncio.gather(*tasks)
     assert order == ["a1", "b1", "a2", "b2", "a3"]
 
 
-def test_fair_scheduler_capacity() -> None:
-    async def run() -> int:
-        queue = FairScheduler(2)
-        active = 0
-        peak = 0
+async def test_fair_scheduler_capacity() -> None:
+    queue = FairScheduler(2)
+    active = 0
+    peak = 0
 
-        async def worker() -> None:
-            nonlocal active, peak
-            await queue.acquire("k")
-            active += 1
-            peak = max(peak, active)
-            await asyncio.sleep(0.01)
-            active -= 1
-            queue.release()
-
-        await asyncio.gather(*[worker() for _ in range(6)])
-        return peak
-
-    assert asyncio.run(run()) == 2
-
-
-def test_fair_scheduler_cancelled_waiter() -> None:
-    async def run() -> None:
-        queue = FairScheduler(1)
-        await queue.acquire("A")
-        waiter = asyncio.create_task(queue.acquire("B"))
-        await asyncio.sleep(0)
-        waiter.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await waiter
+    async def worker() -> None:
+        nonlocal active, peak
+        await queue.acquire("k")
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
         queue.release()
-        # Slot must be available again.
-        await asyncio.wait_for(queue.acquire("C"), timeout=1)
 
-    asyncio.run(run())
+    await asyncio.gather(*[worker() for _ in range(6)])
+
+    assert peak == 2
+
+
+async def test_fair_scheduler_cancelled_waiter() -> None:
+    queue = FairScheduler(1)
+    await queue.acquire("A")
+    waiter = asyncio.create_task(queue.acquire("B"))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    queue.release()
+    # Slot must be available again.
+    await asyncio.wait_for(queue.acquire("C"), timeout=1)
 
 
 # --- LogWriter --------------------------------------------------------------
 
 
-def test_log_writer_roundtrip(tmp_path: Path) -> None:
-    async def run() -> None:
-        writer = LogWriter(path=tmp_path / "log.zst")
-        await writer.write(b"hello ")
-        await writer.write(b"world\n")
-        await writer.close()
-
-    asyncio.run(run())
+async def test_log_writer_roundtrip(tmp_path: Path) -> None:
+    writer = LogWriter(path=tmp_path / "log.zst")
+    await writer.write(b"hello ")
+    await writer.write(b"world\n")
+    await writer.close()
     assert read_log(tmp_path / "log.zst") == b"hello world\n"
 
 
-def test_log_writer_fan_out(tmp_path: Path) -> None:
-    async def run() -> list[bytes]:
-        writer = LogWriter(path=tmp_path / "log.zst")
-        sub1 = writer.subscribe()
-        sub2 = writer.subscribe()
-        await writer.write(b"line1\n")
-        await writer.close()
-        chunks = []
-        while (chunk := await sub1.get()) is not None:
-            chunks.append(chunk)
-        assert await sub2.get() == b"line1\n"
-        assert await sub2.get() is None
-        return chunks
+async def test_log_writer_fan_out(tmp_path: Path) -> None:
+    writer = LogWriter(path=tmp_path / "log.zst")
+    sub1 = writer.subscribe()
+    sub2 = writer.subscribe()
+    await writer.write(b"line1\n")
+    await writer.close()
+    chunks = []
+    while (chunk := await sub1.get()) is not None:
+        chunks.append(chunk)
+    assert await sub2.get() == b"line1\n"
+    assert await sub2.get() is None
 
-    assert asyncio.run(run()) == [b"line1\n"]
+    assert chunks == [b"line1\n"]
 
 
-def test_log_writer_subscribe_with_history(tmp_path: Path) -> None:
-    async def run() -> None:
-        writer = LogWriter(path=tmp_path / "log.zst")
-        await writer.write(b"early\n")
-        history, queue = await writer.subscribe_with_history()
-        assert history == b"early\n"
-        await writer.write(b"late\n")
-        assert await queue.get() == b"late\n"
-        await writer.close()
-        assert await queue.get() is None
-        # Subscribing after close must terminate, not hang.
-        history, queue = await writer.subscribe_with_history()
-        assert history == b"early\nlate\n"
-        assert await queue.get() is None
-
-    asyncio.run(run())
+async def test_log_writer_subscribe_with_history(tmp_path: Path) -> None:
+    writer = LogWriter(path=tmp_path / "log.zst")
+    await writer.write(b"early\n")
+    history, queue = await writer.subscribe_with_history()
+    assert history == b"early\n"
+    await writer.write(b"late\n")
+    assert await queue.get() == b"late\n"
+    await writer.close()
+    assert await queue.get() is None
+    # Subscribing after close must terminate, not hang.
+    history, queue = await writer.subscribe_with_history()
+    assert history == b"early\nlate\n"
+    assert await queue.get() is None
 
 
-def test_log_writer_no_chunk_lost_during_snapshot(
+async def test_log_writer_no_chunk_lost_during_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A chunk written while subscribe_with_history reads the on-disk
@@ -172,67 +155,56 @@ def test_log_writer_no_chunk_lost_during_snapshot(
 
     monkeypatch.setattr(executor_mod, "read_log", slow_read)
 
-    async def run() -> None:
-        writer = LogWriter(path=tmp_path / "log.zst")
-        await writer.write(b"early\n")
-        task = asyncio.create_task(writer.subscribe_with_history())
-        while (  # noqa: ASYNC110 — polling a threading.Event is the point
-            not started.is_set()
-        ):
-            await asyncio.sleep(0.01)
-        await writer.write(b"during\n")
-        release.set()
-        history, queue = await task
-        await writer.close()
-        chunks = []
-        while (chunk := await queue.get()) is not None:
-            chunks.append(chunk)
-        combined = history + b"".join(chunks)
-        assert combined == b"early\nduring\n"
-
-    asyncio.run(run())
+    writer = LogWriter(path=tmp_path / "log.zst")
+    await writer.write(b"early\n")
+    task = asyncio.create_task(writer.subscribe_with_history())
+    while (  # noqa: ASYNC110 — polling a threading.Event is the point
+        not started.is_set()
+    ):
+        await asyncio.sleep(0.01)
+    await writer.write(b"during\n")
+    release.set()
+    history, queue = await task
+    await writer.close()
+    chunks = []
+    while (chunk := await queue.get()) is not None:
+        chunks.append(chunk)
+    combined = history + b"".join(chunks)
+    assert combined == b"early\nduring\n"
 
 
-def test_log_writer_concurrent_flush_keeps_frame_order(tmp_path: Path) -> None:
+async def test_log_writer_concurrent_flush_keeps_frame_order(tmp_path: Path) -> None:
     """A snapshot racing a threshold flush must not write zstd frames
     out of order (or share the compressor across threads)."""
 
-    async def run() -> bytes:
-        writer = LogWriter(path=tmp_path / "log.zst")
-        orig_compress = writer._compressor.compress  # noqa: SLF001
+    writer = LogWriter(path=tmp_path / "log.zst")
+    orig_compress = writer._compressor.compress  # noqa: SLF001
 
-        class SlowCompressor:
-            @staticmethod
-            def compress(data: bytes) -> bytes:
-                time.sleep(0.05)
-                return orig_compress(data)
+    class SlowCompressor:
+        @staticmethod
+        def compress(data: bytes) -> bytes:
+            time.sleep(0.05)
+            return orig_compress(data)
 
-        writer._compressor = SlowCompressor()  # type: ignore[assignment] # noqa: SLF001
-        big = b"A" * FRAME_FLUSH_THRESHOLD
-        flush_task = asyncio.create_task(writer.write(big))
-        await asyncio.sleep(0.01)  # flush is inside the slow compress
-        await writer.write(b"tail\n")
-        snapshot = await writer.snapshot()
-        await flush_task
-        await writer.close()
-        return snapshot
-
-    snapshot = asyncio.run(run())
+    writer._compressor = SlowCompressor()  # type: ignore[assignment] # noqa: SLF001
+    big = b"A" * FRAME_FLUSH_THRESHOLD
+    flush_task = asyncio.create_task(writer.write(big))
+    await asyncio.sleep(0.01)  # flush is inside the slow compress
+    await writer.write(b"tail\n")
+    snapshot = await writer.snapshot()
+    await flush_task
+    await writer.close()
     big = b"A" * FRAME_FLUSH_THRESHOLD
     assert snapshot == big + b"tail\n"
     assert read_log(tmp_path / "log.zst") == big + b"tail\n"
 
 
-def test_log_writer_truncation_keeps_head_and_tail(tmp_path: Path) -> None:
-    async def run() -> LogWriter:
-        writer = LogWriter(path=tmp_path / "log.zst", size_limit=1000)
-        await writer.write(b"H" * 600)  # head budget is 500
-        for i in range(100):
-            await writer.write(f"tail-{i:03d}\n".encode())
-        await writer.close()
-        return writer
-
-    writer = asyncio.run(run())
+async def test_log_writer_truncation_keeps_head_and_tail(tmp_path: Path) -> None:
+    writer = LogWriter(path=tmp_path / "log.zst", size_limit=1000)
+    await writer.write(b"H" * 600)  # head budget is 500
+    for i in range(100):
+        await writer.write(f"tail-{i:03d}\n".encode())
+    await writer.close()
     content = read_log(tmp_path / "log.zst")
     assert writer.truncated
     assert content.startswith(b"H" * 500)
@@ -298,72 +270,69 @@ esac
     return tmp_path / "control"
 
 
-def run_build(
+async def run_build(
     tmp_path: Path,
     settings: BuildSettings | None = None,
     cancel_event: asyncio.Event | None = None,
 ) -> tuple[BuildOutcome, bytes]:
-    async def run() -> tuple[BuildOutcome, bytes]:
-        executor = NixBuildExecutor(
-            FairScheduler(2), settings or BuildSettings(log_dir=tmp_path)
-        )
-        writer = LogWriter(path=tmp_path / "log.zst")
-        outcome = await executor.build_attribute(
-            "build-1", mk_job(), writer, tmp_path, cancel_event
-        )
-        await writer.close()
-        return outcome, read_log(tmp_path / "log.zst")
-
-    return asyncio.run(run())
+    executor = NixBuildExecutor(
+        FairScheduler(2), settings or BuildSettings(log_dir=tmp_path)
+    )
+    writer = LogWriter(path=tmp_path / "log.zst")
+    outcome = await executor.build_attribute(
+        "build-1", mk_job(), writer, tmp_path, cancel_event
+    )
+    await writer.close()
+    return outcome, read_log(tmp_path / "log.zst")
 
 
-def test_executor_success(tmp_path: Path, fake_nix: Path) -> None:
-    outcome, log = run_build(tmp_path)
+async def test_executor_success(tmp_path: Path, fake_nix: Path) -> None:
+    outcome, log = await run_build(tmp_path)
     assert outcome == BuildOutcome.success
     assert b"building" in log
 
 
-def test_executor_failure(tmp_path: Path, fake_nix: Path) -> None:
+async def test_executor_failure(tmp_path: Path, fake_nix: Path) -> None:
     fake_nix.write_text("fail")
-    outcome, log = run_build(tmp_path)
+    outcome, log = await run_build(tmp_path)
     assert outcome == BuildOutcome.failure
     assert b"builder failed" in log
 
 
-def test_executor_transient_retry_succeeds(tmp_path: Path, fake_nix: Path) -> None:
+async def test_executor_transient_retry_succeeds(
+    tmp_path: Path, fake_nix: Path
+) -> None:
     fake_nix.write_text("transient-once")
-    outcome, log = run_build(tmp_path)
+    outcome, log = await run_build(tmp_path)
     assert outcome == BuildOutcome.success
     assert b"retrying once" in log
 
 
-def test_executor_timeout(tmp_path: Path, fake_nix: Path) -> None:
+async def test_executor_timeout(tmp_path: Path, fake_nix: Path) -> None:
     fake_nix.write_text("hang")
-    outcome, log = run_build(tmp_path, BuildSettings(log_dir=tmp_path, timeout=1))
+    outcome, log = await run_build(tmp_path, BuildSettings(log_dir=tmp_path, timeout=1))
     assert outcome == BuildOutcome.failure
     assert b"timed out" in log
 
 
-def test_executor_cancel(tmp_path: Path, fake_nix: Path) -> None:
+async def test_executor_cancel(tmp_path: Path, fake_nix: Path) -> None:
     fake_nix.write_text("hang")
 
-    async def run() -> BuildOutcome:
-        executor = NixBuildExecutor(FairScheduler(2), BuildSettings(log_dir=tmp_path))
-        writer = LogWriter(path=tmp_path / "log.zst")
-        cancel_event = asyncio.Event()
-        task = asyncio.create_task(
-            executor.build_attribute("b", mk_job(), writer, tmp_path, cancel_event)
-        )
-        await asyncio.sleep(0.2)
-        cancel_event.set()
-        outcome = await asyncio.wait_for(task, timeout=5)
-        await writer.close()
-        return outcome
+    executor = NixBuildExecutor(FairScheduler(2), BuildSettings(log_dir=tmp_path))
+    writer = LogWriter(path=tmp_path / "log.zst")
+    cancel_event = asyncio.Event()
+    task = asyncio.create_task(
+        executor.build_attribute("b", mk_job(), writer, tmp_path, cancel_event)
+    )
+    await asyncio.sleep(0.2)
+    cancel_event.set()
+    outcome = await asyncio.wait_for(task, timeout=5)
+    await writer.close()
 
-    assert asyncio.run(run()) == BuildOutcome.cancelled
+    assert outcome == BuildOutcome.cancelled
 
 
-def test_executor_hard_cancel_kills_process_group(
+async def test_executor_hard_cancel_kills_process_group(
     tmp_path: Path, fake_nix: Path
 ) -> None:
     """Cancelling the build task itself (not via the cancel event) must
@@ -376,23 +345,20 @@ def test_executor_hard_cancel_kills_process_group(
     fake_nix.write_text("hangpid")
     pidfile = tmp_path / "pid"
 
-    async def run() -> int:
-        executor = NixBuildExecutor(FairScheduler(2), BuildSettings(log_dir=tmp_path))
-        writer = LogWriter(path=tmp_path / "log.zst")
-        task = asyncio.create_task(
-            executor.build_attribute("b", mk_job(), writer, tmp_path)
-        )
-        while (  # noqa: ASYNC110 — polling an external file is the point
-            not pidfile.exists() or not pidfile.read_text().strip()
-        ):
-            await asyncio.sleep(0.01)
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=5)
-        await writer.close()
-        return int(pidfile.read_text())
-
-    pid = asyncio.run(run())
+    executor = NixBuildExecutor(FairScheduler(2), BuildSettings(log_dir=tmp_path))
+    writer = LogWriter(path=tmp_path / "log.zst")
+    task = asyncio.create_task(
+        executor.build_attribute("b", mk_job(), writer, tmp_path)
+    )
+    while (  # noqa: ASYNC110 — polling an external file is the point
+        not pidfile.exists() or not pidfile.read_text().strip()
+    ):
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    await writer.close()
+    pid = int(pidfile.read_text())
     for _ in range(100):
         try:
             os.kill(pid, 0)
@@ -404,115 +370,99 @@ def test_executor_hard_cancel_kills_process_group(
         pytest.fail("nix process leaked after hard cancel")
 
 
-def test_executor_cancel_suppresses_retry(tmp_path: Path, fake_nix: Path) -> None:
+async def test_executor_cancel_suppresses_retry(tmp_path: Path, fake_nix: Path) -> None:
     # Cancel before start: no retry, no build.
     fake_nix.write_text("transient-once")
     cancel_event = asyncio.Event()
     cancel_event.set()
-    outcome, log = run_build(tmp_path, cancel_event=cancel_event)
+    outcome, log = await run_build(tmp_path, cancel_event=cancel_event)
     assert outcome == BuildOutcome.cancelled
     assert b"retrying" not in log
 
 
-def test_log_writer_not_truncated_between_head_and_limit(tmp_path: Path) -> None:
+async def test_log_writer_not_truncated_between_head_and_limit(tmp_path: Path) -> None:
     # Total output fits the cap (head budget + tail budget): nothing is
     # dropped, so the log must not be reported or marked as truncated.
-    async def run() -> LogWriter:
-        writer = LogWriter(path=tmp_path / "log.zst", size_limit=1000)
-        await writer.write(b"H" * 600)  # head budget is 500
-        await writer.close()
-        return writer
-
-    writer = asyncio.run(run())
+    writer = LogWriter(path=tmp_path / "log.zst", size_limit=1000)
+    await writer.write(b"H" * 600)  # head budget is 500
+    await writer.close()
     content = read_log(tmp_path / "log.zst")
     assert not writer.truncated
     assert b"log truncated" not in content
     assert content == b"H" * 600
 
 
-def test_log_writer_subscriber_queue_bounded(tmp_path: Path) -> None:
-    async def run() -> tuple[int, bytes | None]:
-        writer = LogWriter(path=tmp_path / "log.zst")
-        queue = writer.subscribe()
-        # A stalled client: nothing consumes while the build streams.
-        for i in range(SUBSCRIBER_QUEUE_MAXSIZE + 100):
-            await writer.write(f"chunk-{i}\n".encode())
-        size = queue.qsize()
-        await writer.close()
-        # Drain: the newest data and the close sentinel must be present.
-        last = None
-        while (chunk := await queue.get()) is not None:
-            last = chunk
-        return size, last
-
-    size, last = asyncio.run(run())
+async def test_log_writer_subscriber_queue_bounded(tmp_path: Path) -> None:
+    writer = LogWriter(path=tmp_path / "log.zst")
+    queue = writer.subscribe()
+    # A stalled client: nothing consumes while the build streams.
+    for i in range(SUBSCRIBER_QUEUE_MAXSIZE + 100):
+        await writer.write(f"chunk-{i}\n".encode())
+    size = queue.qsize()
+    await writer.close()
+    # Drain: the newest data and the close sentinel must be present.
+    last = None
+    while (chunk := await queue.get()) is not None:
+        last = chunk
     assert size <= SUBSCRIBER_QUEUE_MAXSIZE
     assert last == f"chunk-{SUBSCRIBER_QUEUE_MAXSIZE + 99}\n".encode()
 
 
-def test_log_writer_batches_frames(tmp_path: Path) -> None:
+async def test_log_writer_batches_frames(tmp_path: Path) -> None:
     # Many tiny writes must not produce one zstd frame each (frame
     # overhead would make the "compressed" log larger than plaintext).
-    async def run() -> None:
-        writer = LogWriter(path=tmp_path / "log.zst")
-        for i in range(10000):
-            await writer.write(f"line {i}\n".encode())
-        await writer.close()
-
-    asyncio.run(run())
+    writer = LogWriter(path=tmp_path / "log.zst")
+    for i in range(10000):
+        await writer.write(f"line {i}\n".encode())
+    await writer.close()
     raw = (tmp_path / "log.zst").stat().st_size
     plain = read_log(tmp_path / "log.zst")
     assert plain == b"".join(f"line {i}\n".encode() for i in range(10000))
     assert raw < len(plain)
 
 
-def test_executor_sanitizes_out_link(tmp_path: Path, fake_nix: Path) -> None:
+async def test_executor_sanitizes_out_link(tmp_path: Path, fake_nix: Path) -> None:
     # Repository-controlled attribute names must not traverse out of
     # the worktree via --out-link.
-    async def run() -> bytes:
-        executor = NixBuildExecutor(FairScheduler(2), BuildSettings(log_dir=tmp_path))
-        writer = LogWriter(path=tmp_path / "log.zst")
-        outcome = await executor.build_attribute(
-            "b", mk_job('checks."../../evil"'), writer, tmp_path
-        )
-        assert outcome == BuildOutcome.success
-        await writer.close()
-        return read_log(tmp_path / "log.zst")
-
-    log = asyncio.run(run())
+    executor = NixBuildExecutor(FairScheduler(2), BuildSettings(log_dir=tmp_path))
+    writer = LogWriter(path=tmp_path / "log.zst")
+    outcome = await executor.build_attribute(
+        "b", mk_job('checks."../../evil"'), writer, tmp_path
+    )
+    assert outcome == BuildOutcome.success
+    await writer.close()
+    log = read_log(tmp_path / "log.zst")
     assert b"result-.." not in log
     assert b"--out-link " + str(tmp_path).encode() + b"/result-checks." in log
 
 
-def test_executor_cancel_while_queued(tmp_path: Path, fake_nix: Path) -> None:
+async def test_executor_cancel_while_queued(tmp_path: Path, fake_nix: Path) -> None:
     # A queued build whose cancel event fires must not wait for a slot.
     fake_nix.write_text("hang")
 
-    async def run() -> BuildOutcome:
-        queue = FairScheduler(1)
-        executor = NixBuildExecutor(queue, BuildSettings(log_dir=tmp_path))
-        blocker_writer = LogWriter(path=tmp_path / "blocker.zst")
-        blocker = asyncio.create_task(
-            executor.build_attribute("a", mk_job("blocker"), blocker_writer, tmp_path)
-        )
-        await asyncio.sleep(0.2)  # blocker holds the only slot
-        cancel_event = asyncio.Event()
-        writer = LogWriter(path=tmp_path / "log.zst")
-        queued = asyncio.create_task(
-            executor.build_attribute("b", mk_job(), writer, tmp_path, cancel_event)
-        )
-        await asyncio.sleep(0.1)
-        cancel_event.set()
-        outcome = await asyncio.wait_for(queued, timeout=2)
-        blocker.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await blocker
-        return outcome
+    queue = FairScheduler(1)
+    executor = NixBuildExecutor(queue, BuildSettings(log_dir=tmp_path))
+    blocker_writer = LogWriter(path=tmp_path / "blocker.zst")
+    blocker = asyncio.create_task(
+        executor.build_attribute("a", mk_job("blocker"), blocker_writer, tmp_path)
+    )
+    await asyncio.sleep(0.2)  # blocker holds the only slot
+    cancel_event = asyncio.Event()
+    writer = LogWriter(path=tmp_path / "log.zst")
+    queued = asyncio.create_task(
+        executor.build_attribute("b", mk_job(), writer, tmp_path, cancel_event)
+    )
+    await asyncio.sleep(0.1)
+    cancel_event.set()
+    outcome = await asyncio.wait_for(queued, timeout=2)
+    blocker.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await blocker
 
-    assert asyncio.run(run()) == BuildOutcome.cancelled
+    assert outcome == BuildOutcome.cancelled
 
 
-def test_executor_finished_build_wins_cancel_race(
+async def test_executor_finished_build_wins_cancel_race(
     tmp_path: Path, fake_nix: Path
 ) -> None:
     # The process exits successfully and the cancel event fires before
@@ -521,65 +471,60 @@ def test_executor_finished_build_wins_cancel_race(
     fake_nix.write_text("racepid")
     pidfile = tmp_path / "pid"
 
-    async def run() -> BuildOutcome:
-        executor = NixBuildExecutor(FairScheduler(2), BuildSettings(log_dir=tmp_path))
-        writer = LogWriter(path=tmp_path / "log.zst")
-        cancel_event = asyncio.Event()
+    executor = NixBuildExecutor(FairScheduler(2), BuildSettings(log_dir=tmp_path))
+    writer = LogWriter(path=tmp_path / "log.zst")
+    cancel_event = asyncio.Event()
 
-        async def cancel_after_exit() -> None:
-            while (  # noqa: ASYNC110 — polling an external file is the point
-                not pidfile.exists() or not pidfile.read_text().strip()
-            ):
-                await asyncio.sleep(0.005)
-            pid = int(pidfile.read_text())
-            # Wait until the child has been reaped (exit observed by the
-            # event loop), then request cancellation. Polling is the only
-            # way to observe another process's exit from outside.
-            while True:
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    break
-                await asyncio.sleep(0.005)
-            cancel_event.set()
+    async def cancel_after_exit() -> None:
+        while (  # noqa: ASYNC110 — polling an external file is the point
+            not pidfile.exists() or not pidfile.read_text().strip()
+        ):
+            await asyncio.sleep(0.005)
+        pid = int(pidfile.read_text())
+        # Wait until the child has been reaped (exit observed by the
+        # event loop), then request cancellation. Polling is the only
+        # way to observe another process's exit from outside.
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.005)
+        cancel_event.set()
 
-        canceller = asyncio.create_task(cancel_after_exit())
-        outcome = await executor.build_attribute(
-            "b", mk_job(), writer, tmp_path, cancel_event
-        )
-        canceller.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await canceller
-        await writer.close()
-        return outcome
+    canceller = asyncio.create_task(cancel_after_exit())
+    outcome = await executor.build_attribute(
+        "b", mk_job(), writer, tmp_path, cancel_event
+    )
+    canceller.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await canceller
+    await writer.close()
 
-    assert asyncio.run(run()) == BuildOutcome.success
+    assert outcome == BuildOutcome.success
 
 
-def test_executor_task_cancelled_while_queued_releases_waiter(
+async def test_executor_task_cancelled_while_queued_releases_waiter(
     tmp_path: Path, fake_nix: Path
 ) -> None:
     # Cancelling the coroutine itself while it waits for a slot must
     # withdraw the waiter: a later grant must not leak a slot.
     fake_nix.write_text("hang")
 
-    async def run() -> None:
-        queue = FairScheduler(1)
-        executor = NixBuildExecutor(queue, BuildSettings(log_dir=tmp_path))
-        await queue.acquire("seed")  # occupy the only slot
-        writer = LogWriter(path=tmp_path / "log.zst")
-        queued = asyncio.create_task(
-            executor.build_attribute("b", mk_job(), writer, tmp_path)
-        )
-        await asyncio.sleep(0.05)  # let it enqueue
-        queued.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await queued
-        queue.release()
-        # The slot must be available again, not granted to the dead waiter.
-        await asyncio.wait_for(queue.acquire("c"), timeout=1)
-
-    asyncio.run(run())
+    queue = FairScheduler(1)
+    executor = NixBuildExecutor(queue, BuildSettings(log_dir=tmp_path))
+    await queue.acquire("seed")  # occupy the only slot
+    writer = LogWriter(path=tmp_path / "log.zst")
+    queued = asyncio.create_task(
+        executor.build_attribute("b", mk_job(), writer, tmp_path)
+    )
+    await asyncio.sleep(0.05)  # let it enqueue
+    queued.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await queued
+    queue.release()
+    # The slot must be available again, not granted to the dead waiter.
+    await asyncio.wait_for(queue.acquire("c"), timeout=1)
 
 
 def test_render_log_event_attributes_and_colors() -> None:
@@ -654,32 +599,26 @@ def test_failure_excerpt_without_log_lines_keeps_filtered_tail() -> None:
     assert "3 available machines" in excerpt
 
 
-def test_iter_lines_survives_line_over_stream_limit() -> None:
+async def test_iter_lines_survives_line_over_stream_limit() -> None:
     # A single output line larger than the StreamReader limit used to
     # raise LimitOverrunError in the pump, leaving nix blocked on the
     # full pipe until the build timeout.
-    async def run() -> list[bytes]:
-        reader = asyncio.StreamReader(limit=64)
-        reader.feed_data(b"A" * 1000 + b"\nnext\n")
-        reader.feed_eof()
-        return [chunk async for chunk in iter_lines(reader)]
-
-    chunks = asyncio.run(run())
+    reader = asyncio.StreamReader(limit=64)
+    reader.feed_data(b"A" * 1000 + b"\nnext\n")
+    reader.feed_eof()
+    chunks = [chunk async for chunk in iter_lines(reader)]
     assert b"".join(chunks) == b"A" * 1000 + b"\nnext\n"
     # Line-oriented behavior preserved for lines within bounds.
     assert chunks[-1] == b"next\n"
 
 
-def test_iter_lines_caps_buffered_line_length() -> None:
+async def test_iter_lines_caps_buffered_line_length() -> None:
     # An endless line must not buffer unboundedly: the buffer is
     # flushed whenever it exceeds max_line, so memory stays bounded by
     # max_line plus one read chunk.
-    async def run() -> list[bytes]:
-        reader = asyncio.StreamReader(limit=64)
-        reader.feed_data(b"B" * 300)
-        reader.feed_eof()
-        return [chunk async for chunk in iter_lines(reader, max_line=100)]
-
-    chunks = asyncio.run(run())
+    reader = asyncio.StreamReader(limit=64)
+    reader.feed_data(b"B" * 300)
+    reader.feed_eof()
+    chunks = [chunk async for chunk in iter_lines(reader, max_line=100)]
     assert b"".join(chunks) == b"B" * 300
     assert all(len(c) <= 100 + 64 * 1024 for c in chunks)

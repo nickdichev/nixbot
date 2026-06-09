@@ -157,7 +157,7 @@ def test_calculate_eval_workers() -> None:
     shutil.which("nix-eval-jobs") is None or shutil.which("nix") is None,
     reason="nix-eval-jobs not available",
 )
-def test_eval_runner_integration(tmp_path: Path) -> None:
+async def test_eval_runner_integration(tmp_path: Path) -> None:
     flake = tmp_path / "repo"
     flake.mkdir()
     (flake / "flake.nix").write_text(
@@ -186,8 +186,8 @@ def test_eval_runner_integration(tmp_path: Path) -> None:
     async def on_line(line: str) -> None:
         seen.append(line)
 
-    result = asyncio.run(
-        EvalRunner().run(flake, BranchConfig(), settings, on_stderr_line=on_line)
+    result = await EvalRunner().run(
+        flake, BranchConfig(), settings, on_stderr_line=on_line
     )
     assert len(result.jobs) == 1
     job = result.jobs[0]
@@ -195,7 +195,9 @@ def test_eval_runner_integration(tmp_path: Path) -> None:
     assert any("eval warning here" in line for line in seen)
 
 
-def test_stderr_noise_filtered_and_warnings_reach_callback(tmp_path: Path) -> None:
+async def test_stderr_noise_filtered_and_warnings_reach_callback(
+    tmp_path: Path,
+) -> None:
     """Noise stays out of both the tail and the callback; warning and
     error lines reach the callback ANSI-stripped, progress output does
     not."""
@@ -214,16 +216,12 @@ def test_stderr_noise_filtered_and_warnings_reach_callback(tmp_path: Path) -> No
     async def on_line(line: str) -> None:
         seen.append(line)
 
-    async def run() -> bytes:
-        proc = await asyncio.create_subprocess_exec(
-            str(script), stderr=asyncio.subprocess.PIPE
-        )
-        assert proc.stderr is not None
-        tail = await nix_eval._read_stderr_tail(proc.stderr, on_line=on_line)  # noqa: SLF001
-        await proc.wait()
-        return tail
-
-    tail = asyncio.run(run())
+    proc = await asyncio.create_subprocess_exec(
+        str(script), stderr=asyncio.subprocess.PIPE
+    )
+    assert proc.stderr is not None
+    tail = await nix_eval._read_stderr_tail(proc.stderr, on_line=on_line)  # noqa: SLF001
+    await proc.wait()
     assert seen == [
         "warning: unable to download foo",
         "error: something broke",
@@ -234,7 +232,7 @@ def test_stderr_noise_filtered_and_warnings_reach_callback(tmp_path: Path) -> No
     assert b"error: something broke" in tail
 
 
-def test_stderr_tail_is_bounded(tmp_path: Path) -> None:
+async def test_stderr_tail_is_bounded(tmp_path: Path) -> None:
     script = tmp_path / "noisy.sh"
     script.write_text(
         "#!/bin/sh\n"
@@ -244,20 +242,19 @@ def test_stderr_tail_is_bounded(tmp_path: Path) -> None:
     )
     script.chmod(0o755)
 
-    async def run() -> None:
-        proc = await asyncio.create_subprocess_exec(
-            str(script), stderr=asyncio.subprocess.PIPE
-        )
-        assert proc.stderr is not None
-        tail = await nix_eval._read_stderr_tail(proc.stderr)  # noqa: SLF001
-        await proc.wait()
-        assert len(tail) <= nix_eval.STDERR_TAIL_LIMIT
-        assert tail.endswith(b"final error marker\n")
-
-    asyncio.run(run())
+    proc = await asyncio.create_subprocess_exec(
+        str(script), stderr=asyncio.subprocess.PIPE
+    )
+    assert proc.stderr is not None
+    tail = await nix_eval._read_stderr_tail(proc.stderr)  # noqa: SLF001
+    await proc.wait()
+    assert len(tail) <= nix_eval.STDERR_TAIL_LIMIT
+    assert tail.endswith(b"final error marker\n")
 
 
-def test_eval_runner_times_out(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_eval_runner_times_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setattr(nix_eval, "build_full_command", lambda *_args: ["sleep", "60"])
     settings = EvalSettings(
         gc_roots_dir=tmp_path / "gcroots",
@@ -266,7 +263,7 @@ def test_eval_runner_times_out(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
         timeout=0.2,
     )
     with pytest.raises(EvalError, match="timed out"):
-        asyncio.run(EvalRunner().run(tmp_path, BranchConfig(), settings))
+        await EvalRunner().run(tmp_path, BranchConfig(), settings)
 
 
 def test_cgroup_limiter_create_handles_missing_delegation(
@@ -286,14 +283,14 @@ def test_cgroup_limiter_create_handles_missing_delegation(
     assert nix_eval.CgroupLimiter.create() is None
 
 
-def test_cgroup_limiter_eval_cgroup_lifecycle(tmp_path: Path) -> None:
+async def test_cgroup_limiter_eval_cgroup_lifecycle(tmp_path: Path) -> None:
     # Filesystem-level behavior with a plain directory standing in for the
     # delegated subtree; cgroup.kill writes fail and are tolerated.
     limiter = nix_eval.CgroupLimiter(tmp_path)
     path = limiter.new_eval_cgroup(123)
     assert (path / "memory.max").read_text() == str(123 * 1024 * 1024)
     (path / "memory.max").unlink()
-    asyncio.run(limiter.cleanup(path))
+    await limiter.cleanup(path)
     assert not path.exists()
 
 
@@ -309,7 +306,7 @@ def fake_nix_eval_jobs(
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
 
 
-def test_eval_runner_handles_long_json_lines(
+async def test_eval_runner_handles_long_json_lines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # nix-eval-jobs emits one JSON object per line including the full
@@ -335,12 +332,12 @@ def test_eval_runner_handles_long_json_lines(
     settings = EvalSettings(
         gc_roots_dir=tmp_path / "gcroots", sandbox=False, systemd_scope=False
     )
-    result = asyncio.run(EvalRunner().run(tmp_path, BranchConfig(), settings))
+    result = await EvalRunner().run(tmp_path, BranchConfig(), settings)
     assert len(result.jobs) == 1
     assert result.jobs[0].attr == "big"
 
 
-def test_eval_runner_streams_job_batches(
+async def test_eval_runner_streams_job_batches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Large evals (thousands of attrs) must reach the database in
@@ -375,16 +372,14 @@ def test_eval_runner_streams_job_batches(
     settings = EvalSettings(
         gc_roots_dir=tmp_path / "gcroots", sandbox=False, systemd_scope=False
     )
-    result = asyncio.run(
-        EvalRunner().run(tmp_path, BranchConfig(), settings, on_jobs=on_jobs)
-    )
+    result = await EvalRunner().run(tmp_path, BranchConfig(), settings, on_jobs=on_jobs)
     assert len(result.jobs) == 250
     assert sum(batches) == 250
     assert len(batches) > 1  # streamed in multiple batches
     assert max(batches) <= 100
 
 
-def test_eval_runner_flushes_partial_batch_on_timeout(
+async def test_eval_runner_flushes_partial_batch_on_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A slow eval that trickles jobs must not sit on a partial batch
@@ -415,9 +410,7 @@ def test_eval_runner_flushes_partial_batch_on_timeout(
     settings = EvalSettings(
         gc_roots_dir=tmp_path / "gcroots", sandbox=False, systemd_scope=False
     )
-    result = asyncio.run(
-        EvalRunner().run(tmp_path, BranchConfig(), settings, on_jobs=on_jobs)
-    )
+    result = await EvalRunner().run(tmp_path, BranchConfig(), settings, on_jobs=on_jobs)
     assert len(result.jobs) == 2
     # First job flushed alone during the sleep, second after EOF.
     assert batches == [1, 1]
@@ -433,7 +426,7 @@ def test_cgroup_limiter_retries_subtree_enable(tmp_path: Path) -> None:
     assert (path / "memory.max").read_text() == str(64 * 1024 * 1024)
 
 
-def test_eval_failure_with_oom_text_in_stderr_is_not_oom(
+async def test_eval_failure_with_oom_text_in_stderr_is_not_oom(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A failed eval whose trace merely mentions "out of memory" (e.g. a
@@ -451,7 +444,7 @@ def test_eval_failure_with_oom_text_in_stderr_is_not_oom(
         gc_roots_dir=tmp_path / "gcroots", sandbox=False, systemd_scope=False
     )
     with pytest.raises(EvalError) as excinfo:
-        asyncio.run(EvalRunner().run(tmp_path, BranchConfig(), settings))
+        await EvalRunner().run(tmp_path, BranchConfig(), settings)
     assert not isinstance(excinfo.value, nix_eval.EvalOOMError)
 
 
@@ -464,7 +457,7 @@ def test_cgroup_oom_killed_reads_memory_events(tmp_path: Path) -> None:
     assert nix_eval.cgroup_oom_killed(tmp_path)
 
 
-def test_eval_runner_proxy_env_reaches_evaluator(
+async def test_eval_runner_proxy_env_reaches_evaluator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Proxy/TLS settings must reach nix-eval-jobs or evaluation breaks
@@ -482,11 +475,11 @@ def test_eval_runner_proxy_env_reaches_evaluator(
         gc_roots_dir=tmp_path / "gcroots", sandbox=False, systemd_scope=False
     )
     with pytest.raises(EvalError) as excinfo:
-        asyncio.run(EvalRunner().run(tmp_path, BranchConfig(), settings))
+        await EvalRunner().run(tmp_path, BranchConfig(), settings)
     assert "proxy=http://proxy:3128 ca=/etc/ssl/ca.pem" in str(excinfo.value)
 
 
-def test_eval_fails_cleanly_on_line_over_stream_limit(
+async def test_eval_fails_cleanly_on_line_over_stream_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A JSON line over the StreamReader limit used to raise ValueError
@@ -501,4 +494,4 @@ def test_eval_fails_cleanly_on_line_over_stream_limit(
         gc_roots_dir=tmp_path / "gcroots", sandbox=False, systemd_scope=False
     )
     with pytest.raises(EvalError):
-        asyncio.run(EvalRunner().run(tmp_path, BranchConfig(), settings))
+        await EvalRunner().run(tmp_path, BranchConfig(), settings)

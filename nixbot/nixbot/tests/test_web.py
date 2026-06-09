@@ -60,8 +60,8 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture(scope="module")
-def postgres_dsn(postgres_dsn: str) -> str:
-    asyncio.run(seed(postgres_dsn))
+async def postgres_dsn(postgres_dsn: str) -> str:
+    await seed(postgres_dsn)
     return postgres_dsn
 
 

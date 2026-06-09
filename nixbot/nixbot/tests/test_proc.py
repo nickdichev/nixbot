@@ -31,57 +31,51 @@ def _assert_dead(pid: int) -> None:
     pytest.fail(f"process {pid} survived process-group kill")
 
 
-def test_reap_kills_whole_group(tmp_path: Path) -> None:
+async def test_reap_kills_whole_group(tmp_path: Path) -> None:
     # A grandchild (own fork) must die with the group: nix and deploy
     # tools fork helpers that a plain proc.kill() would leave running.
     pidfile = tmp_path / "pid"
 
-    async def run() -> int:
-        group = await ProcessGroup.start(
-            ["sh", "-c", f"(echo $$ > {pidfile}; sleep 60) & wait"],
-            cwd=tmp_path,
-        )
-        while not pidfile.exists() or not pidfile.read_text().strip():  # noqa: ASYNC110
-            await asyncio.sleep(0.01)
-        await group.reap()
-        assert group.proc.returncode is not None
-        return int(pidfile.read_text())
+    group = await ProcessGroup.start(
+        ["sh", "-c", f"(echo $$ > {pidfile}; sleep 60) & wait"],
+        cwd=tmp_path,
+    )
+    while not pidfile.exists() or not pidfile.read_text().strip():  # noqa: ASYNC110
+        await asyncio.sleep(0.01)
+    await group.reap()
+    assert group.proc.returncode is not None
 
-    _assert_dead(asyncio.run(run()))
+    _assert_dead(int(pidfile.read_text()))
 
 
-def test_reap_after_clean_exit_is_noop(tmp_path: Path) -> None:
-    async def run() -> int | None:
-        group = await ProcessGroup.start(["true"], cwd=tmp_path)
-        await group.proc.wait()
-        await group.reap()  # must not raise or block
-        return group.proc.returncode
+async def test_reap_after_clean_exit_is_noop(tmp_path: Path) -> None:
+    group = await ProcessGroup.start(["true"], cwd=tmp_path)
+    await group.proc.wait()
+    await group.reap()  # must not raise or block
 
-    assert asyncio.run(run()) == 0
+    assert group.proc.returncode == 0
 
 
-def test_reap_on_task_cancel(tmp_path: Path) -> None:
+async def test_reap_on_task_cancel(tmp_path: Path) -> None:
     # The pattern all callers use: kill the group when the awaiting
     # task is cancelled.
     pidfile = tmp_path / "pid"
 
-    async def run() -> int:
-        async def body() -> None:
-            group = await ProcessGroup.start(
-                ["sh", "-c", f"echo $$ > {pidfile}; sleep 60"], cwd=tmp_path
-            )
-            try:
-                await group.proc.wait()
-            except asyncio.CancelledError:
-                await group.reap()
-                raise
+    async def body() -> None:
+        group = await ProcessGroup.start(
+            ["sh", "-c", f"echo $$ > {pidfile}; sleep 60"], cwd=tmp_path
+        )
+        try:
+            await group.proc.wait()
+        except asyncio.CancelledError:
+            await group.reap()
+            raise
 
-        task = asyncio.create_task(body())
-        while not pidfile.exists() or not pidfile.read_text().strip():  # noqa: ASYNC110
-            await asyncio.sleep(0.01)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        return int(pidfile.read_text())
+    task = asyncio.create_task(body())
+    while not pidfile.exists() or not pidfile.read_text().strip():  # noqa: ASYNC110
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
-    _assert_dead(asyncio.run(run()))
+    _assert_dead(int(pidfile.read_text()))

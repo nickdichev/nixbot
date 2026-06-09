@@ -5,7 +5,6 @@ and the project store incl. one-shot legacy topic import."""
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import shutil
@@ -157,30 +156,26 @@ def github_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> GitHubAppC
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl required")
-def test_github_webhook_check_ok(github_client: GitHubAppClient) -> None:
-    problems = asyncio.run(
-        github_client.check_app_webhook("https://buildbot.example.com")
-    )
+async def test_github_webhook_check_ok(github_client: GitHubAppClient) -> None:
+    problems = await github_client.check_app_webhook("https://buildbot.example.com")
     assert problems == []
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl required")
-def test_github_webhook_check_misconfigured(
+async def test_github_webhook_check_misconfigured(
     github_client: GitHubAppClient,
 ) -> None:
     github_client.http = httpx.AsyncClient(
         transport=github_transport(hook_url="", events=("push",))
     )
-    problems = asyncio.run(
-        github_client.check_app_webhook("https://buildbot.example.com")
-    )
+    problems = await github_client.check_app_webhook("https://buildbot.example.com")
     assert any("webhook URL" in p for p in problems)
     assert any("pull_request" in p for p in problems)
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl required")
-def test_github_discovery(github_client: GitHubAppClient) -> None:
-    repos = asyncio.run(github_client.discover_repos())
+async def test_github_discovery(github_client: GitHubAppClient) -> None:
+    repos = await github_client.discover_repos()
     assert {r.name for r in repos} == {"acme/repo11", "acme/repo22"}
     assert {r.forge_repo_id for r in repos} == {"1100", "2200"}
     private = next(r for r in repos if r.name == "acme/repo22")
@@ -192,38 +187,32 @@ def test_github_discovery(github_client: GitHubAppClient) -> None:
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl required")
-def test_github_fetch_credentials(github_client: GitHubAppClient) -> None:
-    async def run() -> None:
-        await github_client.discover_repos()
-        provider = GitHubFetchCredentialsProvider(github_client)
-        creds = await provider.get("https://github.com/acme/repo22.git")
-        assert creds.netrc_file is not None
-        content = creds.netrc_file.read_text()
-        assert "x-access-token" in content
-        assert "ghs_token_22" in content
-        # Unknown repo: no credentials (public/netrc fallback).
-        assert (await provider.get("https://github.com/other/x.git")).netrc_file is None
-
-    asyncio.run(run())
+async def test_github_fetch_credentials(github_client: GitHubAppClient) -> None:
+    await github_client.discover_repos()
+    provider = GitHubFetchCredentialsProvider(github_client)
+    creds = await provider.get("https://github.com/acme/repo22.git")
+    assert creds.netrc_file is not None
+    content = creds.netrc_file.read_text()
+    assert "x-access-token" in content
+    assert "ghs_token_22" in content
+    # Unknown repo: no credentials (public/netrc fallback).
+    assert (await provider.get("https://github.com/other/x.git")).netrc_file is None
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl required")
-def test_github_fetch_credentials_enterprise_host(
+async def test_github_fetch_credentials_enterprise_host(
     github_client: GitHubAppClient,
 ) -> None:
     # The netrc machine entry must match the host git fetches from.
-    async def run() -> None:
-        await github_client.discover_repos()
-        provider = GitHubFetchCredentialsProvider(github_client)
-        creds = await provider.get("https://ghe.example.com/acme/repo22.git")
-        assert creds.netrc_file is not None
-        assert "machine ghe.example.com " in creds.netrc_file.read_text()
-
-    asyncio.run(run())
+    await github_client.discover_repos()
+    provider = GitHubFetchCredentialsProvider(github_client)
+    creds = await provider.get("https://ghe.example.com/acme/repo22.git")
+    assert creds.netrc_file is not None
+    assert "machine ghe.example.com " in creds.netrc_file.read_text()
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl required")
-def test_github_discovery_isolates_failed_installation(
+async def test_github_discovery_isolates_failed_installation(
     github_client: GitHubAppClient,
 ) -> None:
     """One suspended installation (403 on token mint) must not abort
@@ -238,12 +227,12 @@ def test_github_discovery_isolates_failed_installation(
         return response
 
     github_client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    repos = asyncio.run(github_client.discover_repos())
+    repos = await github_client.discover_repos()
     assert {r.name for r in repos} == {"acme/repo22"}
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl required")
-def test_github_fetch_credentials_repo_scoped(
+async def test_github_fetch_credentials_repo_scoped(
     github_client: GitHubAppClient,
 ) -> None:
     """Tokens handed to fetch paths must be scoped to the single repo
@@ -262,18 +251,17 @@ def test_github_fetch_credentials_repo_scoped(
 
     github_client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
-    async def run() -> None:
-        await github_client.discover_repos()
-        provider = GitHubFetchCredentialsProvider(github_client)
-        creds = await provider.get("https://github.com/acme/repo22.git")
-        assert creds.token is not None
-
-    asyncio.run(run())
+    await github_client.discover_repos()
+    provider = GitHubFetchCredentialsProvider(github_client)
+    creds = await provider.get("https://github.com/acme/repo22.git")
+    assert creds.token is not None
     assert scoped_requests[-1] == ["repo22"]
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl required")
-def test_github_credentials_before_discovery(github_client: GitHubAppClient) -> None:
+async def test_github_credentials_before_discovery(
+    github_client: GitHubAppClient,
+) -> None:
     """Webhooks are served before the initial discovery finishes; an
     unknown repo's installation must be looked up on demand instead of
     dropping credentials (private fetch and statuses would fail)."""
@@ -288,21 +276,18 @@ def test_github_credentials_before_discovery(github_client: GitHubAppClient) -> 
 
     github_client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
-    async def run() -> None:
-        provider = GitHubFetchCredentialsProvider(github_client)
-        creds = await provider.get("https://github.com/acme/repo22.git")
-        assert creds.token == "ghs_token_22"  # noqa: S105
-        # Cached: later lookups must not re-query the API.
-        assert github_client.repo_installations["acme/repo22"] == 22
-        # Unknown repo (404) degrades to no credentials.
-        assert (await provider.get("https://github.com/acme/nope.git")).token is None
-
-    asyncio.run(run())
+    provider = GitHubFetchCredentialsProvider(github_client)
+    creds = await provider.get("https://github.com/acme/repo22.git")
+    assert creds.token == "ghs_token_22"  # noqa: S105
+    # Cached: later lookups must not re-query the API.
+    assert github_client.repo_installations["acme/repo22"] == 22
+    # Unknown repo (404) degrades to no credentials.
+    assert (await provider.get("https://github.com/acme/nope.git")).token is None
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl required")
-def test_github_jwt_is_signed(github_client: GitHubAppClient) -> None:
-    token = asyncio.run(github_client._app_jwt())  # noqa: SLF001
+async def test_github_jwt_is_signed(github_client: GitHubAppClient) -> None:
+    token = await github_client._app_jwt()  # noqa: SLF001
     header_b64, payload_b64, signature = token.split(".")
 
     def unpad(data: str) -> bytes:
@@ -318,7 +303,7 @@ def test_github_jwt_is_signed(github_client: GitHubAppClient) -> None:
 # --- Gitea client ---------------------------------------------------------------
 
 
-def test_gitea_discovery() -> None:
+async def test_gitea_discovery() -> None:
     forge = FakeGitea(
         [
             {
@@ -345,14 +330,14 @@ def test_gitea_discovery() -> None:
         ],
         topics={"widget": ["ci"], "readonly": []},
     )
-    repos = asyncio.run(forge.client().discover_repos(fetch_topics=True))
+    repos = await forge.client().discover_repos(fetch_topics=True)
     assert [r.forge_repo_id for r in repos] == ["7", "8"]
     assert repos[0].forge == "gitea"
     assert repos[0].topics == ("ci",)
     assert repos[0].private
 
 
-def test_gitea_discovery_skips_topics_by_default() -> None:
+async def test_gitea_discovery_skips_topics_by_default() -> None:
     """Topics are only the one-shot legacy import aid; the hourly sync
     must not pay one extra request per repo for them."""
     forge = FakeGitea(
@@ -368,12 +353,12 @@ def test_gitea_discovery_skips_topics_by_default() -> None:
         ],
         topics={"widget": ["ci"]},
     )
-    repos = asyncio.run(forge.client().discover_repos())
+    repos = await forge.client().discover_repos()
     assert forge.topics_requests == 0
     assert repos[0].topics == ()
 
 
-def test_gitea_discovery_null_topics() -> None:
+async def test_gitea_discovery_null_topics() -> None:
     """Gitea returns {"topics": null} for repos without topics; that
     must not crash discovery."""
     forge = FakeGitea(
@@ -388,144 +373,130 @@ def test_gitea_discovery_null_topics() -> None:
             }
         ]
     )
-    repos = asyncio.run(forge.client().discover_repos(fetch_topics=True))
+    repos = await forge.client().discover_repos(fetch_topics=True)
     assert repos[0].topics == ()
 
 
 # --- project store -----------------------------------------------------------------
 
 
-def test_project_store_sync_and_legacy_import(postgres_dsn: str) -> None:
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            store = RepoStore(pool)
-            repos = [
-                repo("acme", "tagged", topics=("build-with-buildbot",)),
-                repo("acme", "untagged"),
-            ]
-            # First startup with empty table: topic import enables.
-            await store.sync_discovered(
-                repos, legacy_import_topics={"github": "build-with-buildbot"}
-            )
-            enabled = await store.enabled_repos()
-            assert [p.name for p in enabled] == ["tagged"]
+async def test_project_store_sync_and_legacy_import(postgres_dsn: str) -> None:
+    async with db_pool(postgres_dsn) as pool:
+        store = RepoStore(pool)
+        repos = [
+            repo("acme", "tagged", topics=("build-with-buildbot",)),
+            repo("acme", "untagged"),
+        ]
+        # First startup with empty table: topic import enables.
+        await store.sync_discovered(
+            repos, legacy_import_topics={"github": "build-with-buildbot"}
+        )
+        enabled = await store.enabled_repos()
+        assert [p.name for p in enabled] == ["tagged"]
 
-            # Rename keeps identity and enablement (stable forge id).
-            renamed = DiscoveredRepo(
-                **{**repos[0].__dict__, "repo": "renamed", "topics": ()}
-            )
-            await store.sync_discovered(
-                [renamed], legacy_import_topics={"github": "build-with-buildbot"}
-            )
-            enabled = await store.enabled_repos()
-            assert [p.name for p in enabled] == ["renamed"]
+        # Rename keeps identity and enablement (stable forge id).
+        renamed = DiscoveredRepo(
+            **{**repos[0].__dict__, "repo": "renamed", "topics": ()}
+        )
+        await store.sync_discovered(
+            [renamed], legacy_import_topics={"github": "build-with-buildbot"}
+        )
+        enabled = await store.enabled_repos()
+        assert [p.name for p in enabled] == ["renamed"]
 
-            # Non-empty table: topic import never runs again.
-            newly_tagged = repo("acme", "later", topics=("build-with-buildbot",))
-            await store.sync_discovered(
-                [newly_tagged], legacy_import_topics={"github": "build-with-buildbot"}
-            )
-            assert {p.name for p in await store.enabled_repos()} == {"renamed"}
+        # Non-empty table: topic import never runs again.
+        newly_tagged = repo("acme", "later", topics=("build-with-buildbot",))
+        await store.sync_discovered(
+            [newly_tagged], legacy_import_topics={"github": "build-with-buildbot"}
+        )
+        assert {p.name for p in await store.enabled_repos()} == {"renamed"}
 
-            # Admin toggle.
-            later = await store.by_forge_id("github", "acme-later")
-            assert later is not None
-            await store.set_enabled(later.id, enabled=True)
-            assert {p.name for p in await store.enabled_repos()} == {
-                "renamed",
-                "later",
-            }
-
-    asyncio.run(run())
+        # Admin toggle.
+        later = await store.by_forge_id("github", "acme-later")
+        assert later is not None
+        await store.set_enabled(later.id, enabled=True)
+        assert {p.name for p in await store.enabled_repos()} == {
+            "renamed",
+            "later",
+        }
 
 
-def test_legacy_import_runs_despite_pull_based_rows(postgres_dsn: str) -> None:
+async def test_legacy_import_runs_despite_pull_based_rows(postgres_dsn: str) -> None:
     """sync_pull_based fills the projects table before discovery; that
     must not suppress the one-shot legacy topic import."""
 
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            await pool.execute("TRUNCATE projects CASCADE")
-            store = RepoStore(pool)
-            await store.sync_pull_based([("pull/one", "https://x/one.git", "main")])
-            await store.sync_discovered(
-                [repo("acme", "tagged", topics=("ci-topic",))],
-                legacy_import_topics={"github": "ci-topic"},
-            )
-            enabled = {p.name for p in await store.enabled_repos()}
-            assert "tagged" in enabled
-
-    asyncio.run(run())
+    async with db_pool(postgres_dsn) as pool:
+        await pool.execute("TRUNCATE projects CASCADE")
+        store = RepoStore(pool)
+        await store.sync_pull_based([("pull/one", "https://x/one.git", "main")])
+        await store.sync_discovered(
+            [repo("acme", "tagged", topics=("ci-topic",))],
+            legacy_import_topics={"github": "ci-topic"},
+        )
+        enabled = {p.name for p in await store.enabled_repos()}
+        assert "tagged" in enabled
 
 
-def test_legacy_import_scopes_topics_per_forge(postgres_dsn: str) -> None:
+async def test_legacy_import_scopes_topics_per_forge(postgres_dsn: str) -> None:
     """Each forge's configured topic only enables that forge's repos."""
 
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            await pool.execute("TRUNCATE projects CASCADE")
-            store = RepoStore(pool)
-            gitea_repo = DiscoveredRepo(
-                **{
-                    **repo("acme", "gt", topics=("gitea-topic",)).__dict__,
-                    "forge": "gitea",
-                }
-            )
-            cross = repo("acme", "cross", topics=("gitea-topic",))
-            await store.sync_discovered(
-                [gitea_repo, cross],
-                legacy_import_topics={
-                    "github": "github-topic",
-                    "gitea": "gitea-topic",
-                },
-            )
-            enabled = {p.name for p in await store.enabled_repos()}
-            assert "gt" in enabled
-            assert "cross" not in enabled
-
-    asyncio.run(run())
+    async with db_pool(postgres_dsn) as pool:
+        await pool.execute("TRUNCATE projects CASCADE")
+        store = RepoStore(pool)
+        gitea_repo = DiscoveredRepo(
+            **{
+                **repo("acme", "gt", topics=("gitea-topic",)).__dict__,
+                "forge": "gitea",
+            }
+        )
+        cross = repo("acme", "cross", topics=("gitea-topic",))
+        await store.sync_discovered(
+            [gitea_repo, cross],
+            legacy_import_topics={
+                "github": "github-topic",
+                "gitea": "gitea-topic",
+            },
+        )
+        enabled = {p.name for p in await store.enabled_repos()}
+        assert "gt" in enabled
+        assert "cross" not in enabled
 
 
-def test_project_store_sync_skips_unchanged_rows(postgres_dsn: str) -> None:
+async def test_project_store_sync_skips_unchanged_rows(postgres_dsn: str) -> None:
     """Re-syncing identical repo metadata must not rewrite rows:
     discovery runs every poll cycle over every repo, and unconditional
     updates churn WAL and autovacuum on otherwise idle databases."""
 
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            store = RepoStore(pool)
-            repos = [repo("acme", "stable"), repo("acme", "other")]
-            await store.sync_discovered(repos)
-            await store.sync_pull_based([("pull/one", "https://x/one.git", "main")])
-            before = await pool.fetch(
-                "SELECT name, xmin, updated_at FROM projects ORDER BY name"
-            )
+    async with db_pool(postgres_dsn) as pool:
+        store = RepoStore(pool)
+        repos = [repo("acme", "stable"), repo("acme", "other")]
+        await store.sync_discovered(repos)
+        await store.sync_pull_based([("pull/one", "https://x/one.git", "main")])
+        before = await pool.fetch(
+            "SELECT name, xmin, updated_at FROM projects ORDER BY name"
+        )
 
-            await store.sync_discovered(repos)
-            await store.sync_pull_based([("pull/one", "https://x/one.git", "main")])
-            after = await pool.fetch(
-                "SELECT name, xmin, updated_at FROM projects ORDER BY name"
-            )
-            assert [tuple(r) for r in before] == [tuple(r) for r in after]
+        await store.sync_discovered(repos)
+        await store.sync_pull_based([("pull/one", "https://x/one.git", "main")])
+        after = await pool.fetch(
+            "SELECT name, xmin, updated_at FROM projects ORDER BY name"
+        )
+        assert [tuple(r) for r in before] == [tuple(r) for r in after]
 
-            # A real change still updates the row.
-            changed = DiscoveredRepo(
-                **{**repos[0].__dict__, "default_branch": "develop"}
-            )
-            await store.sync_discovered([changed])
-            row = await pool.fetchrow(
-                "SELECT default_branch FROM projects WHERE name = 'stable'"
-            )
-            assert row is not None
-            assert row["default_branch"] == "develop"
-
-    asyncio.run(run())
+        # A real change still updates the row.
+        changed = DiscoveredRepo(**{**repos[0].__dict__, "default_branch": "develop"})
+        await store.sync_discovered([changed])
+        row = await pool.fetchrow(
+            "SELECT default_branch FROM projects WHERE name = 'stable'"
+        )
+        assert row is not None
+        assert row["default_branch"] == "develop"
 
 
 # --- gitea webhook auto-registration ------------------------------
 
 
-def test_gitea_hook_registration(postgres_dsn: str) -> None:
+async def test_gitea_hook_registration(postgres_dsn: str) -> None:
     forge = FakeGitea(
         hooks=[
             {"id": 1, "config": {"url": "https://ci.example.com/change_hook/gitea"}},
@@ -538,63 +509,58 @@ def test_gitea_hook_registration(postgres_dsn: str) -> None:
         ]
     )
 
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            project_id = await insert_project(
-                pool, forge="gitea", forge_repo_id="hook-1"
-            )
-            secrets_store = WebhookSecrets(pool, "gitea")
-            client = forge.client()
-            await register_repo_hook(
-                client,
-                secrets_store,
-                project_id,
-                "acme",
-                "widget",
-                "https://ci.example.com",
-            )
-            # Hook created with the stored per-repo secret.
-            assert len(forge.created) == 1
-            hook = forge.created[0]
-            assert hook["config"]["url"] == "https://ci.example.com/webhooks/gitea"
-            # PR head pushes arrive as pull_request_sync, not pull_request.
-            assert hook["events"] == ["push", "pull_request", "pull_request_sync"]
-            secret = await secrets_store.secret_for_repo("hook-1")
-            assert hook["config"]["secret"] == secret
-            # Legacy hooks removed only when they match OUR base URL,
-            # with or without trailing slash.
-            assert forge.deleted == ["1", "3"]
+    async with db_pool(postgres_dsn) as pool:
+        project_id = await insert_project(pool, forge="gitea", forge_repo_id="hook-1")
+        secrets_store = WebhookSecrets(pool, "gitea")
+        client = forge.client()
+        await register_repo_hook(
+            client,
+            secrets_store,
+            project_id,
+            "acme",
+            "widget",
+            "https://ci.example.com",
+        )
+        # Hook created with the stored per-repo secret.
+        assert len(forge.created) == 1
+        hook = forge.created[0]
+        assert hook["config"]["url"] == "https://ci.example.com/webhooks/gitea"
+        # PR head pushes arrive as pull_request_sync, not pull_request.
+        assert hook["events"] == ["push", "pull_request", "pull_request_sync"]
+        secret = await secrets_store.secret_for_repo("hook-1")
+        assert hook["config"]["secret"] == secret
+        # Legacy hooks removed only when they match OUR base URL,
+        # with or without trailing slash.
+        assert forge.deleted == ["1", "3"]
 
-            # Secret is stable across calls.
-            assert await secrets_store.get_or_create(project_id) == secret
+        # Secret is stable across calls.
+        assert await secrets_store.get_or_create(project_id) == secret
 
-            # An existing hook is updated in place to re-sync the secret.
-            forge.hooks[:] = [
-                {"id": 9, "config": {"url": "https://ci.example.com/webhooks/gitea"}}
-            ]
-            forge.deleted.clear()
-            await register_repo_hook(
-                client,
-                secrets_store,
-                project_id,
-                "acme",
-                "widget",
-                "https://ci.example.com",
-            )
-            assert len(forge.created) == 1  # no duplicate hook created
-            assert forge.deleted == []
-            assert len(forge.patched) == 1
-            hook_id, patch_body = forge.patched[0]
-            assert hook_id == "9"
-            assert patch_body["config"]["secret"] == secret
-
-    asyncio.run(run())
+        # An existing hook is updated in place to re-sync the secret.
+        forge.hooks[:] = [
+            {"id": 9, "config": {"url": "https://ci.example.com/webhooks/gitea"}}
+        ]
+        forge.deleted.clear()
+        await register_repo_hook(
+            client,
+            secrets_store,
+            project_id,
+            "acme",
+            "widget",
+            "https://ci.example.com",
+        )
+        assert len(forge.created) == 1  # no duplicate hook created
+        assert forge.deleted == []
+        assert len(forge.patched) == 1
+        hook_id, patch_body = forge.patched[0]
+        assert hook_id == "9"
+        assert patch_body["config"]["secret"] == secret
 
 
 # --- startup reconciliation ----------------------------------------
 
 
-def test_gitlab_heads_carry_target_branch_base(postgres_dsn: str) -> None:
+async def test_gitlab_heads_carry_target_branch_base(postgres_dsn: str) -> None:
     """GitLab's MR API has no base sha; reconciliation must still merge
     MR heads into the target branch."""
 
@@ -616,22 +582,17 @@ def test_gitlab_heads_carry_target_branch_base(postgres_dsn: str) -> None:
             )
         return httpx.Response(404)
 
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            await insert_project(
-                pool, "glrecon", forge="gitlab", forge_repo_id="glrecon-1"
-            )
-            project = await RepoStore(pool).by_forge_id("gitlab", "glrecon-1")
-            assert project is not None
-            client = gitlab_client(handler)
-            heads = await gitlab_heads(client, project)
-            mr_head = next(h for h in heads if h.pr_number == 5)
-            assert mr_head.base_sha == "refs/heads/main"
-
-    asyncio.run(run())
+    async with db_pool(postgres_dsn) as pool:
+        await insert_project(pool, "glrecon", forge="gitlab", forge_repo_id="glrecon-1")
+        project = await RepoStore(pool).by_forge_id("gitlab", "glrecon-1")
+        assert project is not None
+        client = gitlab_client(handler)
+        heads = await gitlab_heads(client, project)
+        mr_head = next(h for h in heads if h.pr_number == 5)
+        assert mr_head.base_sha == "refs/heads/main"
 
 
-def test_gitea_heads_encode_slashed_default_branch(postgres_dsn: str) -> None:
+async def test_gitea_heads_encode_slashed_default_branch(postgres_dsn: str) -> None:
     """A default branch with a slash must be URL-encoded or the
     branches endpoint 404s and the head is never reconciled."""
 
@@ -646,25 +607,22 @@ def test_gitea_heads_encode_slashed_default_branch(postgres_dsn: str) -> None:
             return httpx.Response(200, json=[])
         return httpx.Response(404)
 
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            await insert_project(
-                pool,
-                "slashy",
-                forge="gitea",
-                forge_repo_id="slashy-1",
-                default_branch="release/1.0",
-            )
-            project = await RepoStore(pool).by_forge_id("gitea", "slashy-1")
-            assert project is not None
-            client = gitea_client(handler)
-            heads = await gitea_heads(client, project)
-            assert [h.commit_sha for h in heads] == ["head-rel"]
-
-    asyncio.run(run())
+    async with db_pool(postgres_dsn) as pool:
+        await insert_project(
+            pool,
+            "slashy",
+            forge="gitea",
+            forge_repo_id="slashy-1",
+            default_branch="release/1.0",
+        )
+        project = await RepoStore(pool).by_forge_id("gitea", "slashy-1")
+        assert project is not None
+        client = gitea_client(handler)
+        heads = await gitea_heads(client, project)
+        assert [h.commit_sha for h in heads] == ["head-rel"]
 
 
-def test_reconcile_unbuilt_heads(postgres_dsn: str) -> None:
+async def test_reconcile_unbuilt_heads(postgres_dsn: str) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path == "/api/v1/repos/acme/recon/branches/main":
@@ -692,64 +650,61 @@ def test_reconcile_unbuilt_heads(postgres_dsn: str) -> None:
             )
         return httpx.Response(404)
 
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            project_id = await insert_project(
-                pool, "recon", forge="gitea", forge_repo_id="recon-1"
-            )
-            # PR 6's head already has a build record.
-            await insert_build(
-                pool, project_id, commit_sha="already-built", status="succeeded"
-            )
-            project = await RepoStore(pool).by_forge_id("gitea", "recon-1")
-            assert project is not None
+    async with db_pool(postgres_dsn) as pool:
+        project_id = await insert_project(
+            pool, "recon", forge="gitea", forge_repo_id="recon-1"
+        )
+        # PR 6's head already has a build record.
+        await insert_build(
+            pool, project_id, commit_sha="already-built", status="succeeded"
+        )
+        project = await RepoStore(pool).by_forge_id("gitea", "recon-1")
+        assert project is not None
 
-            client = gitea_client(handler)
-            heads = await gitea_heads(client, project)
-            assert len(heads) == 3
+        client = gitea_client(handler)
+        heads = await gitea_heads(client, project)
+        assert len(heads) == 3
 
-            events: list[object] = []
+        events: list[object] = []
 
-            class Sink:
-                async def submit(self, event: object) -> None:
-                    events.append(event)
+        class Sink:
+            async def submit(self, event: object) -> None:
+                events.append(event)
 
-            submitted = await reconcile_repo(pool, project, heads, Sink())
-            # main head + PR 5; PR 6 already built.
-            assert submitted == 2
-            shas = {e.commit_sha for e in events}  # type: ignore[attr-defined]
-            assert shas == {"head-main", "head-pr5"}
+        submitted = await reconcile_repo(pool, project, heads, Sink())
+        # main head + PR 5; PR 6 already built.
+        assert submitted == 2
+        shas = {e.commit_sha for e in events}  # type: ignore[attr-defined]
+        assert shas == {"head-main", "head-pr5"}
 
-            # First contact (no builds at all): default branch only, the
-            # open-PR backlog is not built.
-            await pool.execute("DELETE FROM builds WHERE project_id = $1", project_id)
-            events.clear()
-            submitted = await reconcile_repo(pool, project, heads, Sink())
-            assert submitted == 1
-            assert events[0].commit_sha == "head-main"  # type: ignore[attr-defined]
+        # First contact (no builds at all): default branch only, the
+        # open-PR backlog is not built.
+        await pool.execute("DELETE FROM builds WHERE project_id = $1", project_id)
+        events.clear()
+        submitted = await reconcile_repo(pool, project, heads, Sink())
+        assert submitted == 1
+        assert events[0].commit_sha == "head-main"  # type: ignore[attr-defined]
 
-            # Cancelled-only history is still fresh: an operator who
-            # cancels the initial build must not get the PR backlog on
-            # the next restart.
-            await insert_build(
-                pool,
-                project_id,
-                number=2,
-                commit_sha="head-main",
-                status="cancelled",
-            )
-            events.clear()
-            submitted = await reconcile_repo(pool, project, heads, Sink())
-            assert submitted == 0  # main head cancelled, PRs skipped
-
-    asyncio.run(run())
+        # Cancelled-only history is still fresh: an operator who
+        # cancels the initial build must not get the PR backlog on
+        # the next restart.
+        await insert_build(
+            pool,
+            project_id,
+            number=2,
+            commit_sha="head-main",
+            status="cancelled",
+        )
+        events.clear()
+        submitted = await reconcile_repo(pool, project, heads, Sink())
+        assert submitted == 0  # main head cancelled, PRs skipped
 
 
 # --- status posting against fake forge APIs -------------------------
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl required")
-def test_github_status_post(github_client: GitHubAppClient) -> None:
+async def test_github_status_post(github_client: GitHubAppClient) -> None:
     posted: list[dict] = []
     fallback = github_transport()
 
@@ -763,20 +718,17 @@ def test_github_status_post(github_client: GitHubAppClient) -> None:
         transport=httpx.MockTransport(handler), base_url=""
     )
 
-    async def run() -> None:
-        await github_client.discover_repos()
-        poster = GitHubStatusPoster(github_client)
-        await poster.post(
-            "acme",
-            "repo11",
-            "sha1",
-            "nixbot/nix-eval",
-            StatusState.success,
-            "evaluation succeeded",
-            "https://ci.test/repos/acme/repo11/builds/1",
-        )
-
-    asyncio.run(run())
+    await github_client.discover_repos()
+    poster = GitHubStatusPoster(github_client)
+    await poster.post(
+        "acme",
+        "repo11",
+        "sha1",
+        "nixbot/nix-eval",
+        StatusState.success,
+        "evaluation succeeded",
+        "https://ci.test/repos/acme/repo11/builds/1",
+    )
     assert posted == [
         {
             "state": "success",
@@ -787,7 +739,7 @@ def test_github_status_post(github_client: GitHubAppClient) -> None:
     ]
 
 
-def test_gitea_status_post() -> None:
+async def test_gitea_status_post() -> None:
     posted: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -798,22 +750,20 @@ def test_gitea_status_post() -> None:
         return httpx.Response(404)
 
     client = gitea_client(handler)
-    asyncio.run(
-        GiteaStatusPoster(client).post(
-            "acme",
-            "widget",
-            "sha9",
-            "nixbot/nix-build",
-            StatusState.failure,
-            "2 of 3 attributes failed",
-            "https://ci.test/repos/acme/widget/builds/7",
-        )
+    await GiteaStatusPoster(client).post(
+        "acme",
+        "widget",
+        "sha9",
+        "nixbot/nix-build",
+        StatusState.failure,
+        "2 of 3 attributes failed",
+        "https://ci.test/repos/acme/widget/builds/7",
     )
     assert posted[0]["state"] == "failure"
     assert posted[0]["context"] == "nixbot/nix-build"
 
 
-def test_register_repo_hook_without_admin_warns(
+async def test_register_repo_hook_without_admin_warns(
     postgres_dsn: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """No admin permission on the repo: degrade to a manual-setup hint
@@ -824,7 +774,7 @@ def test_register_repo_hook_without_admin_warns(
             return httpx.Response(403, json={"message": "forbidden"})
         return httpx.Response(404)
 
-    async def run() -> None:
+    with caplog.at_level("WARNING"):
         async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(
                 pool, "locked", forge="gitea", forge_repo_id="hook-403"
@@ -838,13 +788,10 @@ def test_register_repo_hook_without_admin_warns(
                 "locked",
                 "https://ci.example.com",
             )
-
-    with caplog.at_level("WARNING"):
-        asyncio.run(run())
     assert any("manually" in r.message for r in caplog.records)
 
 
-def test_gitlab_discovery() -> None:
+async def test_gitlab_discovery() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["PRIVATE-TOKEN"] == "glpat-x"
         if request.url.path == "/api/v4/projects":
@@ -876,7 +823,7 @@ def test_gitlab_discovery() -> None:
         base_url="https://gitlab.example.com/",
         token="glpat-x",  # noqa: S106 (test credential)
     )
-    nested, public = asyncio.run(client.discover_repos())
+    nested, public = await client.discover_repos()
     assert nested == DiscoveredRepo(
         forge="gitlab",
         forge_repo_id="7",
@@ -895,7 +842,7 @@ def test_gitlab_discovery() -> None:
     )
 
 
-def test_gitlab_hook_registration(postgres_dsn: str) -> None:
+async def test_gitlab_hook_registration(postgres_dsn: str) -> None:
     hooks: list[dict] = []
     created: list[dict] = []
     updated: list[tuple[str, dict]] = []
@@ -914,45 +861,44 @@ def test_gitlab_hook_registration(postgres_dsn: str) -> None:
             return httpx.Response(200, json={})
         return httpx.Response(404)
 
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            project_id = await insert_project(
-                pool, forge="gitlab", forge_repo_id="glhook-1"
-            )
-            secrets_store = WebhookSecrets(pool, "gitlab")
-            client = gitlab_client(handler)
-            await gitlab_register_repo_hook(
-                client,
-                secrets_store,
-                project_id,
-                "acme",
-                "widget",
-                "https://ci.example.com",
-            )
-            assert len(created) == 1
-            hook = created[0]
-            assert hook["url"] == "https://ci.example.com/webhooks/gitlab"
-            assert hook["push_events"]
-            assert hook["merge_requests_events"]
-            assert hook["token"] == await secrets_store.secret_for_repo("glhook-1")
+    async with db_pool(postgres_dsn) as pool:
+        project_id = await insert_project(
+            pool, forge="gitlab", forge_repo_id="glhook-1"
+        )
+        secrets_store = WebhookSecrets(pool, "gitlab")
+        client = gitlab_client(handler)
+        await gitlab_register_repo_hook(
+            client,
+            secrets_store,
+            project_id,
+            "acme",
+            "widget",
+            "https://ci.example.com",
+        )
+        assert len(created) == 1
+        hook = created[0]
+        assert hook["url"] == "https://ci.example.com/webhooks/gitlab"
+        assert hook["push_events"]
+        assert hook["merge_requests_events"]
+        assert hook["token"] == await secrets_store.secret_for_repo("glhook-1")
 
-            # An existing hook is updated in place to re-sync the secret.
-            hooks[:] = [{"id": 9, "url": "https://ci.example.com/webhooks/gitlab"}]
-            await gitlab_register_repo_hook(
-                client,
-                secrets_store,
-                project_id,
-                "acme",
-                "widget",
-                "https://ci.example.com",
-            )
-            assert len(created) == 1
-            assert updated[0][0] == "9"
-
-    asyncio.run(run())
+        # An existing hook is updated in place to re-sync the secret.
+        hooks[:] = [{"id": 9, "url": "https://ci.example.com/webhooks/gitlab"}]
+        await gitlab_register_repo_hook(
+            client,
+            secrets_store,
+            project_id,
+            "acme",
+            "widget",
+            "https://ci.example.com",
+        )
+        assert len(created) == 1
+        assert updated[0][0] == "9"
 
 
-def test_register_repo_hook_500_with_403_in_body_raises(postgres_dsn: str) -> None:
+async def test_register_repo_hook_500_with_403_in_body_raises(
+    postgres_dsn: str,
+) -> None:
     """A 500 whose response body merely contains "403" is not a
     permission problem: it must propagate, not degrade to a warning."""
 
@@ -961,26 +907,23 @@ def test_register_repo_hook_500_with_403_in_body_raises(postgres_dsn: str) -> No
             return httpx.Response(500, json={"message": "object id 403 missing"})
         return httpx.Response(404)
 
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            project_id = await insert_project(
-                pool, "err500", forge="gitea", forge_repo_id="hook-500"
+    async with db_pool(postgres_dsn) as pool:
+        project_id = await insert_project(
+            pool, "err500", forge="gitea", forge_repo_id="hook-500"
+        )
+        client = gitea_client(handler)
+        with pytest.raises(ForgeError):
+            await register_repo_hook(
+                client,
+                WebhookSecrets(pool, "gitea"),
+                project_id,
+                "acme",
+                "err500",
+                "https://ci.example.com",
             )
-            client = gitea_client(handler)
-            with pytest.raises(ForgeError):
-                await register_repo_hook(
-                    client,
-                    WebhookSecrets(pool, "gitea"),
-                    project_id,
-                    "acme",
-                    "err500",
-                    "https://ci.example.com",
-                )
-
-    asyncio.run(run())
 
 
-def test_gitlab_register_repo_hook_status_classification(
+async def test_gitlab_register_repo_hook_status_classification(
     postgres_dsn: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """403 degrades to a manual-setup warning; a 500 whose body
@@ -992,8 +935,7 @@ def test_gitlab_register_repo_hook_status_classification(
             return httpx.Response(status, json={"message": "see id 403"})
         return httpx.Response(404)
 
-    async def run() -> None:
-        nonlocal status
+    with caplog.at_level("WARNING"):
         async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(
                 pool, "glperm", forge="gitlab", forge_repo_id="glhook-403"
@@ -1018,25 +960,22 @@ def test_gitlab_register_repo_hook_status_classification(
                     "glperm",
                     "https://ci.example.com",
                 )
-
-    with caplog.at_level("WARNING"):
-        asyncio.run(run())
     assert any("manually" in r.message for r in caplog.records)
 
 
 # --- credential temp-dir lifecycle ---------------------------------------------
 
 
-def test_netrc_provider_cleanup_removes_tempdir() -> None:
+async def test_netrc_provider_cleanup_removes_tempdir() -> None:
     provider = NetrcFetchCredentialsProvider("https://gitea.example.com", "tkn")
-    creds = asyncio.run(provider.get("https://gitea.example.com/a/b.git"))
+    creds = await provider.get("https://gitea.example.com/a/b.git")
     assert creds.netrc_file is not None
     assert creds.netrc_file.exists()
     provider.cleanup()
     assert not creds.netrc_file.parent.exists()
 
 
-def test_gitea_legacy_hook_delete_failure_warns(
+async def test_gitea_legacy_hook_delete_failure_warns(
     postgres_dsn: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A failed legacy-hook DELETE silently leaves the old hook
@@ -1048,23 +987,20 @@ def test_gitea_legacy_hook_delete_failure_warns(
         delete_status=500,
     )
 
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            project_id = await insert_project(
-                pool, forge="gitea", forge_repo_id="hook-del-1"
+    async with db_pool(postgres_dsn) as pool:
+        project_id = await insert_project(
+            pool, forge="gitea", forge_repo_id="hook-del-1"
+        )
+        client = forge.client()
+        with caplog.at_level("WARNING", logger="nixbot.gitea_hooks"):
+            await register_repo_hook(
+                client,
+                WebhookSecrets(pool, "gitea"),
+                project_id,
+                "acme",
+                "widget",
+                "https://ci.example.com",
             )
-            client = forge.client()
-            with caplog.at_level("WARNING", logger="nixbot.gitea_hooks"):
-                await register_repo_hook(
-                    client,
-                    WebhookSecrets(pool, "gitea"),
-                    project_id,
-                    "acme",
-                    "widget",
-                    "https://ci.example.com",
-                )
-            assert any(
-                "failed to remove legacy" in record.message for record in caplog.records
-            )
-
-    asyncio.run(run())
+        assert any(
+            "failed to remove legacy" in record.message for record in caplog.records
+        )

@@ -35,7 +35,7 @@ DISCOVERY_DOC = {
 }
 
 
-def test_oidc_retry_registers_provider_after_transient_failure(
+async def test_oidc_retry_registers_provider_after_transient_failure(
     tmp_path: Path,
 ) -> None:
     """A transient discovery failure at startup must not permanently
@@ -60,16 +60,12 @@ def test_oidc_retry_registers_provider_after_transient_failure(
 
     providers: dict[str, OAuthProvider] = {}
     registered: list[str] = []
-    asyncio.run(
-        register_oidc_with_retry(
-            oidc,
-            providers,
-            on_registered=lambda: registered.append("oidc"),
-            retry_delay=0,
-            http_factory=lambda: httpx.AsyncClient(
-                transport=httpx.MockTransport(handler)
-            ),
-        )
+    await register_oidc_with_retry(
+        oidc,
+        providers,
+        on_registered=lambda: registered.append("oidc"),
+        retry_delay=0,
+        http_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
     assert attempts == 3
     assert providers["oidc"].authorize_url == "https://idp.example.com/auth"
@@ -97,7 +93,7 @@ def test_explicit_listen_flag_keeps_both(tmp_path: Path) -> None:
     assert len(configs) == 2
 
 
-def test_lifespan_runs_once_with_two_listeners(tmp_path: Path) -> None:
+async def test_lifespan_runs_once_with_two_listeners(tmp_path: Path) -> None:
     """Two uvicorn servers share one app; each running the ASGI
     lifespan would start the app twice (duplicate LISTEN connection,
     double SSE event delivery)."""
@@ -119,15 +115,12 @@ def test_lifespan_runs_once_with_two_listeners(tmp_path: Path) -> None:
     )
     config.http_port = 0  # ephemeral TCP port
 
-    async def run() -> None:
-        task = asyncio.create_task(_serve(app, _uvicorn_configs(config, app)))
-        async with asyncio.timeout(10):
-            while not sock.exists():  # noqa: ASYNC110 (poll fs, no event)
-                await asyncio.sleep(0.05)
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-    asyncio.run(run())
+    task = asyncio.create_task(_serve(app, _uvicorn_configs(config, app)))
+    async with asyncio.timeout(10):
+        while not sock.exists():  # noqa: ASYNC110 (poll fs, no event)
+            await asyncio.sleep(0.05)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
     assert starts == ["x"]
     assert stops == ["x"]

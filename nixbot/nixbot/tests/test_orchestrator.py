@@ -316,478 +316,437 @@ async def build_status(pool: asyncpg.Pool, build_id: int) -> str:
 # --- tests --------------------------------------------------------------------
 
 
-def test_full_lifecycle(postgres_dsn: str, tmp_path: Path, upstream: Path) -> None:
-    async def run() -> None:
-        eval_runner = FakeEvalRunner([mk_job("a"), mk_job("b")], warnings=["warn1"])
-        executor = FakeExecutor()
-        build, reporter, pool = await run_event(
-            postgres_dsn, tmp_path, upstream, eval_runner, executor
+async def test_full_lifecycle(
+    postgres_dsn: str, tmp_path: Path, upstream: Path
+) -> None:
+    eval_runner = FakeEvalRunner([mk_job("a"), mk_job("b")], warnings=["warn1"])
+    executor = FakeExecutor()
+    build, reporter, pool = await run_event(
+        postgres_dsn, tmp_path, upstream, eval_runner, executor
+    )
+    try:
+        assert build is not None
+        row = await pool.fetchrow("SELECT * FROM builds WHERE id = $1", build.id)
+        assert row["status"] == BuildStatus.SUCCEEDED
+        assert row["status_generation"] == 1
+        assert row["tree_hash"]
+        attrs = await pool.fetch(
+            "SELECT attr, status FROM build_attributes WHERE build_id = $1",
+            build.id,
         )
-        try:
-            assert build is not None
-            row = await pool.fetchrow("SELECT * FROM builds WHERE id = $1", build.id)
-            assert row["status"] == BuildStatus.SUCCEEDED
-            assert row["status_generation"] == 1
-            assert row["tree_hash"]
-            attrs = await pool.fetch(
-                "SELECT attr, status FROM build_attributes WHERE build_id = $1",
-                build.id,
-            )
-            assert {r["attr"]: r["status"] for r in attrs} == {
-                "a": "succeeded",
-                "b": "succeeded",
-            }
-            # Log metadata written in the same transaction as completion.
-            logs = await pool.fetch(
-                "SELECT l.path FROM logs l JOIN build_attributes a "
-                "ON l.attribute_id = a.id WHERE a.build_id = $1",
-                build.id,
-            )
-            assert len(logs) == 2
-            kinds = [e[0] for e in reporter.events]
-            assert kinds == ["started", "eval", "finished"]
-            assert reporter.events[1][3] == ("warn1",)
-            assert reporter.events[2][2] == BuildStatus.SUCCEEDED
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
-
-
-def test_failure_aggregation(postgres_dsn: str, tmp_path: Path, upstream: Path) -> None:
-    async def run() -> None:
-        add_commit(upstream, "f2")
-        eval_runner = FakeEvalRunner([mk_job("ok"), mk_job("bad")])
-        executor = FakeExecutor({"bad": BuildOutcome.failure})
-        build, reporter, pool = await run_event(
-            postgres_dsn, tmp_path, upstream, eval_runner, executor
+        assert {r["attr"]: r["status"] for r in attrs} == {
+            "a": "succeeded",
+            "b": "succeeded",
+        }
+        # Log metadata written in the same transaction as completion.
+        logs = await pool.fetch(
+            "SELECT l.path FROM logs l JOIN build_attributes a "
+            "ON l.attribute_id = a.id WHERE a.build_id = $1",
+            build.id,
         )
-        try:
-            assert build is not None
-            assert await build_status(pool, build.id) == BuildStatus.FAILED
-            assert reporter.events[-1][2] == BuildStatus.FAILED
-            error = await pool.fetchval(
-                "SELECT error FROM build_attributes"
-                " WHERE build_id = $1 AND attr = 'bad'",
-                build.id,
-            )
-            assert error is not None
-            assert "fake build output" in error
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        assert len(logs) == 2
+        kinds = [e[0] for e in reporter.events]
+        assert kinds == ["started", "eval", "finished"]
+        assert reporter.events[1][3] == ("warn1",)
+        assert reporter.events[2][2] == BuildStatus.SUCCEEDED
+    finally:
+        await pool.close()
 
 
-def test_tree_hash_reuse(postgres_dsn: str, tmp_path: Path, upstream: Path) -> None:
-    async def run() -> None:
-        add_commit(upstream, "f3")
-        eval_runner = FakeEvalRunner([mk_job("a")])
-        executor = FakeExecutor()
-        build1, _, pool1 = await run_event(
-            postgres_dsn, tmp_path, upstream, eval_runner, executor
+async def test_failure_aggregation(
+    postgres_dsn: str, tmp_path: Path, upstream: Path
+) -> None:
+    add_commit(upstream, "f2")
+    eval_runner = FakeEvalRunner([mk_job("ok"), mk_job("bad")])
+    executor = FakeExecutor({"bad": BuildOutcome.failure})
+    build, reporter, pool = await run_event(
+        postgres_dsn, tmp_path, upstream, eval_runner, executor
+    )
+    try:
+        assert build is not None
+        assert await build_status(pool, build.id) == BuildStatus.FAILED
+        assert reporter.events[-1][2] == BuildStatus.FAILED
+        error = await pool.fetchval(
+            "SELECT error FROM build_attributes WHERE build_id = $1 AND attr = 'bad'",
+            build.id,
         )
-        await pool1.close()
-        # Same tree content from another context: no second build, no
-        # second eval; existing result re-reported.
-        build2, reporter2, pool2 = await run_event(
-            postgres_dsn, tmp_path, upstream, eval_runner, executor
-        )
-        try:
-            assert build1 is not None
-            assert build2 is not None
-            assert build1.id == build2.id
-            assert eval_runner.calls == 1
-            # The eval context must not stay pending on the second commit.
-            assert [e[0] for e in reporter2.events] == ["eval", "finished"]
-        finally:
-            await pool2.close()
-
-    asyncio.run(run())
+        assert error is not None
+        assert "fake build output" in error
+    finally:
+        await pool.close()
 
 
-def test_main_push_promotes_reused_pr_build(
+async def test_tree_hash_reuse(
+    postgres_dsn: str, tmp_path: Path, upstream: Path
+) -> None:
+    add_commit(upstream, "f3")
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    executor = FakeExecutor()
+    build1, _, pool1 = await run_event(
+        postgres_dsn, tmp_path, upstream, eval_runner, executor
+    )
+    await pool1.close()
+    # Same tree content from another context: no second build, no
+    # second eval; existing result re-reported.
+    build2, reporter2, pool2 = await run_event(
+        postgres_dsn, tmp_path, upstream, eval_runner, executor
+    )
+    try:
+        assert build1 is not None
+        assert build2 is not None
+        assert build1.id == build2.id
+        assert eval_runner.calls == 1
+        # The eval context must not stay pending on the second commit.
+        assert [e[0] for e in reporter2.events] == ["eval", "finished"]
+    finally:
+        await pool2.close()
+
+
+async def test_main_push_promotes_reused_pr_build(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """A main push reusing a PR build (identical tree) must shed the
     PR identity and refresh schedules."""
 
-    async def run() -> None:
-        add_commit(upstream, "promote")
-        sha = git(upstream, "rev-parse", "HEAD")
-        eval_runner = FakeEvalRunner([mk_job("a")])
-        executor = FakeExecutor()
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn, tmp_path, upstream, eval_runner, executor, name="promote"
+    add_commit(upstream, "promote")
+    sha = git(upstream, "rev-parse", "HEAD")
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    executor = FakeExecutor()
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn, tmp_path, upstream, eval_runner, executor, name="promote"
+    )
+    try:
+        pr_build = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=7)
         )
-        try:
-            pr_build = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=7)
-            )
-            assert pr_build is not None
-            assert pr_build.pr_number == 7
-            main_build = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=sha)
-            )
-            assert main_build is not None
-            assert main_build.id == pr_build.id
-            row = await pool.fetchrow(
-                "SELECT branch, pr_number FROM builds WHERE id = $1", pr_build.id
-            )
-            assert dict(row) == {"branch": "main", "pr_number": None}
-            assert await pool.fetchval(
-                "SELECT count(*) FROM work_queue WHERE kind = 'refresh-schedules'"
-            )
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        assert pr_build is not None
+        assert pr_build.pr_number == 7
+        main_build = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha)
+        )
+        assert main_build is not None
+        assert main_build.id == pr_build.id
+        row = await pool.fetchrow(
+            "SELECT branch, pr_number FROM builds WHERE id = $1", pr_build.id
+        )
+        assert dict(row) == {"branch": "main", "pr_number": None}
+        assert await pool.fetchval(
+            "SELECT count(*) FROM work_queue WHERE kind = 'refresh-schedules'"
+        )
+    finally:
+        await pool.close()
 
 
-def test_merge_conflict_fails_build(
+async def test_merge_conflict_fails_build(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
-    async def run() -> None:
-        git(upstream, "checkout", "-b", "pr")
-        (upstream / "flake.nix").write_text("{ pr = 1; }")
-        git(upstream, "commit", "-am", "pr change")
-        head = git(upstream, "rev-parse", "HEAD")
-        git(upstream, "checkout", "main")
-        (upstream / "flake.nix").write_text("{ main = 1; }")
-        git(upstream, "commit", "-am", "main change")
-        base = git(upstream, "rev-parse", "HEAD")
+    git(upstream, "checkout", "-b", "pr")
+    (upstream / "flake.nix").write_text("{ pr = 1; }")
+    git(upstream, "commit", "-am", "pr change")
+    head = git(upstream, "rev-parse", "HEAD")
+    git(upstream, "checkout", "main")
+    (upstream / "flake.nix").write_text("{ main = 1; }")
+    git(upstream, "commit", "-am", "main change")
+    base = git(upstream, "rev-parse", "HEAD")
 
-        eval_runner = FakeEvalRunner([mk_job("a")])
-        executor = FakeExecutor()
-        pool = await asyncpg.create_pool(postgres_dsn)
-        orchestrator, reporter = make_orchestrator(
-            pool, tmp_path, eval_runner, executor
-        )
-        project = await make_project(pool, name="conflict")
-        project = RepoInfo(**{**project.__dict__, "clone_url": str(upstream)})
-        try:
-            build = await orchestrator.handle_change_event(
-                ChangeEvent(
-                    repo=project,
-                    branch="main",
-                    commit_sha=head,
-                    pr_number=5,
-                    pr_author="github:alice",
-                    base_sha=base,
-                )
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    executor = FakeExecutor()
+    pool = await asyncpg.create_pool(postgres_dsn)
+    orchestrator, reporter = make_orchestrator(pool, tmp_path, eval_runner, executor)
+    project = await make_project(pool, name="conflict")
+    project = RepoInfo(**{**project.__dict__, "clone_url": str(upstream)})
+    try:
+        build = await orchestrator.handle_change_event(
+            ChangeEvent(
+                repo=project,
+                branch="main",
+                commit_sha=head,
+                pr_number=5,
+                pr_author="github:alice",
+                base_sha=base,
             )
-            assert build is not None
-            row = await pool.fetchrow("SELECT * FROM builds WHERE id = $1", build.id)
-            assert row["status"] == "failed"
-            assert "conflict" in row["error"]
-            assert row["pr_author"] == "github:alice"
-            assert eval_runner.calls == 0
-            assert reporter.events[-1][2] == BuildStatus.FAILED
-            # The eval context must get a terminal status too.
-            assert ("eval", build.id, False, ()) in reporter.events
-        finally:
-            await pool.close()
+        )
+        assert build is not None
+        row = await pool.fetchrow("SELECT * FROM builds WHERE id = $1", build.id)
+        assert row["status"] == "failed"
+        assert "conflict" in row["error"]
+        assert row["pr_author"] == "github:alice"
+        assert eval_runner.calls == 0
+        assert reporter.events[-1][2] == BuildStatus.FAILED
+        # The eval context must get a terminal status too.
+        assert ("eval", build.id, False, ()) in reporter.events
+    finally:
+        await pool.close()
 
-    asyncio.run(run())
 
-
-def test_build_reuse_clears_pr_author_in_other_context(
+async def test_build_reuse_clears_pr_author_in_other_context(
     postgres_dsn: str, tmp_path: Path
 ) -> None:
     """A PR build reused for another context (e.g. the default branch
     after the merge) must not stay controllable by the PR author."""
 
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            db = BuildDB(pool)
-            project = await make_project(pool, name="reuse-author")
-            build, created = await db.get_or_create_build(
-                project.id,
-                "tree-reuse",
-                "sha",
-                "main",
-                pr_number=7,
-                pr_author="github:alice",
-            )
-            assert created
+    async with db_pool(postgres_dsn) as pool:
+        db = BuildDB(pool)
+        project = await make_project(pool, name="reuse-author")
+        build, created = await db.get_or_create_build(
+            project.id,
+            "tree-reuse",
+            "sha",
+            "main",
+            pr_number=7,
+            pr_author="github:alice",
+        )
+        assert created
 
-            # Re-trigger of the same PR: author keeps control.
-            await db.get_or_create_build(
-                project.id, "tree-reuse", "sha", "main", pr_number=7
-            )
-            author = await pool.fetchval(
-                "SELECT pr_author FROM builds WHERE id = $1", build.id
-            )
-            assert author == "github:alice"
+        # Re-trigger of the same PR: author keeps control.
+        await db.get_or_create_build(
+            project.id, "tree-reuse", "sha", "main", pr_number=7
+        )
+        author = await pool.fetchval(
+            "SELECT pr_author FROM builds WHERE id = $1", build.id
+        )
+        assert author == "github:alice"
 
-            # Default-branch push producing the same tree: control revoked.
-            _, created = await db.get_or_create_build(
-                project.id, "tree-reuse", "sha", "main"
-            )
-            assert not created
-            author = await pool.fetchval(
-                "SELECT pr_author FROM builds WHERE id = $1", build.id
-            )
-            assert author is None
-
-    asyncio.run(run())
+        # Default-branch push producing the same tree: control revoked.
+        _, created = await db.get_or_create_build(
+            project.id, "tree-reuse", "sha", "main"
+        )
+        assert not created
+        author = await pool.fetchval(
+            "SELECT pr_author FROM builds WHERE id = $1", build.id
+        )
+        assert author is None
 
 
-def test_effects_started_flag(postgres_dsn: str, tmp_path: Path) -> None:
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            db = BuildDB(pool)
-            project = await make_project(pool, name="flag")
-            build, _ = await db.get_or_create_build(
-                project.id, "tree-flag", "sha", "main"
-            )
-            assert await db.mark_effects_started(build.id)
-            # Second attempt (e.g. crash recovery) must not re-run.
-            assert not await db.mark_effects_started(build.id)
-
-    asyncio.run(run())
+async def test_effects_started_flag(postgres_dsn: str, tmp_path: Path) -> None:
+    async with db_pool(postgres_dsn) as pool:
+        db = BuildDB(pool)
+        project = await make_project(pool, name="flag")
+        build, _ = await db.get_or_create_build(project.id, "tree-flag", "sha", "main")
+        assert await db.mark_effects_started(build.id)
+        # Second attempt (e.g. crash recovery) must not re-run.
+        assert not await db.mark_effects_started(build.id)
 
 
-def test_aggregation_generation_monotonic(postgres_dsn: str, tmp_path: Path) -> None:
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            db = BuildDB(pool)
-            project = await make_project(pool, name="gen")
-            build, _ = await db.get_or_create_build(
-                project.id, "tree-gen", "sha", "main"
-            )
-            job = mk_job("x")
-            await db.complete_attribute(
-                build.id,
-                AttributeResult(
-                    attr="x",
-                    status=AttributeStatus.failed,
-                    job=job,
-                    drv_path=job.drv_path,
-                    system=job.system,
-                ),
-            )
-            status1, gen1 = await db.aggregate_build(build.id)
-            assert status1 == BuildStatus.FAILED
-            # Attribute rebuilt successfully: aggregate flips, generation grows.
-            await db.complete_attribute(
-                build.id,
-                AttributeResult(
-                    attr="x",
-                    status=AttributeStatus.succeeded,
-                    job=job,
-                    drv_path=job.drv_path,
-                    system=job.system,
-                ),
-            )
-            status2, gen2 = await db.aggregate_build(build.id)
-            assert status2 == BuildStatus.SUCCEEDED
-            assert gen2 > gen1
-
-    asyncio.run(run())
+async def test_aggregation_generation_monotonic(
+    postgres_dsn: str, tmp_path: Path
+) -> None:
+    async with db_pool(postgres_dsn) as pool:
+        db = BuildDB(pool)
+        project = await make_project(pool, name="gen")
+        build, _ = await db.get_or_create_build(project.id, "tree-gen", "sha", "main")
+        job = mk_job("x")
+        await db.complete_attribute(
+            build.id,
+            AttributeResult(
+                attr="x",
+                status=AttributeStatus.failed,
+                job=job,
+                drv_path=job.drv_path,
+                system=job.system,
+            ),
+        )
+        status1, gen1 = await db.aggregate_build(build.id)
+        assert status1 == BuildStatus.FAILED
+        # Attribute rebuilt successfully: aggregate flips, generation grows.
+        await db.complete_attribute(
+            build.id,
+            AttributeResult(
+                attr="x",
+                status=AttributeStatus.succeeded,
+                job=job,
+                drv_path=job.drv_path,
+                system=job.system,
+            ),
+        )
+        status2, gen2 = await db.aggregate_build(build.id)
+        assert status2 == BuildStatus.SUCCEEDED
+        assert gen2 > gen1
 
 
-def test_internal_error_not_recorded_in_failed_build_cache(
+async def test_internal_error_not_recorded_in_failed_build_cache(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
-    async def run() -> None:
-        class CrashingExecutor(FakeExecutor):
-            async def build_attribute(
-                self, *args: object, **kwargs: object
-            ) -> BuildOutcome:
-                msg = "executor exploded"
-                raise RuntimeError(msg)
+    class CrashingExecutor(FakeExecutor):
+        async def build_attribute(
+            self, *args: object, **kwargs: object
+        ) -> BuildOutcome:
+            msg = "executor exploded"
+            raise RuntimeError(msg)
 
-        sha = add_commit(upstream, "crash")
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job("a")]),
-            CrashingExecutor(),
-            "crash",
+    sha = add_commit(upstream, "crash")
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job("a")]),
+        CrashingExecutor(),
+        "crash",
+    )
+    cache = FakeCache()
+    orchestrator.failed_build_cache = lambda _project_id: cache  # type: ignore[assignment]
+    orchestrator.config = orchestrator.config.model_copy(
+        update={"cache_failed_builds": True}
+    )
+    try:
+        build = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha)
         )
-        cache = FakeCache()
-        orchestrator.failed_build_cache = lambda _project_id: cache  # type: ignore[assignment]
-        orchestrator.config = orchestrator.config.model_copy(
-            update={"cache_failed_builds": True}
+        assert build is not None
+        assert await build_status(pool, build.id) == BuildStatus.FAILED
+        assert cache.added == []
+    finally:
+        await pool.close()
+
+
+async def test_log_path_attribute_name_sanitized(
+    postgres_dsn: str, tmp_path: Path, upstream: Path
+) -> None:
+    add_commit(upstream, "trav")
+    evil = '../../../evil".attr'
+    build, _, pool = await run_event(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job(evil)]),
+        FakeExecutor(),
+    )
+    try:
+        assert build is not None
+        log_dir = tmp_path / "state" / "logs" / str(build.id)
+        files = list(log_dir.iterdir())
+        assert len(files) == 1
+        assert files[0].parent == log_dir
+        assert not (tmp_path / 'evil".attr.zst').exists()
+        log_path = await pool.fetchval(
+            "SELECT l.path FROM logs l JOIN build_attributes a "
+            "ON l.attribute_id = a.id WHERE a.build_id = $1",
+            build.id,
         )
-        try:
-            build = await orchestrator.handle_change_event(
+        state_dir = (tmp_path / "state").resolve()
+        assert (state_dir / log_path).resolve().is_relative_to(state_dir / "logs")
+    finally:
+        await pool.close()
+
+
+async def test_cancel_interrupts_evaluation(
+    postgres_dsn: str, tmp_path: Path, upstream: Path
+) -> None:
+    sha = add_commit(upstream, "ceval")
+    eval_runner = FakeEvalRunner([mk_job("a")], block=asyncio.Event())
+    executor = FakeExecutor()
+    pool, orchestrator, reporter, project = await make_env(
+        postgres_dsn, tmp_path, upstream, eval_runner, executor, "ceval"
+    )
+    try:
+        task = asyncio.create_task(
+            orchestrator.handle_change_event(
                 ChangeEvent(repo=project, branch="main", commit_sha=sha)
             )
-            assert build is not None
-            assert await build_status(pool, build.id) == BuildStatus.FAILED
-            assert cache.added == []
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
-
-
-def test_log_path_attribute_name_sanitized(
-    postgres_dsn: str, tmp_path: Path, upstream: Path
-) -> None:
-    async def run() -> None:
-        add_commit(upstream, "trav")
-        evil = '../../../evil".attr'
-        build, _, pool = await run_event(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job(evil)]),
-            FakeExecutor(),
         )
-        try:
-            assert build is not None
-            log_dir = tmp_path / "state" / "logs" / str(build.id)
-            files = list(log_dir.iterdir())
-            assert len(files) == 1
-            assert files[0].parent == log_dir
-            assert not (tmp_path / 'evil".attr.zst').exists()
-            log_path = await pool.fetchval(
-                "SELECT l.path FROM logs l JOIN build_attributes a "
-                "ON l.attribute_id = a.id WHERE a.build_id = $1",
-                build.id,
-            )
-            state_dir = (tmp_path / "state").resolve()
-            assert (state_dir / log_path).resolve().is_relative_to(state_dir / "logs")
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        await asyncio.wait_for(eval_runner.started.wait(), timeout=10)
+        for cancel_event in orchestrator.cancel_events.values():
+            cancel_event.set()
+        build = await asyncio.wait_for(task, timeout=10)
+        assert build is not None
+        assert await build_status(pool, build.id) == BuildStatus.CANCELLED
+        assert executor.built == []
+        # The pending nix-eval status must resolve (merge queues).
+        assert ("eval-cancelled", build.id) in reporter.events
+    finally:
+        await pool.close()
 
 
-def test_cancel_interrupts_evaluation(
-    postgres_dsn: str, tmp_path: Path, upstream: Path
-) -> None:
-    async def run() -> None:
-        sha = add_commit(upstream, "ceval")
-        eval_runner = FakeEvalRunner([mk_job("a")], block=asyncio.Event())
-        executor = FakeExecutor()
-        pool, orchestrator, reporter, project = await make_env(
-            postgres_dsn, tmp_path, upstream, eval_runner, executor, "ceval"
-        )
-        try:
-            task = asyncio.create_task(
-                orchestrator.handle_change_event(
-                    ChangeEvent(repo=project, branch="main", commit_sha=sha)
-                )
-            )
-            await asyncio.wait_for(eval_runner.started.wait(), timeout=10)
-            for cancel_event in orchestrator.cancel_events.values():
-                cancel_event.set()
-            build = await asyncio.wait_for(task, timeout=10)
-            assert build is not None
-            assert await build_status(pool, build.id) == BuildStatus.CANCELLED
-            assert executor.built == []
-            # The pending nix-eval status must resolve (merge queues).
-            assert ("eval-cancelled", build.id) in reporter.events
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
-
-
-def test_pending_attribute_rows_recorded_for_crash_recovery(
+async def test_pending_attribute_rows_recorded_for_crash_recovery(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """Without pending rows a crash mid-build has nothing to resume from."""
 
-    async def run() -> None:
-        sha = add_commit(upstream, "recov")
-        executor = FakeExecutor(gate=asyncio.Event())
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job("a"), mk_job("b")]),
-            executor,
-            "recov",
+    sha = add_commit(upstream, "recov")
+    executor = FakeExecutor(gate=asyncio.Event())
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job("a"), mk_job("b")]),
+        executor,
+        "recov",
+    )
+    try:
+        task = asyncio.create_task(
+            orchestrator.handle_change_event(
+                ChangeEvent(repo=project, branch="main", commit_sha=sha)
+            )
         )
-        try:
-            task = asyncio.create_task(
-                orchestrator.handle_change_event(
-                    ChangeEvent(repo=project, branch="main", commit_sha=sha)
-                )
-            )
-            await asyncio.wait_for(executor.started.wait(), timeout=10)
-            rows = await pool.fetch(
-                "SELECT a.attr, a.status FROM build_attributes a "
-                "JOIN builds b ON a.build_id = b.id WHERE b.project_id = $1",
-                project.id,
-            )
-            assert {r["attr"] for r in rows} == {"a", "b"}
-            # Both attrs may already be 'building' depending on timing;
-            # recovery only needs the unfinished rows to exist.
-            assert {r["status"] for r in rows} <= {"pending", "building"}
-            assert executor.gate is not None
-            executor.gate.set()
-            build = await task
-            assert build is not None
-            assert await build_status(pool, build.id) == BuildStatus.SUCCEEDED
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        await asyncio.wait_for(executor.started.wait(), timeout=10)
+        rows = await pool.fetch(
+            "SELECT a.attr, a.status FROM build_attributes a "
+            "JOIN builds b ON a.build_id = b.id WHERE b.project_id = $1",
+            project.id,
+        )
+        assert {r["attr"] for r in rows} == {"a", "b"}
+        # Both attrs may already be 'building' depending on timing;
+        # recovery only needs the unfinished rows to exist.
+        assert {r["status"] for r in rows} <= {"pending", "building"}
+        assert executor.gate is not None
+        executor.gate.set()
+        build = await task
+        assert build is not None
+        assert await build_status(pool, build.id) == BuildStatus.SUCCEEDED
+    finally:
+        await pool.close()
 
 
-def test_eval_warnings_null_when_empty(
+async def test_eval_warnings_null_when_empty(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
-    async def run() -> None:
-        add_commit(upstream, "warn")
-        build, _, pool = await run_event(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job("a")]),
-            FakeExecutor(),
+    add_commit(upstream, "warn")
+    build, _, pool = await run_event(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job("a")]),
+        FakeExecutor(),
+    )
+    try:
+        assert build is not None
+        warnings = await pool.fetchval(
+            "SELECT eval_warnings FROM builds WHERE id = $1", build.id
         )
-        try:
-            assert build is not None
-            warnings = await pool.fetchval(
-                "SELECT eval_warnings FROM builds WHERE id = $1", build.id
-            )
-            assert warnings is None
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        assert warnings is None
+    finally:
+        await pool.close()
 
 
-def test_recovery_rerun_failures_not_cached(
+async def test_recovery_rerun_failures_not_cached(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """Jobs reconstructed on recovery have empty dependency closures:
     dependents of one broken drv fail individually and must not enter
     the failed-build cache."""
 
-    async def run() -> None:
-        sha = add_commit(upstream, "recov")
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([]),
-            FakeExecutor(outcomes={"a": BuildOutcome.failure}),
-            "recov",
-        )
-        cache = FakeCache()
-        orchestrator.failed_build_cache = lambda _project_id: cache  # type: ignore[assignment]
-        orchestrator.config = orchestrator.config.model_copy(
-            update={"cache_failed_builds": True}
-        )
-        db = BuildDB(pool)
-        build, _ = await db.get_or_create_build(project.id, "recov-tree", sha, "main")
-        try:
-            await orchestrator.rerun_pending_attributes(project, build, [mk_job("a")])
-            assert await db.get_attribute_statuses(build.id) == {"a": "failed"}
-            assert cache.added == []
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+    sha = add_commit(upstream, "recov")
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([]),
+        FakeExecutor(outcomes={"a": BuildOutcome.failure}),
+        "recov",
+    )
+    cache = FakeCache()
+    orchestrator.failed_build_cache = lambda _project_id: cache  # type: ignore[assignment]
+    orchestrator.config = orchestrator.config.model_copy(
+        update={"cache_failed_builds": True}
+    )
+    db = BuildDB(pool)
+    build, _ = await db.get_or_create_build(project.id, "recov-tree", sha, "main")
+    try:
+        await orchestrator.rerun_pending_attributes(project, build, [mk_job("a")])
+        assert await db.get_attribute_statuses(build.id) == {"a": "failed"}
+        assert cache.added == []
+    finally:
+        await pool.close()
 
 
 # Each forge serves change-request heads under its own ref namespace.
@@ -823,208 +782,188 @@ async def setup_forge_mr(
     return project, mr_sha
 
 
-def test_gitlab_mr_fetches_merge_request_refs(
+async def test_gitlab_mr_fetches_merge_request_refs(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """GitLab serves MR heads under refs/merge-requests/*, not the
     GitHub-style refs/pull/*."""
 
-    async def run() -> None:
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job("a")]),
-            FakeExecutor(),
-            "glmr",
-        )
-        project, mr_sha = await setup_forge_mr(
-            orchestrator, project, upstream, "gitlab"
-        )
-        event = ChangeEvent(
-            repo=project,
-            branch="main",
-            commit_sha=mr_sha,
-            pr_number=7,
-            base_sha="refs/heads/main",
-        )
-        try:
-            build = await orchestrator.handle_change_event(event)
-            assert build is not None
-            assert await build_status(pool, build.id) == BuildStatus.SUCCEEDED
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job("a")]),
+        FakeExecutor(),
+        "glmr",
+    )
+    project, mr_sha = await setup_forge_mr(orchestrator, project, upstream, "gitlab")
+    event = ChangeEvent(
+        repo=project,
+        branch="main",
+        commit_sha=mr_sha,
+        pr_number=7,
+        base_sha="refs/heads/main",
+    )
+    try:
+        build = await orchestrator.handle_change_event(event)
+        assert build is not None
+        assert await build_status(pool, build.id) == BuildStatus.SUCCEEDED
+    finally:
+        await pool.close()
 
 
 @pytest.mark.parametrize("forge", ["github", "gitlab"])
-def test_rerun_fetches_forge_change_request_refs(
+async def test_rerun_fetches_forge_change_request_refs(
     postgres_dsn: str, tmp_path: Path, upstream: Path, forge: str
 ) -> None:
     """The rerun path must fetch the forge-specific head refspec:
     PR/MR heads are only reachable via refs/pull/* (GitHub) or
     refs/merge-requests/* (GitLab)."""
 
-    async def run() -> None:
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([]),
-            FakeExecutor(),
-            f"rerun-{forge}",
-        )
-        project, mr_sha = await setup_forge_mr(orchestrator, project, upstream, forge)
-        db = BuildDB(pool)
-        build, _ = await db.get_or_create_build(
-            project.id, "mr-tree", mr_sha, "main", pr_number=7
-        )
-        try:
-            await orchestrator.rerun_pending_attributes(project, build, [mk_job("a")])
-            assert await db.get_attribute_statuses(build.id) == {"a": "succeeded"}
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([]),
+        FakeExecutor(),
+        f"rerun-{forge}",
+    )
+    project, mr_sha = await setup_forge_mr(orchestrator, project, upstream, forge)
+    db = BuildDB(pool)
+    build, _ = await db.get_or_create_build(
+        project.id, "mr-tree", mr_sha, "main", pr_number=7
+    )
+    try:
+        await orchestrator.rerun_pending_attributes(project, build, [mk_job("a")])
+        assert await db.get_attribute_statuses(build.id) == {"a": "succeeded"}
+    finally:
+        await pool.close()
 
 
-def test_cancelled_build_reuse_rebuilds(
+async def test_cancelled_build_reuse_rebuilds(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
-    async def run() -> None:
-        add_commit(upstream, "cxl")
-        eval_runner = FakeEvalRunner([mk_job("a")])
-        build1, _, pool1 = await run_event(
-            postgres_dsn, tmp_path, upstream, eval_runner, FakeExecutor()
+    add_commit(upstream, "cxl")
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    build1, _, pool1 = await run_event(
+        postgres_dsn, tmp_path, upstream, eval_runner, FakeExecutor()
+    )
+    assert build1 is not None
+    await pool1.execute(
+        "UPDATE builds SET status = 'cancelled' WHERE id = $1", build1.id
+    )
+    await pool1.close()
+    build2, _, pool2 = await run_event(
+        postgres_dsn, tmp_path, upstream, eval_runner, FakeExecutor()
+    )
+    try:
+        # A cancelled build carries no verdict: a re-push of the
+        # same tree gets a fresh build instead of reusing it.
+        assert build2 is not None
+        assert build2.id != build1.id
+        assert eval_runner.calls == 2
+        assert await build_status(pool2, build2.id) == BuildStatus.SUCCEEDED
+    finally:
+        await pool2.close()
+
+
+async def test_inflight_share_fans_out_final_status(
+    postgres_dsn: str, tmp_path: Path, upstream: Path
+) -> None:
+    sha = add_commit(upstream, "share")
+    git(upstream, "branch", "copy", "main")
+    executor = FakeExecutor(gate=asyncio.Event())
+    pool, orchestrator, reporter, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job("a")]),
+        executor,
+        "share",
+    )
+    try:
+        task = asyncio.create_task(
+            orchestrator.handle_change_event(
+                ChangeEvent(repo=project, branch="main", commit_sha=sha)
+            )
         )
+        await asyncio.wait_for(executor.started.wait(), timeout=10)
+        build2 = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="copy", commit_sha=sha)
+        )
+        assert executor.gate is not None
+        executor.gate.set()
+        build1 = await task
         assert build1 is not None
-        await pool1.execute(
-            "UPDATE builds SET status = 'cancelled' WHERE id = $1", build1.id
-        )
-        await pool1.close()
-        build2, _, pool2 = await run_event(
-            postgres_dsn, tmp_path, upstream, eval_runner, FakeExecutor()
-        )
-        try:
-            # A cancelled build carries no verdict: a re-push of the
-            # same tree gets a fresh build instead of reusing it.
-            assert build2 is not None
-            assert build2.id != build1.id
-            assert eval_runner.calls == 2
-            assert await build_status(pool2, build2.id) == BuildStatus.SUCCEEDED
-        finally:
-            await pool2.close()
-
-    asyncio.run(run())
+        assert build2 is not None
+        assert build1.id == build2.id
+        finished = [e for e in reporter.events if e[0] == "finished"]
+        assert len(finished) == 2  # one final status per context
+    finally:
+        await pool.close()
 
 
-def test_inflight_share_fans_out_final_status(
+async def test_stale_event_does_not_supersede_newer_build(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
-    async def run() -> None:
-        sha = add_commit(upstream, "share")
-        git(upstream, "branch", "copy", "main")
-        executor = FakeExecutor(gate=asyncio.Event())
-        pool, orchestrator, reporter, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job("a")]),
-            executor,
-            "share",
+    old_sha = add_commit(upstream, "older")
+    new_sha = add_commit(upstream, "newer")
+    executor = FakeExecutor(gate=asyncio.Event())
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job("a")]),
+        executor,
+        "stale",
+    )
+    try:
+        task = asyncio.create_task(
+            orchestrator.handle_change_event(
+                ChangeEvent(repo=project, branch="main", commit_sha=new_sha)
+            )
         )
-        try:
-            task = asyncio.create_task(
-                orchestrator.handle_change_event(
-                    ChangeEvent(repo=project, branch="main", commit_sha=sha)
-                )
-            )
-            await asyncio.wait_for(executor.started.wait(), timeout=10)
-            build2 = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="copy", commit_sha=sha)
-            )
-            assert executor.gate is not None
-            executor.gate.set()
-            build1 = await task
-            assert build1 is not None
-            assert build2 is not None
-            assert build1.id == build2.id
-            finished = [e for e in reporter.events if e[0] == "finished"]
-            assert len(finished) == 2  # one final status per context
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
-
-
-def test_stale_event_does_not_supersede_newer_build(
-    postgres_dsn: str, tmp_path: Path, upstream: Path
-) -> None:
-    async def run() -> None:
-        old_sha = add_commit(upstream, "older")
-        new_sha = add_commit(upstream, "newer")
-        executor = FakeExecutor(gate=asyncio.Event())
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job("a")]),
-            executor,
-            "stale",
+        await asyncio.wait_for(executor.started.wait(), timeout=10)
+        stale_build = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=old_sha)
         )
-        try:
-            task = asyncio.create_task(
-                orchestrator.handle_change_event(
-                    ChangeEvent(repo=project, branch="main", commit_sha=new_sha)
-                )
-            )
-            await asyncio.wait_for(executor.started.wait(), timeout=10)
-            stale_build = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=old_sha)
-            )
-            assert stale_build is not None
-            assert await build_status(pool, stale_build.id) == BuildStatus.CANCELLED
-            assert executor.gate is not None
-            executor.gate.set()
-            build = await task
-            assert build is not None
-            assert await build_status(pool, build.id) == BuildStatus.SUCCEEDED
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        assert stale_build is not None
+        assert await build_status(pool, stale_build.id) == BuildStatus.CANCELLED
+        assert executor.gate is not None
+        executor.gate.set()
+        build = await task
+        assert build is not None
+        assert await build_status(pool, build.id) == BuildStatus.SUCCEEDED
+    finally:
+        await pool.close()
 
 
-def test_eval_failure_cleans_cancel_events(
+async def test_eval_failure_cleans_cancel_events(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """A leaked cancel_events entry blocks restart/cancel forever."""
 
-    async def run() -> None:
-        sha = add_commit(upstream, "evf")
+    sha = add_commit(upstream, "evf")
 
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([], error=EvalError("boom")),
-            FakeExecutor(),
-            "evf",
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([], error=EvalError("boom")),
+        FakeExecutor(),
+        "evf",
+    )
+    try:
+        build = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha)
         )
-        try:
-            build = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=sha)
-            )
-            assert build is not None
-            assert orchestrator.cancel_events == {}
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        assert build is not None
+        assert orchestrator.cancel_events == {}
+    finally:
+        await pool.close()
 
 
-def test_eval_settings_wired(
+async def test_eval_settings_wired(
     postgres_dsn: str,
     tmp_path: Path,
     upstream: Path,
@@ -1038,864 +977,781 @@ def test_eval_settings_wired(
         lambda: EvalWorkerConfig(count=3, max_memory_mib=1234),
     )
 
-    async def run() -> None:
-        sha = add_commit(upstream, "setw")
-        eval_runner = FakeEvalRunner([mk_job("a")])
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn, tmp_path, upstream, eval_runner, FakeExecutor(), "setw"
+    sha = add_commit(upstream, "setw")
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn, tmp_path, upstream, eval_runner, FakeExecutor(), "setw"
+    )
+    netrc = tmp_path / "netrc"
+    netrc.write_text("")
+    try:
+        await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha),
+            FetchCredentials(netrc_file=netrc),
         )
-        netrc = tmp_path / "netrc"
-        netrc.write_text("")
-        try:
-            await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=sha),
-                FetchCredentials(netrc_file=netrc),
-            )
-            settings = eval_runner.last_settings
-            assert settings is not None
-            assert settings.worker_count == 3
-            # Auto-sized workers carry the computed per-worker memory
-            # limit, capped by the configured ceiling.
-            assert settings.max_memory_size_mib == min(
-                orchestrator.config.eval_max_memory_size, 1234
-            )
-            assert settings.netrc_file == netrc
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        settings = eval_runner.last_settings
+        assert settings is not None
+        assert settings.worker_count == 3
+        # Auto-sized workers carry the computed per-worker memory
+        # limit, capped by the configured ceiling.
+        assert settings.max_memory_size_mib == min(
+            orchestrator.config.eval_max_memory_size, 1234
+        )
+        assert settings.netrc_file == netrc
+    finally:
+        await pool.close()
 
 
-def test_eval_netrc_withheld_from_pr_with_instance_wide_creds(
+async def test_eval_netrc_withheld_from_pr_with_instance_wide_creds(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """PR-controlled eval fetches arbitrary flake inputs with the
     netrc; an instance-wide Gitea/GitLab token must not reach it.
     Repo-scoped GitHub tokens may."""
 
-    async def run() -> None:
-        git(upstream, "checkout", "-b", "prsrc")
-        pr_sha = add_commit(upstream, "prnetrc")
-        git(upstream, "update-ref", "refs/pull/9/head", pr_sha)
-        pr_sha2 = add_commit(upstream, "prnetrc2")
-        git(upstream, "update-ref", "refs/pull/9/head", pr_sha2)
-        git(upstream, "checkout", "main")
-        git(upstream, "branch", "-D", "prsrc")
+    git(upstream, "checkout", "-b", "prsrc")
+    pr_sha = add_commit(upstream, "prnetrc")
+    git(upstream, "update-ref", "refs/pull/9/head", pr_sha)
+    pr_sha2 = add_commit(upstream, "prnetrc2")
+    git(upstream, "update-ref", "refs/pull/9/head", pr_sha2)
+    git(upstream, "checkout", "main")
+    git(upstream, "branch", "-D", "prsrc")
 
-        eval_runner = FakeEvalRunner([mk_job("a")])
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn, tmp_path, upstream, eval_runner, FakeExecutor(), "prnetrc"
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn, tmp_path, upstream, eval_runner, FakeExecutor(), "prnetrc"
+    )
+    netrc = tmp_path / "netrc"
+    netrc.write_text("")
+    try:
+        await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=pr_sha, pr_number=9),
+            FetchCredentials(netrc_file=netrc),
         )
-        netrc = tmp_path / "netrc"
-        netrc.write_text("")
-        try:
-            await orchestrator.handle_change_event(
-                ChangeEvent(
-                    repo=project, branch="main", commit_sha=pr_sha, pr_number=9
-                ),
-                FetchCredentials(netrc_file=netrc),
-            )
-            assert eval_runner.last_settings is not None
-            assert eval_runner.last_settings.netrc_file is None
+        assert eval_runner.last_settings is not None
+        assert eval_runner.last_settings.netrc_file is None
 
-            await orchestrator.handle_change_event(
-                ChangeEvent(
-                    repo=project, branch="main", commit_sha=pr_sha2, pr_number=9
-                ),
-                FetchCredentials(netrc_file=netrc, repo_scoped=True),
-            )
-            assert eval_runner.last_settings.netrc_file == netrc
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=pr_sha2, pr_number=9),
+            FetchCredentials(netrc_file=netrc, repo_scoped=True),
+        )
+        assert eval_runner.last_settings.netrc_file == netrc
+    finally:
+        await pool.close()
 
 
-def test_eval_gcroots_dir_removed_after_build(
+async def test_eval_gcroots_dir_removed_after_build(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
-    async def run() -> None:
-        add_commit(upstream, "gcr")
-        build, _, pool = await run_event(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job("a")]),
-            FakeExecutor(),
-        )
-        try:
-            assert build is not None
-            assert not (tmp_path / "state" / "eval-gcroots" / str(build.id)).exists()
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+    add_commit(upstream, "gcr")
+    build, _, pool = await run_event(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job("a")]),
+        FakeExecutor(),
+    )
+    try:
+        assert build is not None
+        assert not (tmp_path / "state" / "eval-gcroots" / str(build.id)).exists()
+    finally:
+        await pool.close()
 
 
-def test_effects_run_after_default_branch_success(
+async def test_effects_run_after_default_branch_success(
     postgres_dsn: str, tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def run() -> None:
-        add_commit(upstream, "eff")
-        build, _, _, pool, ran = await run_effect_build(
-            postgres_dsn, tmp_path, upstream, monkeypatch
+    add_commit(upstream, "eff")
+    build, _, _, pool, ran = await run_effect_build(
+        postgres_dsn, tmp_path, upstream, monkeypatch
+    )
+    try:
+        assert build is not None
+        assert ran == ["deploy"]
+        started = await pool.fetchval(
+            "SELECT effects_started FROM builds WHERE id = $1", build.id
         )
-        try:
-            assert build is not None
-            assert ran == ["deploy"]
-            started = await pool.fetchval(
-                "SELECT effects_started FROM builds WHERE id = $1", build.id
-            )
-            assert started is True
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        assert started is True
+    finally:
+        await pool.close()
 
 
-def test_pr_worktree_config_cannot_grant_effects(
+async def test_pr_worktree_config_cannot_grant_effects(
     postgres_dsn: str, tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The effects-gating config must come from the default branch, not
     the PR's merged tree: a PR adding effects_on_pull_requests = true
     to nixbot.toml must not grant itself effects."""
 
-    async def run() -> None:
-        git(upstream, "checkout", "-b", "pr")
-        (upstream / "nixbot.toml").write_text("effects_on_pull_requests = true\n")
-        git(upstream, "add", ".")
-        git(upstream, "commit", "-m", "grant myself effects")
-        head = git(upstream, "rev-parse", "HEAD")
-        git(upstream, "checkout", "main")
-        base = git(upstream, "rev-parse", "HEAD")
+    git(upstream, "checkout", "-b", "pr")
+    (upstream / "nixbot.toml").write_text("effects_on_pull_requests = true\n")
+    git(upstream, "add", ".")
+    git(upstream, "commit", "-m", "grant myself effects")
+    head = git(upstream, "rev-parse", "HEAD")
+    git(upstream, "checkout", "main")
+    base = git(upstream, "rev-parse", "HEAD")
 
-        ran = patch_effects(monkeypatch)
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job("a")]),
-            FakeExecutor(),
-            name="pr-grant",
+    ran = patch_effects(monkeypatch)
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job("a")]),
+        FakeExecutor(),
+        name="pr-grant",
+    )
+    try:
+        build = await orchestrator.handle_change_event(
+            ChangeEvent(
+                repo=project,
+                branch="main",  # PR base ref, as webhooks report it
+                commit_sha=head,
+                pr_number=9,
+                base_sha=base,
+            )
         )
-        try:
-            build = await orchestrator.handle_change_event(
-                ChangeEvent(
-                    repo=project,
-                    branch="main",  # PR base ref, as webhooks report it
-                    commit_sha=head,
-                    pr_number=9,
-                    base_sha=base,
-                )
-            )
-            assert build is not None
-            await drain_effect_items(orchestrator, project, pool)
-            assert ran == []
-            assert not await pool.fetchval(
-                "SELECT effects_started FROM builds WHERE id = $1", build.id
-            )
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        assert build is not None
+        await drain_effect_items(orchestrator, project, pool)
+        assert ran == []
+        assert not await pool.fetchval(
+            "SELECT effects_started FROM builds WHERE id = $1", build.id
+        )
+    finally:
+        await pool.close()
 
 
-def test_rerun_effects_runs_effects_again(
+async def test_rerun_effects_runs_effects_again(
     postgres_dsn: str, tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Effects-only restart: re-runs effects from a fresh worktree
     without touching the build's attributes."""
 
-    async def run() -> None:
-        add_commit(upstream, "eff2")
-        build, orchestrator, project, pool, ran = await run_effect_build(
-            postgres_dsn, tmp_path, upstream, monkeypatch
+    add_commit(upstream, "eff2")
+    build, orchestrator, project, pool, ran = await run_effect_build(
+        postgres_dsn, tmp_path, upstream, monkeypatch
+    )
+    try:
+        assert build is not None
+        assert ran == ["deploy"]
+        attrs_before = await pool.fetch(
+            "SELECT attr, status, finished_at FROM build_attributes "
+            "WHERE build_id = $1",
+            build.id,
         )
-        try:
-            assert build is not None
-            assert ran == ["deploy"]
-            attrs_before = await pool.fetch(
-                "SELECT attr, status, finished_at FROM build_attributes "
-                "WHERE build_id = $1",
-                build.id,
-            )
-            # A stale row from an effect no longer in the flake.
-            await pool.execute(
-                "INSERT INTO build_effects (build_id, name, status) "
-                "VALUES ($1, 'removed', 'failed')",
-                build.id,
-            )
-            await orchestrator.rerun_effects(project, build)
-            await drain_effect_items(orchestrator, project, pool)
-            assert ran == ["deploy", "deploy"]
-            # Restarts must queue a schedule refresh too.
-            assert await pool.fetchval(
-                "SELECT count(*) FROM work_queue WHERE kind = 'refresh-schedules'"
-            )
-            rows = await pool.fetch(
-                "SELECT name, status FROM build_effects WHERE build_id = $1",
-                build.id,
-            )
-            assert [(r["name"], r["status"]) for r in rows] == [("deploy", "succeeded")]
-            attrs_after = await pool.fetch(
-                "SELECT attr, status, finished_at FROM build_attributes "
-                "WHERE build_id = $1",
-                build.id,
-            )
-            assert attrs_before == attrs_after
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        # A stale row from an effect no longer in the flake.
+        await pool.execute(
+            "INSERT INTO build_effects (build_id, name, status) "
+            "VALUES ($1, 'removed', 'failed')",
+            build.id,
+        )
+        await orchestrator.rerun_effects(project, build)
+        await drain_effect_items(orchestrator, project, pool)
+        assert ran == ["deploy", "deploy"]
+        # Restarts must queue a schedule refresh too.
+        assert await pool.fetchval(
+            "SELECT count(*) FROM work_queue WHERE kind = 'refresh-schedules'"
+        )
+        rows = await pool.fetch(
+            "SELECT name, status FROM build_effects WHERE build_id = $1",
+            build.id,
+        )
+        assert [(r["name"], r["status"]) for r in rows] == [("deploy", "succeeded")]
+        attrs_after = await pool.fetch(
+            "SELECT attr, status, finished_at FROM build_attributes "
+            "WHERE build_id = $1",
+            build.id,
+        )
+        assert attrs_before == attrs_after
+    finally:
+        await pool.close()
 
 
-def test_recovery_rerun_runs_effects(
+async def test_recovery_rerun_runs_effects(
     postgres_dsn: str, tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A build recovered after a crash that happened before effects
     started must still run them on success."""
 
-    async def run() -> None:
-        add_commit(upstream, "rec")
-        build, orchestrator, project, pool, ran = await run_effect_build(
-            postgres_dsn, tmp_path, upstream, monkeypatch
+    add_commit(upstream, "rec")
+    build, orchestrator, project, pool, ran = await run_effect_build(
+        postgres_dsn, tmp_path, upstream, monkeypatch
+    )
+    try:
+        assert build is not None
+        assert ran == ["deploy"]
+        # Simulate a crash before effects started.
+        await pool.execute(
+            "UPDATE builds SET effects_started = FALSE WHERE id = $1", build.id
         )
-        try:
-            assert build is not None
-            assert ran == ["deploy"]
-            # Simulate a crash before effects started.
-            await pool.execute(
-                "UPDATE builds SET effects_started = FALSE WHERE id = $1", build.id
-            )
-            await pool.execute(
-                "UPDATE build_attributes SET status = 'pending' WHERE build_id = $1",
-                build.id,
-            )
-            await orchestrator.rerun_pending_attributes(project, build, [mk_job("a")])
-            await drain_effect_items(orchestrator, project, pool)
-            assert ran == ["deploy", "deploy"]
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        await pool.execute(
+            "UPDATE build_attributes SET status = 'pending' WHERE build_id = $1",
+            build.id,
+        )
+        await orchestrator.rerun_pending_attributes(project, build, [mk_job("a")])
+        await drain_effect_items(orchestrator, project, pool)
+        assert ran == ["deploy", "deploy"]
+    finally:
+        await pool.close()
 
 
-def test_unsupported_system_attr_does_not_block_aggregation(
+async def test_unsupported_system_attr_does_not_block_aggregation(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """The scheduler drops unsupported systems; a pending row for them
     would keep the build non-terminal forever."""
 
-    async def run() -> None:
-        add_commit(upstream, "sys")
-        jobs = [mk_job("a"), mk_job("other", system="riscv64-linux")]
-        build, _, pool = await run_event(
-            postgres_dsn, tmp_path, upstream, FakeEvalRunner(jobs), FakeExecutor()
+    add_commit(upstream, "sys")
+    jobs = [mk_job("a"), mk_job("other", system="riscv64-linux")]
+    build, _, pool = await run_event(
+        postgres_dsn, tmp_path, upstream, FakeEvalRunner(jobs), FakeExecutor()
+    )
+    try:
+        assert build is not None
+        assert await build_status(pool, build.id) == BuildStatus.SUCCEEDED
+        attrs = await pool.fetch(
+            "SELECT attr, status FROM build_attributes WHERE build_id = $1",
+            build.id,
         )
-        try:
-            assert build is not None
-            assert await build_status(pool, build.id) == BuildStatus.SUCCEEDED
-            attrs = await pool.fetch(
-                "SELECT attr, status FROM build_attributes WHERE build_id = $1",
-                build.id,
-            )
-            assert {r["attr"]: r["status"] for r in attrs} == {"a": "succeeded"}
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        assert {r["attr"]: r["status"] for r in attrs} == {"a": "succeeded"}
+    finally:
+        await pool.close()
 
 
-def test_linked_context_reported_on_eval_failure(
+async def test_linked_context_reported_on_eval_failure(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
-    async def run() -> None:
-        sha = add_commit(upstream, "lef")
-        git(upstream, "branch", "lef-copy", "main")
+    sha = add_commit(upstream, "lef")
+    git(upstream, "branch", "lef-copy", "main")
 
-        eval_runner = FakeEvalRunner([], block=asyncio.Event(), error=EvalError("boom"))
-        pool, orchestrator, reporter, project = await make_env(
-            postgres_dsn, tmp_path, upstream, eval_runner, FakeExecutor(), "lef"
+    eval_runner = FakeEvalRunner([], block=asyncio.Event(), error=EvalError("boom"))
+    pool, orchestrator, reporter, project = await make_env(
+        postgres_dsn, tmp_path, upstream, eval_runner, FakeExecutor(), "lef"
+    )
+    try:
+        task = asyncio.create_task(
+            orchestrator.handle_change_event(
+                ChangeEvent(repo=project, branch="main", commit_sha=sha)
+            )
         )
-        try:
-            task = asyncio.create_task(
-                orchestrator.handle_change_event(
-                    ChangeEvent(repo=project, branch="main", commit_sha=sha)
-                )
-            )
-            await asyncio.wait_for(eval_runner.started.wait(), timeout=10)
-            build2 = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="lef-copy", commit_sha=sha)
-            )
-            assert eval_runner.block is not None
-            eval_runner.block.set()
-            build1 = await task
-            assert build1 is not None
-            assert build2 is not None
-            assert build1.id == build2.id
-            finished = [e for e in reporter.events if e[0] == "finished"]
-            assert len(finished) == 2
-            assert all(e[2] == BuildStatus.FAILED for e in finished)
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        await asyncio.wait_for(eval_runner.started.wait(), timeout=10)
+        build2 = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="lef-copy", commit_sha=sha)
+        )
+        assert eval_runner.block is not None
+        eval_runner.block.set()
+        build1 = await task
+        assert build1 is not None
+        assert build2 is not None
+        assert build1.id == build2.id
+        finished = [e for e in reporter.events if e[0] == "finished"]
+        assert len(finished) == 2
+        assert all(e[2] == BuildStatus.FAILED for e in finished)
+    finally:
+        await pool.close()
 
 
-def test_eval_failure_settles_streamed_attributes(
+async def test_eval_failure_settles_streamed_attributes(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     # Eval streams a batch (rows recorded as pending), then fails:
     # the rows must not stay pending/building on the failed build.
-    def _test() -> None:
-        async def run() -> None:
-            sha = add_commit(upstream, "evstream")
+    sha = add_commit(upstream, "evstream")
 
-            pool, orchestrator, _, project = await make_env(
-                postgres_dsn,
-                tmp_path,
-                upstream,
-                FakeEvalRunner(
-                    [mk_job("streamed")],
-                    error=EvalError("boom after streaming"),
-                    stream_jobs=True,
-                ),
-                FakeExecutor(),
-                "evstream",
-            )
-            try:
-                build = await orchestrator.handle_change_event(
-                    ChangeEvent(repo=project, branch="main", commit_sha=sha)
-                )
-                assert build is not None
-                assert await build_status(pool, build.id) == BuildStatus.FAILED
-                rows = await pool.fetch(
-                    "SELECT attr, status FROM build_attributes WHERE build_id = $1",
-                    build.id,
-                )
-                assert {r["attr"]: r["status"] for r in rows} == {
-                    "streamed": "cancelled"
-                }
-            finally:
-                await pool.close()
-
-        asyncio.run(run())
-
-    _test()
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner(
+            [mk_job("streamed")],
+            error=EvalError("boom after streaming"),
+            stream_jobs=True,
+        ),
+        FakeExecutor(),
+        "evstream",
+    )
+    try:
+        build = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha)
+        )
+        assert build is not None
+        assert await build_status(pool, build.id) == BuildStatus.FAILED
+        rows = await pool.fetch(
+            "SELECT attr, status FROM build_attributes WHERE build_id = $1",
+            build.id,
+        )
+        assert {r["attr"]: r["status"] for r in rows} == {"streamed": "cancelled"}
+    finally:
+        await pool.close()
 
 
-def test_effect_rows_roundtrip(postgres_dsn: str, tmp_path: Path) -> None:
+async def test_effect_rows_roundtrip(postgres_dsn: str, tmp_path: Path) -> None:
     """Start, finish and rerun-reset of effect rows."""
 
-    async def run() -> None:
-        async with db_pool(postgres_dsn) as pool:
-            db = BuildDB(pool)
-            project = await make_project(pool, name="fx")
-            build, _ = await db.get_or_create_build(
-                project.id, "tree-fx", "sha", "main"
-            )
+    async with db_pool(postgres_dsn) as pool:
+        db = BuildDB(pool)
+        project = await make_project(pool, name="fx")
+        build, _ = await db.get_or_create_build(project.id, "tree-fx", "sha", "main")
 
-            await db.start_effect(build.id, "deploy")
-            await db.finish_effect(
-                build.id,
-                "deploy",
-                success=False,
-                error="ssh: connection refused",
-                log_path="logs/1/effect-deploy.zst",
-                log_size=123,
-            )
-            effects = await db.effects_for_build(build.id)
-            assert [(e["name"], e["status"], e["error"]) for e in effects] == [
-                ("deploy", "failed", "ssh: connection refused")
-            ]
-            assert effects[0]["finished_at"] is not None
+        await db.start_effect(build.id, "deploy")
+        await db.finish_effect(
+            build.id,
+            "deploy",
+            success=False,
+            error="ssh: connection refused",
+            log_path="logs/1/effect-deploy.zst",
+            log_size=123,
+        )
+        effects = await db.effects_for_build(build.id)
+        assert [(e["name"], e["status"], e["error"]) for e in effects] == [
+            ("deploy", "failed", "ssh: connection refused")
+        ]
+        assert effects[0]["finished_at"] is not None
 
-            # A rerun resets the row to running with fresh timestamps.
-            await db.start_effect(build.id, "deploy")
-            effects = await db.effects_for_build(build.id)
-            assert effects[0]["status"] == "running"
-            assert effects[0]["finished_at"] is None
-            assert effects[0]["error"] is None
-
-    asyncio.run(run())
+        # A rerun resets the row to running with fresh timestamps.
+        await db.start_effect(build.id, "deploy")
+        effects = await db.effects_for_build(build.id)
+        assert effects[0]["status"] == "running"
+        assert effects[0]["finished_at"] is None
+        assert effects[0]["error"] is None
 
 
-def test_effect_items_resume_only_pending(
+async def test_effect_items_resume_only_pending(
     postgres_dsn: str, tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """After a crash, pending effects re-run via their queued items;
     a row caught mid-run (swept to failed) must not re-deploy."""
 
-    async def run() -> None:
-        add_commit(upstream, "eff-resume")
-        build, orchestrator, project, pool, ran = await run_effect_build(
-            postgres_dsn, tmp_path, upstream, monkeypatch
+    add_commit(upstream, "eff-resume")
+    build, orchestrator, project, pool, ran = await run_effect_build(
+        postgres_dsn, tmp_path, upstream, monkeypatch
+    )
+    try:
+        assert build is not None
+        assert ran == ["deploy"]
+        # Crash mid-run: the sweep settles the row; the requeued
+        # item must skip it.
+        await pool.execute(
+            "UPDATE build_effects SET status = 'running' WHERE build_id = $1",
+            build.id,
         )
-        try:
-            assert build is not None
-            assert ran == ["deploy"]
-            # Crash mid-run: the sweep settles the row; the requeued
-            # item must skip it.
-            await pool.execute(
-                "UPDATE build_effects SET status = 'running' WHERE build_id = $1",
-                build.id,
-            )
-            await fail_interrupted_effects(
-                pool, datetime.now(UTC) + timedelta(minutes=1)
-            )
-            await orchestrator.run_effect_item(project, build, "deploy")
-            assert ran == ["deploy"]
-            # Crash before the run: the pending row resumes.
-            await pool.execute(
-                "UPDATE build_effects SET status = 'pending' WHERE build_id = $1",
-                build.id,
-            )
-            await orchestrator.run_effect_item(project, build, "deploy")
-            assert ran == ["deploy", "deploy"]
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        await fail_interrupted_effects(pool, datetime.now(UTC) + timedelta(minutes=1))
+        await orchestrator.run_effect_item(project, build, "deploy")
+        assert ran == ["deploy"]
+        # Crash before the run: the pending row resumes.
+        await pool.execute(
+            "UPDATE build_effects SET status = 'pending' WHERE build_id = $1",
+            build.id,
+        )
+        await orchestrator.run_effect_item(project, build, "deploy")
+        assert ran == ["deploy", "deploy"]
+    finally:
+        await pool.close()
 
 
-def test_effect_crash_settles_the_row(
+async def test_effect_crash_settles_the_row(
     postgres_dsn: str, tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An unexpected exception inside an effect run must not leave the
     row running: nothing re-runs effects, so it would stick until the
     next service restart."""
 
-    async def run() -> None:
-        async def broken_run(ctx: object, name: str, log_write: object = None) -> bool:
-            msg = "unexpected"
-            raise RuntimeError(msg)
+    async def broken_run(ctx: object, name: str, log_write: object = None) -> bool:
+        msg = "unexpected"
+        raise RuntimeError(msg)
 
-        patch_effects(monkeypatch, run_effect=broken_run)
-        add_commit(upstream, "eff-crash")
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job("a")]),
-            FakeExecutor(),
-            name="eff-crash",
+    patch_effects(monkeypatch, run_effect=broken_run)
+    add_commit(upstream, "eff-crash")
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job("a")]),
+        FakeExecutor(),
+        name="eff-crash",
+    )
+    event = ChangeEvent(
+        repo=project,
+        branch="main",
+        commit_sha=git(upstream, "rev-parse", "HEAD"),
+    )
+    build = await orchestrator.handle_change_event(event)
+    await drain_effect_items(orchestrator, project, pool)
+    try:
+        assert build is not None
+        row = await pool.fetchrow(
+            "SELECT status, finished_at FROM build_effects WHERE build_id = $1",
+            build.id,
         )
-        event = ChangeEvent(
-            repo=project,
-            branch="main",
-            commit_sha=git(upstream, "rev-parse", "HEAD"),
-        )
-        build = await orchestrator.handle_change_event(event)
-        await drain_effect_items(orchestrator, project, pool)
-        try:
-            assert build is not None
-            row = await pool.fetchrow(
-                "SELECT status, finished_at FROM build_effects WHERE build_id = $1",
-                build.id,
-            )
-            assert row is not None
-            assert row["status"] == "failed"
-            assert row["finished_at"] is not None
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        assert row is not None
+        assert row["status"] == "failed"
+        assert row["finished_at"] is not None
+    finally:
+        await pool.close()
 
 
-def test_post_process_error_does_not_wedge_build(
+async def test_post_process_error_does_not_wedge_build(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """A gcroot/outputs failure after the attributes settled must not
     leave the build stuck in 'building' without a final status."""
 
-    async def run() -> None:
-        add_commit(upstream, "pp-err")
-        eval_runner = FakeEvalRunner(
-            [mk_job("a", cache_status=CacheStatus.local, out="/nix/store/a-out")]
-        )
-        executor = FakeExecutor()
-        pool, orchestrator, reporter, project = await make_env(
-            postgres_dsn, tmp_path, upstream, eval_runner, executor, name="pp-err"
-        )
+    add_commit(upstream, "pp-err")
+    eval_runner = FakeEvalRunner(
+        [mk_job("a", cache_status=CacheStatus.local, out="/nix/store/a-out")]
+    )
+    executor = FakeExecutor()
+    pool, orchestrator, reporter, project = await make_env(
+        postgres_dsn, tmp_path, upstream, eval_runner, executor, name="pp-err"
+    )
 
-        async def boom(gcroots_dir: Path, proj: str, attr: str, out: str) -> None:
-            msg = "disk full"
-            raise OSError(msg)
+    async def boom(gcroots_dir: Path, proj: str, attr: str, out: str) -> None:
+        msg = "disk full"
+        raise OSError(msg)
 
-        orchestrator.register_gcroot = boom
-        try:
-            build = await orchestrator.handle_change_event(
-                ChangeEvent(
-                    repo=project,
-                    branch="main",
-                    commit_sha=git(upstream, "rev-parse", "HEAD"),
-                )
+    orchestrator.register_gcroot = boom
+    try:
+        build = await orchestrator.handle_change_event(
+            ChangeEvent(
+                repo=project,
+                branch="main",
+                commit_sha=git(upstream, "rev-parse", "HEAD"),
             )
-            assert build is not None
-            row = await pool.fetchrow(
-                "SELECT status, error FROM builds WHERE id = $1", build.id
-            )
-            assert row["status"] == BuildStatus.FAILED
-            assert "disk full" in row["error"]
-            finished = [e for e in reporter.events if e[0] == "finished"]
-            assert finished
-            assert finished[-1][2] == BuildStatus.FAILED
-            # The eval succeeded; only the build may turn red.
-            assert ("eval", build.id, False, ()) not in reporter.events
-        finally:
-            await pool.close()
+        )
+        assert build is not None
+        row = await pool.fetchrow(
+            "SELECT status, error FROM builds WHERE id = $1", build.id
+        )
+        assert row["status"] == BuildStatus.FAILED
+        assert "disk full" in row["error"]
+        finished = [e for e in reporter.events if e[0] == "finished"]
+        assert finished
+        assert finished[-1][2] == BuildStatus.FAILED
+        # The eval succeeded; only the build may turn red.
+        assert ("eval", build.id, False, ()) not in reporter.events
+    finally:
+        await pool.close()
 
-    asyncio.run(run())
 
-
-def test_unexpected_eval_path_error_settles_build(
+async def test_unexpected_eval_path_error_settles_build(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """Any exception on the eval path (not just EvalError) must settle
     the build as failed instead of wedging it in 'evaluating' and
     leaking the build task blocked on the jobs queue."""
 
-    async def run() -> None:
-        add_commit(upstream, "eval-boom")
-        pool, orchestrator, reporter, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([], error=RuntimeError("db outage")),
-            FakeExecutor(),
-            name="eval-boom",
+    add_commit(upstream, "eval-boom")
+    pool, orchestrator, reporter, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([], error=RuntimeError("db outage")),
+        FakeExecutor(),
+        name="eval-boom",
+    )
+    try:
+        build = await orchestrator.handle_change_event(
+            ChangeEvent(
+                repo=project,
+                branch="main",
+                commit_sha=git(upstream, "rev-parse", "HEAD"),
+            )
         )
-        try:
-            build = await orchestrator.handle_change_event(
-                ChangeEvent(
-                    repo=project,
-                    branch="main",
-                    commit_sha=git(upstream, "rev-parse", "HEAD"),
-                )
-            )
-            assert build is not None
-            row = await pool.fetchrow(
-                "SELECT status, error FROM builds WHERE id = $1", build.id
-            )
-            assert row["status"] == BuildStatus.FAILED
-            assert "db outage" in row["error"]
-            assert ("eval", build.id, False, ()) in reporter.events
-            assert reporter.events[-1][2] == BuildStatus.FAILED
-            # No leaked consumer task blocked on the jobs queue.
-            leaked = [
-                t
-                for t in asyncio.all_tasks()
-                if t is not asyncio.current_task() and not t.done()
-            ]
-            assert leaked == []
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        assert build is not None
+        row = await pool.fetchrow(
+            "SELECT status, error FROM builds WHERE id = $1", build.id
+        )
+        assert row["status"] == BuildStatus.FAILED
+        assert "db outage" in row["error"]
+        assert ("eval", build.id, False, ()) in reporter.events
+        assert reporter.events[-1][2] == BuildStatus.FAILED
+        # No leaked consumer task blocked on the jobs queue.
+        leaked = [
+            t
+            for t in asyncio.all_tasks()
+            if t is not asyncio.current_task() and not t.done()
+        ]
+        assert leaked == []
+    finally:
+        await pool.close()
 
 
-def test_reuse_empty_succeeded_build_posts_eval_success(
+async def test_reuse_empty_succeeded_build_posts_eval_success(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """Reusing a genuinely empty-but-green build must not report
     'evaluation failed' on the new commit."""
 
-    async def run() -> None:
-        add_commit(upstream, "empty-green")
-        eval_runner = FakeEvalRunner([])
-        executor = FakeExecutor()
-        pool, orchestrator, reporter, project = await make_env(
-            postgres_dsn, tmp_path, upstream, eval_runner, executor, name="empty-green"
+    add_commit(upstream, "empty-green")
+    eval_runner = FakeEvalRunner([])
+    executor = FakeExecutor()
+    pool, orchestrator, reporter, project = await make_env(
+        postgres_dsn, tmp_path, upstream, eval_runner, executor, name="empty-green"
+    )
+    try:
+        sha = git(upstream, "rev-parse", "HEAD")
+        build1 = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha)
         )
-        try:
-            sha = git(upstream, "rev-parse", "HEAD")
-            build1 = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=sha)
-            )
-            assert build1 is not None
-            assert await build_status(pool, build1.id) == BuildStatus.SUCCEEDED
-            build2 = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=3)
-            )
-            assert build2 is not None
-            assert build2.id == build1.id
-            evals = [e for e in reporter.events if e[0] == "eval"]
-            assert evals[-1][2] is True
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        assert build1 is not None
+        assert await build_status(pool, build1.id) == BuildStatus.SUCCEEDED
+        build2 = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=3)
+        )
+        assert build2 is not None
+        assert build2.id == build1.id
+        evals = [e for e in reporter.events if e[0] == "eval"]
+        assert evals[-1][2] is True
+    finally:
+        await pool.close()
 
 
-def test_stale_event_reusing_old_build_does_not_cancel_newer(
+async def test_stale_event_reusing_old_build_does_not_cancel_newer(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """A redelivered push event for an ancestor commit whose tree
     matches an old terminal build must not supersede the in-flight
     newer build."""
 
-    async def run() -> None:
-        sha1 = add_commit(upstream, "stale-1")
-        eval_runner1 = FakeEvalRunner([mk_job("a")])
-        executor = FakeExecutor()
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn, tmp_path, upstream, eval_runner1, executor, name="stale"
+    sha1 = add_commit(upstream, "stale-1")
+    eval_runner1 = FakeEvalRunner([mk_job("a")])
+    executor = FakeExecutor()
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn, tmp_path, upstream, eval_runner1, executor, name="stale"
+    )
+    try:
+        build1 = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha1)
         )
-        try:
-            build1 = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=sha1)
+        assert build1 is not None
+        sha2 = add_commit(upstream, "stale-2")
+        eval_runner2 = FakeEvalRunner([mk_job("a")], block=asyncio.Event())
+        orchestrator.eval_runner = eval_runner2
+        task2 = asyncio.create_task(
+            orchestrator.handle_change_event(
+                ChangeEvent(repo=project, branch="main", commit_sha=sha2)
             )
-            assert build1 is not None
-            sha2 = add_commit(upstream, "stale-2")
-            eval_runner2 = FakeEvalRunner([mk_job("a")], block=asyncio.Event())
-            orchestrator.eval_runner = eval_runner2
-            task2 = asyncio.create_task(
-                orchestrator.handle_change_event(
-                    ChangeEvent(repo=project, branch="main", commit_sha=sha2)
-                )
-            )
-            await eval_runner2.started.wait()
-            await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=sha1)
-            )
-            assert eval_runner2.block is not None
-            eval_runner2.block.set()
-            build2 = await task2
-            assert build2 is not None
-            assert await build_status(pool, build2.id) == BuildStatus.SUCCEEDED
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        )
+        await eval_runner2.started.wait()
+        await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha1)
+        )
+        assert eval_runner2.block is not None
+        eval_runner2.block.set()
+        build2 = await task2
+        assert build2 is not None
+        assert await build_status(pool, build2.id) == BuildStatus.SUCCEEDED
+    finally:
+        await pool.close()
 
 
-def test_reuse_for_default_branch_push_runs_effects(
+async def test_reuse_for_default_branch_push_runs_effects(
     postgres_dsn: str, tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A main push reusing a succeeded PR build must still deploy:
     the PR run never started effects."""
 
-    async def run() -> None:
-        ran = patch_effects(monkeypatch)
-        add_commit(upstream, "reuse-deploy")
-        sha = git(upstream, "rev-parse", "HEAD")
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job("a")]),
-            FakeExecutor(),
-            name="reuse-deploy",
+    ran = patch_effects(monkeypatch)
+    add_commit(upstream, "reuse-deploy")
+    sha = git(upstream, "rev-parse", "HEAD")
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job("a")]),
+        FakeExecutor(),
+        name="reuse-deploy",
+    )
+    try:
+        pr_build = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=9)
         )
-        try:
-            pr_build = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=9)
-            )
-            assert pr_build is not None
-            await drain_effect_items(orchestrator, project, pool)
-            assert ran == []
-            main_build = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=sha)
-            )
-            assert main_build is not None
-            assert main_build.id == pr_build.id
-            await drain_effect_items(orchestrator, project, pool)
-            assert ran == ["deploy"]
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        assert pr_build is not None
+        await drain_effect_items(orchestrator, project, pool)
+        assert ran == []
+        main_build = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha)
+        )
+        assert main_build is not None
+        assert main_build.id == pr_build.id
+        await drain_effect_items(orchestrator, project, pool)
+        assert ran == ["deploy"]
+    finally:
+        await pool.close()
 
 
-def test_attach_to_already_terminal_build_replays_status(
+async def test_attach_to_already_terminal_build_replays_status(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """An event attaching to a build that turned terminal between the
     record fetch and the attach must get the final status replayed,
     not stay pending forever."""
 
-    async def run() -> None:
-        add_commit(upstream, "attach-late")
-        sha = git(upstream, "rev-parse", "HEAD")
-        pool, orchestrator, reporter, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job("a")]),
-            FakeExecutor(),
-            name="attach-late",
+    add_commit(upstream, "attach-late")
+    sha = git(upstream, "rev-parse", "HEAD")
+    pool, orchestrator, reporter, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job("a")]),
+        FakeExecutor(),
+        name="attach-late",
+    )
+    try:
+        build = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha)
         )
-        try:
-            build = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=sha)
-            )
-            assert build is not None
-            assert await build_status(pool, build.id) == BuildStatus.SUCCEEDED
-            # Simulate the race: record fetched before completion,
-            # cancel event still registered (build "in flight").
-            stale_record = replace(build, status=BuildStatus.BUILDING)
-            orchestrator.cancel_events[build.id] = asyncio.Event()
-            reporter.events.clear()
-            event2 = ChangeEvent(
-                repo=project, branch="main", commit_sha=sha, pr_number=11
-            )
-            await orchestrator._dispatch_build(  # noqa: SLF001
-                event2,
-                stale_record,
-                created=False,
-                tree_hash=build.tree_hash or "",
-                worktree_path=tmp_path,
-                credentials=None,
-            )
-            finished = [e for e in reporter.events if e[0] == "finished"]
-            assert finished
-            assert finished[-1][2] == BuildStatus.SUCCEEDED
-        finally:
-            orchestrator.cancel_events.clear()
-            await pool.close()
-
-    asyncio.run(run())
+        assert build is not None
+        assert await build_status(pool, build.id) == BuildStatus.SUCCEEDED
+        # Simulate the race: record fetched before completion,
+        # cancel event still registered (build "in flight").
+        stale_record = replace(build, status=BuildStatus.BUILDING)
+        orchestrator.cancel_events[build.id] = asyncio.Event()
+        reporter.events.clear()
+        event2 = ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=11)
+        await orchestrator._dispatch_build(  # noqa: SLF001
+            event2,
+            stale_record,
+            created=False,
+            tree_hash=build.tree_hash or "",
+            worktree_path=tmp_path,
+            credentials=None,
+        )
+        finished = [e for e in reporter.events if e[0] == "finished"]
+        assert finished
+        assert finished[-1][2] == BuildStatus.SUCCEEDED
+    finally:
+        orchestrator.cancel_events.clear()
+        await pool.close()
 
 
-def test_cancel_during_eval_resolves_linked_eval_contexts(
+async def test_cancel_during_eval_resolves_linked_eval_contexts(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """Cancelling a build mid-eval must resolve the nix-eval context of
     every linked event, not only the primary one."""
 
-    async def run() -> None:
-        add_commit(upstream, "linked-cancel")
-        sha = git(upstream, "rev-parse", "HEAD")
-        eval_runner = FakeEvalRunner([mk_job("a")], block=asyncio.Event())
-        pool, orchestrator, reporter, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            eval_runner,
-            FakeExecutor(),
-            name="linked-cancel",
+    add_commit(upstream, "linked-cancel")
+    sha = git(upstream, "rev-parse", "HEAD")
+    eval_runner = FakeEvalRunner([mk_job("a")], block=asyncio.Event())
+    pool, orchestrator, reporter, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        eval_runner,
+        FakeExecutor(),
+        name="linked-cancel",
+    )
+    try:
+        task1 = asyncio.create_task(
+            orchestrator.handle_change_event(
+                ChangeEvent(repo=project, branch="main", commit_sha=sha)
+            )
         )
-        try:
-            task1 = asyncio.create_task(
-                orchestrator.handle_change_event(
-                    ChangeEvent(repo=project, branch="main", commit_sha=sha)
-                )
-            )
-            await eval_runner.started.wait()
-            build2 = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=4)
-            )
-            assert build2 is not None
-            orchestrator.cancel_events[build2.id].set()
-            await task1
-            cancelled_evals = [e for e in reporter.events if e[0] == "eval-cancelled"]
-            assert len(cancelled_evals) == 2
-            finished = [e for e in reporter.events if e[0] == "finished"]
-            assert len(finished) == 2
-            assert all(e[2] == BuildStatus.CANCELLED for e in finished)
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        await eval_runner.started.wait()
+        build2 = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=4)
+        )
+        assert build2 is not None
+        orchestrator.cancel_events[build2.id].set()
+        await task1
+        cancelled_evals = [e for e in reporter.events if e[0] == "eval-cancelled"]
+        assert len(cancelled_evals) == 2
+        finished = [e for e in reporter.events if e[0] == "finished"]
+        assert len(finished) == 2
+        assert all(e[2] == BuildStatus.CANCELLED for e in finished)
+    finally:
+        await pool.close()
 
 
-def test_effect_log_does_not_collide_with_attribute_log(
+async def test_effect_log_does_not_collide_with_attribute_log(
     postgres_dsn: str, tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An attribute named "effect-deploy" and an effect named "deploy"
     must not share one log file."""
 
-    async def run() -> None:
-        patch_effects(monkeypatch)
-        add_commit(upstream, "log-collide")
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job("effect-deploy")]),
-            FakeExecutor(),
-            name="log-collide",
+    patch_effects(monkeypatch)
+    add_commit(upstream, "log-collide")
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job("effect-deploy")]),
+        FakeExecutor(),
+        name="log-collide",
+    )
+    try:
+        build = await orchestrator.handle_change_event(
+            ChangeEvent(
+                repo=project,
+                branch="main",
+                commit_sha=git(upstream, "rev-parse", "HEAD"),
+            )
         )
-        try:
-            build = await orchestrator.handle_change_event(
-                ChangeEvent(
-                    repo=project,
-                    branch="main",
-                    commit_sha=git(upstream, "rev-parse", "HEAD"),
-                )
-            )
-            assert build is not None
-            await drain_effect_items(orchestrator, project, pool)
-            attr_log = await pool.fetchval(
-                "SELECT l.path FROM logs l JOIN build_attributes a "
-                "ON l.attribute_id = a.id WHERE a.build_id = $1",
-                build.id,
-            )
-            effect_log = await pool.fetchval(
-                "SELECT log_path FROM build_effects WHERE build_id = $1",
-                build.id,
-            )
-            assert attr_log is not None
-            assert effect_log is not None
-            assert attr_log != effect_log
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        assert build is not None
+        await drain_effect_items(orchestrator, project, pool)
+        attr_log = await pool.fetchval(
+            "SELECT l.path FROM logs l JOIN build_attributes a "
+            "ON l.attribute_id = a.id WHERE a.build_id = $1",
+            build.id,
+        )
+        effect_log = await pool.fetchval(
+            "SELECT log_path FROM build_effects WHERE build_id = $1",
+            build.id,
+        )
+        assert attr_log is not None
+        assert effect_log is not None
+        assert attr_log != effect_log
+    finally:
+        await pool.close()
 
 
-def test_post_process_paths_are_forge_scoped(
+async def test_post_process_paths_are_forge_scoped(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """Gcroots and outputs for the same owner/repo on two forges must
     not collide; the forge belongs in both path schemes."""
 
-    async def run() -> None:
-        add_commit(upstream, "forge-scope")
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner(
-                [mk_job("a", cache_status=CacheStatus.local, out="/nix/store/a-out")]
-            ),
-            FakeExecutor(),
-            name="forge-scope",
-        )
-        gcroot_projects: list[str] = []
-        output_calls: list[tuple] = []
+    add_commit(upstream, "forge-scope")
+    pool, orchestrator, _, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner(
+            [mk_job("a", cache_status=CacheStatus.local, out="/nix/store/a-out")]
+        ),
+        FakeExecutor(),
+        name="forge-scope",
+    )
+    gcroot_projects: list[str] = []
+    output_calls: list[tuple] = []
 
-        async def capture_gcroot(
-            gcroots_dir: Path, proj: str, attr: str, out: str
-        ) -> None:
-            gcroot_projects.append(proj)
+    async def capture_gcroot(gcroots_dir: Path, proj: str, attr: str, out: str) -> None:
+        gcroot_projects.append(proj)
 
-        def capture_output(*args: object) -> Path:
-            output_calls.append(args)
-            return tmp_path / "out"
+    def capture_output(*args: object) -> Path:
+        output_calls.append(args)
+        return tmp_path / "out"
 
-        orchestrator.register_gcroot = capture_gcroot
-        orchestrator.write_output_path = capture_output
-        orchestrator.config.outputs_path = tmp_path / "outputs"
-        try:
-            build = await orchestrator.handle_change_event(
-                ChangeEvent(
-                    repo=project,
-                    branch="main",
-                    commit_sha=git(upstream, "rev-parse", "HEAD"),
-                )
+    orchestrator.register_gcroot = capture_gcroot
+    orchestrator.write_output_path = capture_output
+    orchestrator.config.outputs_path = tmp_path / "outputs"
+    try:
+        build = await orchestrator.handle_change_event(
+            ChangeEvent(
+                repo=project,
+                branch="main",
+                commit_sha=git(upstream, "rev-parse", "HEAD"),
             )
-            assert build is not None
-            assert gcroot_projects == [project.key]
-            assert output_calls
-            assert "github" in output_calls[0]
-        finally:
-            await pool.close()
+        )
+        assert build is not None
+        assert gcroot_projects == [project.key]
+        assert output_calls
+        assert "github" in output_calls[0]
+    finally:
+        await pool.close()
 
-    asyncio.run(run())
 
-
-def test_effects_phase_error_keeps_succeeded_build(
+async def test_effects_phase_error_keeps_succeeded_build(
     postgres_dsn: str, tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An exception after the final fan-out (effects discovery here)
@@ -1905,73 +1761,67 @@ def test_effects_phase_error_keeps_succeeded_build(
         msg = "state api down"
         raise RuntimeError(msg)
 
-    async def run() -> None:
-        monkeypatch.setattr(effects_run_mod, "list_effects", boom_list)
-        add_commit(upstream, "late-boom")
-        pool, orchestrator, reporter, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job("a")]),
-            FakeExecutor(),
-            name="late-boom",
-        )
-        try:
-            build = await orchestrator.handle_change_event(
-                ChangeEvent(
-                    repo=project,
-                    branch="main",
-                    commit_sha=git(upstream, "rev-parse", "HEAD"),
-                )
+    monkeypatch.setattr(effects_run_mod, "list_effects", boom_list)
+    add_commit(upstream, "late-boom")
+    pool, orchestrator, reporter, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job("a")]),
+        FakeExecutor(),
+        name="late-boom",
+    )
+    try:
+        build = await orchestrator.handle_change_event(
+            ChangeEvent(
+                repo=project,
+                branch="main",
+                commit_sha=git(upstream, "rev-parse", "HEAD"),
             )
-            assert build is not None
-            assert await build_status(pool, build.id) == BuildStatus.SUCCEEDED
-            finished = [e for e in reporter.events if e[0] == "finished"]
-            assert finished[-1][2] == BuildStatus.SUCCEEDED
-        finally:
-            await pool.close()
+        )
+        assert build is not None
+        assert await build_status(pool, build.id) == BuildStatus.SUCCEEDED
+        finished = [e for e in reporter.events if e[0] == "finished"]
+        assert finished[-1][2] == BuildStatus.SUCCEEDED
+    finally:
+        await pool.close()
 
-    asyncio.run(run())
 
-
-def test_reuse_post_process_error_still_reports_status(
+async def test_reuse_post_process_error_still_reports_status(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
     """A gcroot/outputs failure on the reuse path must not strand the
     new context without a final status (same wedge as in-build
     post-processing)."""
 
-    async def run() -> None:
-        add_commit(upstream, "reuse-pp-err")
-        sha = git(upstream, "rev-parse", "HEAD")
-        pool, orchestrator, reporter, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([mk_job("a")]),
-            FakeExecutor(),
-            name="reuse-pp-err",
+    add_commit(upstream, "reuse-pp-err")
+    sha = git(upstream, "rev-parse", "HEAD")
+    pool, orchestrator, reporter, project = await make_env(
+        postgres_dsn,
+        tmp_path,
+        upstream,
+        FakeEvalRunner([mk_job("a")]),
+        FakeExecutor(),
+        name="reuse-pp-err",
+    )
+    try:
+        build1 = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha)
         )
-        try:
-            build1 = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=sha)
-            )
-            assert build1 is not None
+        assert build1 is not None
 
-            async def boom(gcroots_dir: Path, proj: str, attr: str, out: str) -> None:
-                msg = "disk full"
-                raise OSError(msg)
+        async def boom(gcroots_dir: Path, proj: str, attr: str, out: str) -> None:
+            msg = "disk full"
+            raise OSError(msg)
 
-            orchestrator.register_gcroot = boom
-            reporter.events.clear()
-            build2 = await orchestrator.handle_change_event(
-                ChangeEvent(repo=project, branch="main", commit_sha=sha)
-            )
-            assert build2 is not None
-            finished = [e for e in reporter.events if e[0] == "finished"]
-            assert finished
-            assert finished[-1][2] == BuildStatus.SUCCEEDED
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
+        orchestrator.register_gcroot = boom
+        reporter.events.clear()
+        build2 = await orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha)
+        )
+        assert build2 is not None
+        finished = [e for e in reporter.events if e[0] == "finished"]
+        assert finished
+        assert finished[-1][2] == BuildStatus.SUCCEEDED
+    finally:
+        await pool.close()

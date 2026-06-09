@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import stat
 from typing import TYPE_CHECKING
@@ -138,8 +137,8 @@ def make_ctx(tmp_path: Path, secret_name: str | None = None) -> EffectsContext:
     )
 
 
-def test_list_effects(tmp_path: Path, fake_effects: Path) -> None:
-    effects = asyncio.run(list_effects(make_ctx(tmp_path)))
+async def test_list_effects(tmp_path: Path, fake_effects: Path) -> None:
+    effects = await list_effects(make_ctx(tmp_path))
     assert effects == ["deploy", "notify"]
     calls = (fake_effects / "calls").read_text()
     assert "--rev abc123" in calls
@@ -147,7 +146,7 @@ def test_list_effects(tmp_path: Path, fake_effects: Path) -> None:
     assert "--repo acme/widget" in calls
 
 
-def test_run_effect_with_secrets(
+async def test_run_effect_with_secrets(
     tmp_path: Path, fake_effects: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     creds = tmp_path / "creds"
@@ -161,7 +160,7 @@ def test_run_effect_with_secrets(
         chunks.append(data)
 
     ctx = make_ctx(tmp_path, secret_name="widget-secret")
-    ok = asyncio.run(run_effect(ctx, "deploy", log_write))
+    ok = await run_effect(ctx, "deploy", log_write)
     assert ok
     output = b"".join(chunks).decode()
     assert '{"token": "s3"}' in output  # secrets file content reached the CLI
@@ -172,7 +171,7 @@ def test_run_effect_with_secrets(
     assert not list(tmp_path.glob("*-secrets.json"))
 
 
-def test_run_effect_inherits_environment(
+async def test_run_effect_inherits_environment(
     tmp_path: Path, fake_effects: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Remote builders need $HOME for ~/.ssh; the service environment
@@ -183,47 +182,53 @@ def test_run_effect_inherits_environment(
     async def log_write(data: bytes) -> None:
         chunks.append(data)
 
-    ok = asyncio.run(run_effect(make_ctx(tmp_path), "deploy", log_write))
+    ok = await run_effect(make_ctx(tmp_path), "deploy", log_write)
     assert ok
     assert b"HOME=/var/lib/nixbot-test\n" in b"".join(chunks)
 
 
-def test_long_output_lines(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_long_output_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # A single output line larger than asyncio's 64 KiB StreamReader
     # default must not abort the run.
     install_fake_effects(
         tmp_path, monkeypatch, 'head -c 200000 /dev/zero | tr "\\0" x\necho\n'
     )
 
-    ok = asyncio.run(run_effect(make_ctx(tmp_path), "deploy"))
+    ok = await run_effect(make_ctx(tmp_path), "deploy")
     assert ok
 
 
-def test_timeout_kills_effect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_timeout_kills_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     install_fake_effects(tmp_path, monkeypatch, "sleep 60\n")
 
     ctx = make_ctx(tmp_path)
     ctx.timeout = 0.2
     with pytest.raises(EffectsError, match="timed out"):
-        asyncio.run(run_effect(ctx, "deploy"))
+        await run_effect(ctx, "deploy")
 
 
-def test_run_effect_extra_sandbox_paths(tmp_path: Path, fake_effects: Path) -> None:
+async def test_run_effect_extra_sandbox_paths(
+    tmp_path: Path, fake_effects: Path
+) -> None:
     ctx = make_ctx(tmp_path)
     ctx.extra_sandbox_paths = [tmp_path / "extra"]
-    asyncio.run(run_effect(ctx, "deploy"))
+    await run_effect(ctx, "deploy")
     calls = (fake_effects / "calls").read_text()
     assert f"--extra-sandbox-path {tmp_path / 'extra'}" in calls
 
 
-def test_run_effect_passes_task_flags(tmp_path: Path, fake_effects: Path) -> None:
+async def test_run_effect_passes_task_flags(tmp_path: Path, fake_effects: Path) -> None:
     ctx = make_ctx(tmp_path)
     ctx.default_branch = "main"
     ctx.git_token = "forge-tok"  # noqa: S105
     ctx.task_token = "task-tok"  # noqa: S105
     ctx.api_base_url = "https://ci.example"
     ctx.project_id = "42"
-    assert asyncio.run(run_effect(ctx, "deploy"))
+    assert await run_effect(ctx, "deploy")
     call = (tmp_path / "calls").read_text().splitlines()[-1]
     assert "--default-branch main" in call
     assert "--git-token-file" in call

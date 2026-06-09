@@ -3,7 +3,6 @@ eval fan-out, cached skip, failure aggregation."""
 
 from __future__ import annotations
 
-import asyncio
 import shutil
 import subprocess
 from typing import TYPE_CHECKING
@@ -107,21 +106,20 @@ def flake(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return path
 
 
-def run_pipeline(flake: Path, log_dir: Path) -> tuple[ScheduleResult, PipelineExecutor]:
-    async def run() -> tuple[ScheduleResult, PipelineExecutor]:
-        settings = EvalSettings(
-            gc_roots_dir=log_dir / "gcroots", sandbox=False, systemd_scope=False
-        )
-        eval_result = await EvalRunner().run(flake, BranchConfig(), settings)
-        executor = PipelineExecutor(flake, log_dir)
-        scheduler = JobScheduler(executor, [current_system()])
-        return await scheduler.run(eval_result.jobs), executor
+async def run_pipeline(
+    flake: Path, log_dir: Path
+) -> tuple[ScheduleResult, PipelineExecutor]:
+    settings = EvalSettings(
+        gc_roots_dir=log_dir / "gcroots", sandbox=False, systemd_scope=False
+    )
+    eval_result = await EvalRunner().run(flake, BranchConfig(), settings)
+    executor = PipelineExecutor(flake, log_dir)
+    scheduler = JobScheduler(executor, [current_system()])
+    return await scheduler.run(eval_result.jobs), executor
 
-    return asyncio.run(run())
 
-
-def test_full_pipeline(flake: Path, tmp_path: Path) -> None:
-    result, executor = run_pipeline(flake, tmp_path)
+async def test_full_pipeline(flake: Path, tmp_path: Path) -> None:
+    result, executor = await run_pipeline(flake, tmp_path)
     system = current_system()
     statuses = {r.attr: r.status for r in result.results}
 
@@ -163,10 +161,10 @@ def test_full_pipeline(flake: Path, tmp_path: Path) -> None:
     assert "deliberate eval failure" in (errors[f"{system}.evalfail"] or "")
 
 
-def test_cached_skip_on_second_run(flake: Path, tmp_path: Path) -> None:
+async def test_cached_skip_on_second_run(flake: Path, tmp_path: Path) -> None:
     # First run built base/dependent (test ordering within module);
     # a second eval marks them local and the scheduler skips them.
-    result, executor = run_pipeline(flake, tmp_path)
+    result, executor = await run_pipeline(flake, tmp_path)
     system = current_system()
     statuses = {r.attr: r.status for r in result.results}
     assert statuses[f"{system}.base"] == AttributeStatus.skipped_local

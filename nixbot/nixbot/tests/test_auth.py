@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlparse
@@ -165,7 +164,7 @@ def test_can_control_build() -> None:
     assert can_control_build(None, open_config)
 
 
-def test_oauth_login_flow() -> None:
+async def test_oauth_login_flow() -> None:
     provider = github_oauth("cid", "csecret")
     vault = DictVault()
 
@@ -196,67 +195,64 @@ def test_oauth_login_flow() -> None:
         )
     )
 
-    async def run() -> None:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="https://ci.test"
-        ) as client:
-            login = await client.get("/login/github")
-            assert login.status_code == 307
-            assert "github.com/login/oauth/authorize" in login.headers["location"]
-            assert "client_id=cid" in login.headers["location"]
-            state = parse_qs(urlparse(login.headers["location"]).query)["state"][0]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://ci.test"
+    ) as client:
+        login = await client.get("/login/github")
+        assert login.status_code == 307
+        assert "github.com/login/oauth/authorize" in login.headers["location"]
+        assert "client_id=cid" in login.headers["location"]
+        state = parse_qs(urlparse(login.headers["location"]).query)["state"][0]
 
-            callback = await client.get(
-                f"/auth/github/callback?code=thecode&state={state}",
-                headers=cookie_header({f"nixbot_oauth_state_{state}": state}),
-            )
-            assert callback.status_code == 307
-            session = callback.cookies[SESSION_COOKIE]
-            session_user = signer.user_from(session)
-            assert session_user is not None
-            assert session_user.qualified == ALICE.qualified
-            assert session_user.avatar_url == "https://avatars.test/alice"
-            # The forge token lives server-side; the cookie only carries
-            # an opaque session id.
-            payload = signer.verify(session)
-            assert payload is not None
-            assert "token" not in payload
-            session_id = signer.session_id_from(session)
-            assert session_id is not None
-            assert vault.tokens[session_id] == "at"
+        callback = await client.get(
+            f"/auth/github/callback?code=thecode&state={state}",
+            headers=cookie_header({f"nixbot_oauth_state_{state}": state}),
+        )
+        assert callback.status_code == 307
+        session = callback.cookies[SESSION_COOKIE]
+        session_user = signer.user_from(session)
+        assert session_user is not None
+        assert session_user.qualified == ALICE.qualified
+        assert session_user.avatar_url == "https://avatars.test/alice"
+        # The forge token lives server-side; the cookie only carries
+        # an opaque session id.
+        payload = signer.verify(session)
+        assert payload is not None
+        assert "token" not in payload
+        session_id = signer.session_id_from(session)
+        assert session_id is not None
+        assert vault.tokens[session_id] == "at"
 
-            # Bad state rejected.
-            bad = await client.get(
-                "/auth/github/callback?code=x&state=wrong",
-                headers=cookie_header({f"nixbot_oauth_state_{state}": state}),
-            )
-            assert bad.status_code == 403
+        # Bad state rejected.
+        bad = await client.get(
+            "/auth/github/callback?code=x&state=wrong",
+            headers=cookie_header({f"nixbot_oauth_state_{state}": state}),
+        )
+        assert bad.status_code == 403
 
-            # User cancelled on the authorize page: no code, error param.
-            cancelled = await client.get(
-                f"/auth/github/callback?error=access_denied&state={state}",
-                headers=cookie_header({f"nixbot_oauth_state_{state}": state}),
-            )
-            assert cancelled.status_code == 403
+        # User cancelled on the authorize page: no code, error param.
+        cancelled = await client.get(
+            f"/auth/github/callback?error=access_denied&state={state}",
+            headers=cookie_header({f"nixbot_oauth_state_{state}": state}),
+        )
+        assert cancelled.status_code == 403
 
-            # Logout requires same-origin (CSRF).
-            cross = await client.post(
-                "/logout", headers={"Origin": "https://evil.example.com"}
-            )
-            assert cross.status_code == 403
-            ok = await client.post(
-                "/logout",
-                headers={"Origin": "https://ci.test"}
-                | cookie_header({SESSION_COOKIE: session}),
-            )
-            assert ok.status_code == 303
-            # Logout invalidates the server-side forge token.
-            assert vault.tokens == {}
-
-    asyncio.run(run())
+        # Logout requires same-origin (CSRF).
+        cross = await client.post(
+            "/logout", headers={"Origin": "https://evil.example.com"}
+        )
+        assert cross.status_code == 403
+        ok = await client.post(
+            "/logout",
+            headers={"Origin": "https://ci.test"}
+            | cookie_header({SESSION_COOKIE: session}),
+        )
+        assert ok.status_code == 303
+        # Logout invalidates the server-side forge token.
+        assert vault.tokens == {}
 
 
-def test_forge_token_lifetime_capped_by_expires_in() -> None:
+async def test_forge_token_lifetime_capped_by_expires_in() -> None:
     """Gitea access tokens expire after ~1h while the session lives
     30 days; the stored forge token must expire with the token, not
     the session, so visibility falls back to public instead of
@@ -283,25 +279,22 @@ def test_forge_token_lifetime_capped_by_expires_in() -> None:
         )
     )
 
-    async def run() -> None:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="https://ci.test"
-        ) as client:
-            login = await client.get("/login/github")
-            state = parse_qs(urlparse(login.headers["location"]).query)["state"][0]
-            callback = await client.get(
-                f"/auth/github/callback?code=c&state={state}",
-                headers=cookie_header({f"nixbot_oauth_state_{state}": state}),
-            )
-            assert callback.status_code == 307
-            session_id = signer.session_id_from(callback.cookies[SESSION_COOKIE])
-            assert session_id is not None
-            assert vault.lifetimes[session_id] == 3600
-
-    asyncio.run(run())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://ci.test"
+    ) as client:
+        login = await client.get("/login/github")
+        state = parse_qs(urlparse(login.headers["location"]).query)["state"][0]
+        callback = await client.get(
+            f"/auth/github/callback?code=c&state={state}",
+            headers=cookie_header({f"nixbot_oauth_state_{state}": state}),
+        )
+        assert callback.status_code == 307
+        session_id = signer.session_id_from(callback.cookies[SESSION_COOKIE])
+        assert session_id is not None
+        assert vault.lifetimes[session_id] == 3600
 
 
-def test_concurrent_logins_do_not_clobber_oauth_state() -> None:
+async def test_concurrent_logins_do_not_clobber_oauth_state() -> None:
     """Two login attempts in parallel tabs: a single shared state
     cookie let the second login overwrite the first attempt's state,
     403ing whichever callback completed first."""
@@ -325,30 +318,27 @@ def test_concurrent_logins_do_not_clobber_oauth_state() -> None:
         )
     )
 
-    async def run() -> None:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="https://ci.test"
-        ) as client:
-            first = await client.get("/login/github")
-            second = await client.get("/login/github")
-            cookies = dict(first.cookies) | dict(second.cookies)
-            states = [
-                parse_qs(urlparse(r.headers["location"]).query)["state"][0]
-                for r in (first, second)
-            ]
-            assert states[0] != states[1]
-            # Both callbacks succeed, in either completion order.
-            for state in states:
-                callback = await client.get(
-                    f"/auth/github/callback?code=thecode&state={state}",
-                    headers=cookie_header(cookies),
-                )
-                assert callback.status_code == 307, state
-
-    asyncio.run(run())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://ci.test"
+    ) as client:
+        first = await client.get("/login/github")
+        second = await client.get("/login/github")
+        cookies = dict(first.cookies) | dict(second.cookies)
+        states = [
+            parse_qs(urlparse(r.headers["location"]).query)["state"][0]
+            for r in (first, second)
+        ]
+        assert states[0] != states[1]
+        # Both callbacks succeed, in either completion order.
+        for state in states:
+            callback = await client.get(
+                f"/auth/github/callback?code=thecode&state={state}",
+                headers=cookie_header(cookies),
+            )
+            assert callback.status_code == 307, state
 
 
-def test_oauth_callback_handles_token_exchange_errors() -> None:
+async def test_oauth_callback_handles_token_exchange_errors() -> None:
     """GitHub returns expired/reused-code errors as HTTP 200 with an
     error body; the callback must answer 403, not crash with a 500."""
     provider = github_oauth("cid", "csecret")
@@ -374,29 +364,26 @@ def test_oauth_callback_handles_token_exchange_errors() -> None:
         )
     )
 
-    async def run() -> None:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="https://ci.test"
-        ) as client:
-            response = await client.get(
-                "/auth/github/callback?code=stale&state=s",
-                headers=cookie_header({"nixbot_oauth_state_s": "s"}),
-            )
-            assert response.status_code == 403
-            assert "bad_verification_code" in response.text
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://ci.test"
+    ) as client:
+        response = await client.get(
+            "/auth/github/callback?code=stale&state=s",
+            headers=cookie_header({"nixbot_oauth_state_s": "s"}),
+        )
+        assert response.status_code == 403
+        assert "bad_verification_code" in response.text
 
-            # Userinfo body missing the username field: also 403, not 500.
-            response = await client.get(
-                "/auth/github/callback?code=ok&state=s",
-                headers=cookie_header({"nixbot_oauth_state_s": "s"}),
-            )
-            assert response.status_code == 403
-            assert "userinfo" in response.json()["detail"]
-
-    asyncio.run(run())
+        # Userinfo body missing the username field: also 403, not 500.
+        response = await client.get(
+            "/auth/github/callback?code=ok&state=s",
+            headers=cookie_header({"nixbot_oauth_state_s": "s"}),
+        )
+        assert response.status_code == 403
+        assert "userinfo" in response.json()["detail"]
 
 
-def test_userinfo_rejects_null_or_empty_username() -> None:
+async def test_userinfo_rejects_null_or_empty_username() -> None:
     """A userinfo body with "login": null (or "") must not authenticate
     as the literal user "None"/"" shared by everyone."""
     provider = github_oauth("cid", "cs")
@@ -414,7 +401,7 @@ def test_userinfo_rejects_null_or_empty_username() -> None:
     for bad_login in (None, "", 42):
         client = httpx.AsyncClient(transport=handler_for(bad_login))
         with pytest.raises(OAuthError, match="username"):
-            asyncio.run(provider.exchange_code(client, "c", "https://ci/cb"))
+            await provider.exchange_code(client, "c", "https://ci/cb")
 
 
 def test_github_oauth_scope_and_enterprise_urls() -> None:
@@ -435,7 +422,7 @@ def test_github_oauth_scope_and_enterprise_urls() -> None:
     assert ghe.userinfo_url == "https://ghe.corp.example/api/v3/user"
 
 
-def test_oidc_discovery() -> None:
+async def test_oidc_discovery() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/.well-known/openid-configuration":
             return httpx.Response(
@@ -449,14 +436,12 @@ def test_oidc_discovery() -> None:
             )
         return httpx.Response(404)
 
-    provider = asyncio.run(
-        oidc_provider(
-            httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-            "https://id.example.com/.well-known/openid-configuration",
-            "cid",
-            "cs",
-            ["openid", "profile"],
-        )
+    provider = await oidc_provider(
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        "https://id.example.com/.well-known/openid-configuration",
+        "cid",
+        "cs",
+        ["openid", "profile"],
     )
     assert provider.provider_id == "oidc:id.example.com"
     assert provider.authorize_url == "https://id.example.com/auth"
@@ -475,7 +460,7 @@ def test_gitea_oauth_urls() -> None:
     assert "read:repository" in provider.scope.split()
 
 
-def test_oidc_exchange_uses_basic_auth() -> None:
+async def test_oidc_exchange_uses_basic_auth() -> None:
     """OIDC servers only have to support client_secret_basic (RFC
     6749 section 2.3.1); authelia rejects body credentials with 401."""
     seen: dict[str, str] = {}
@@ -504,8 +489,8 @@ def test_oidc_exchange_uses_basic_auth() -> None:
         client_auth="basic",
     )
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    user, _token = asyncio.run(
-        provider.exchange_code(client, "code123", "https://ci/auth/oidc/callback")
+    user, _token = await provider.exchange_code(
+        client, "code123", "https://ci/auth/oidc/callback"
     )
     assert user.username == "alice"
     expected = base64.b64encode(b"cid:cs").decode()
@@ -513,7 +498,7 @@ def test_oidc_exchange_uses_basic_auth() -> None:
     assert "client_secret" not in seen["body"]
 
 
-def test_oidc_provider_honors_advertised_auth_methods() -> None:
+async def test_oidc_provider_honors_advertised_auth_methods() -> None:
     """A provider that only offers client_secret_post (e.g. older
     PocketID) gets body credentials; everyone else gets basic."""
 
@@ -528,24 +513,21 @@ def test_oidc_provider_honors_advertised_auth_methods() -> None:
             doc["token_endpoint_auth_methods_supported"] = methods
         return httpx.MockTransport(lambda _request: httpx.Response(200, json=doc))
 
-    def provider_for(methods: list[str] | None) -> OAuthProvider:
-        return asyncio.run(
-            oidc_provider(
-                httpx.AsyncClient(transport=discovery(methods)),
-                "https://id.example.com/.well-known/openid-configuration",
-                "cid",
-                "cs",
-                ["openid"],
-            )
+    async def provider_for(methods: list[str] | None) -> OAuthProvider:
+        return await oidc_provider(
+            httpx.AsyncClient(transport=discovery(methods)),
+            "https://id.example.com/.well-known/openid-configuration",
+            "cid",
+            "cs",
+            ["openid"],
         )
 
-    assert provider_for(["client_secret_post"]).client_auth == "body"
+    assert (await provider_for(["client_secret_post"])).client_auth == "body"
     assert (
-        provider_for(["client_secret_basic", "client_secret_post"]).client_auth
-        == "basic"
-    )
+        await provider_for(["client_secret_basic", "client_secret_post"])
+    ).client_auth == "basic"
     # Absent means client_secret_basic per OIDC discovery spec.
-    assert provider_for(None).client_auth == "basic"
+    assert (await provider_for(None)).client_auth == "basic"
 
 
 def test_viewer_rule_matching() -> None:
@@ -594,7 +576,7 @@ def test_relevant_groups_keeps_only_rule_groups() -> None:
     assert relevant_groups(groups, {}) == ()
 
 
-def test_oauth_callback_filters_session_groups() -> None:
+async def test_oauth_callback_filters_session_groups() -> None:
     """The session cookie only carries groups a viewer rule can match."""
     provider = OAuthProvider(
         name="oidc",
@@ -635,18 +617,15 @@ def test_oauth_callback_filters_session_groups() -> None:
         )
     )
 
-    async def run() -> None:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="https://ci.test"
-        ) as client:
-            response = await client.get(
-                "/auth/oidc/callback?code=c&state=s",
-                headers=cookie_header({f"{STATE_COOKIE}_s": "s"}),
-            )
-            assert response.status_code in (302, 307)
-            session = response.cookies.get(SESSION_COOKIE)
-            user = signer.user_from(session)
-            assert user is not None
-            assert user.groups == ("ci",)
-
-    asyncio.run(run())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://ci.test"
+    ) as client:
+        response = await client.get(
+            "/auth/oidc/callback?code=c&state=s",
+            headers=cookie_header({f"{STATE_COOKIE}_s": "s"}),
+        )
+        assert response.status_code in (302, 307)
+        session = response.cookies.get(SESSION_COOKIE)
+        user = signer.user_from(session)
+        assert user is not None
+        assert user.groups == ("ci",)

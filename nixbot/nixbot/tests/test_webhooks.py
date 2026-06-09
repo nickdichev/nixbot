@@ -364,72 +364,61 @@ PUSH_PAYLOAD = {
 
 
 @pytest.mark.parametrize("path", ["/webhooks/github", "/change_hook/github"])
-def test_github_endpoint_accepts_signed(path: str) -> None:
-    async def run() -> None:
-        sink = FakeSink()
-        body = json.dumps(PUSH_PAYLOAD).encode()
-        async with make_client(sink) as client:
-            response = await client.post(
-                path,
-                content=body,
-                headers={
-                    "X-Hub-Signature-256": sign_github(body),
-                    "X-GitHub-Event": "push",
-                    "X-GitHub-Delivery": f"guid-{path}",
-                },
-            )
-        assert response.status_code == 202
-        assert len(sink.events) == 1
-
-    asyncio.run(run())
+async def test_github_endpoint_accepts_signed(path: str) -> None:
+    sink = FakeSink()
+    body = json.dumps(PUSH_PAYLOAD).encode()
+    async with make_client(sink) as client:
+        response = await client.post(
+            path,
+            content=body,
+            headers={
+                "X-Hub-Signature-256": sign_github(body),
+                "X-GitHub-Event": "push",
+                "X-GitHub-Delivery": f"guid-{path}",
+            },
+        )
+    assert response.status_code == 202
+    assert len(sink.events) == 1
 
 
-def test_github_endpoint_rejects_bad_signature() -> None:
-    async def run() -> None:
-        sink = FakeSink()
-        body = json.dumps(PUSH_PAYLOAD).encode()
-        async with make_client(sink) as client:
-            response = await client.post(
-                "/webhooks/github",
-                content=body,
-                headers={
-                    "X-Hub-Signature-256": "sha256=bad",
-                    "X-GitHub-Event": "push",
-                },
-            )
-        assert response.status_code == 403
-        assert sink.events == []
-
-    asyncio.run(run())
+async def test_github_endpoint_rejects_bad_signature() -> None:
+    sink = FakeSink()
+    body = json.dumps(PUSH_PAYLOAD).encode()
+    async with make_client(sink) as client:
+        response = await client.post(
+            "/webhooks/github",
+            content=body,
+            headers={
+                "X-Hub-Signature-256": "sha256=bad",
+                "X-GitHub-Event": "push",
+            },
+        )
+    assert response.status_code == 403
+    assert sink.events == []
 
 
-def test_redelivery_after_failed_submit() -> None:
+async def test_redelivery_after_failed_submit() -> None:
     """A 500 must not record the GUID: redeliveries reuse it."""
 
-    async def run() -> None:
-        sink = FakeSink(fail=True)
-        body = json.dumps(PUSH_PAYLOAD).encode()
-        headers = {
-            "X-Hub-Signature-256": sign_github(body),
-            "X-GitHub-Event": "push",
-            "X-GitHub-Delivery": "guid-redelivery",
-        }
-        async with make_client(sink) as client:
-            failed = await client.post(
-                "/webhooks/github", content=body, headers=headers
-            )
-            assert failed.status_code == 500
-            sink.fail = False
-            redelivered = await client.post(
-                "/webhooks/github", content=body, headers=headers
-            )
-        assert redelivered.status_code == 202
-        assert len(sink.events) == 1
-
-    asyncio.run(run())
+    sink = FakeSink(fail=True)
+    body = json.dumps(PUSH_PAYLOAD).encode()
+    headers = {
+        "X-Hub-Signature-256": sign_github(body),
+        "X-GitHub-Event": "push",
+        "X-GitHub-Delivery": "guid-redelivery",
+    }
+    async with make_client(sink) as client:
+        failed = await client.post("/webhooks/github", content=body, headers=headers)
+        assert failed.status_code == 500
+        sink.fail = False
+        redelivered = await client.post(
+            "/webhooks/github", content=body, headers=headers
+        )
+    assert redelivered.status_code == 202
+    assert len(sink.events) == 1
 
 
-def test_concurrent_duplicate_delivery() -> None:
+async def test_concurrent_duplicate_delivery() -> None:
     """The GUID is recorded before the submit, so a concurrent
     duplicate must not also reach the sink."""
 
@@ -439,170 +428,152 @@ def test_concurrent_duplicate_delivery() -> None:
             await asyncio.sleep(0.05)
             await super().submit(event)
 
-    async def run() -> None:
-        sink = SlowSink()
-        body = json.dumps(PUSH_PAYLOAD).encode()
-        headers = {
-            "X-Hub-Signature-256": sign_github(body),
-            "X-GitHub-Event": "push",
-            "X-GitHub-Delivery": "guid-concurrent",
-        }
-        async with make_client(sink) as client:
-            first, second = await asyncio.gather(
-                client.post("/webhooks/github", content=body, headers=headers),
-                client.post("/webhooks/github", content=body, headers=headers),
-            )
-        assert {first.status_code, second.status_code} == {202}
-        assert len(sink.events) == 1
-
-    asyncio.run(run())
+    sink = SlowSink()
+    body = json.dumps(PUSH_PAYLOAD).encode()
+    headers = {
+        "X-Hub-Signature-256": sign_github(body),
+        "X-GitHub-Event": "push",
+        "X-GitHub-Delivery": "guid-concurrent",
+    }
+    async with make_client(sink) as client:
+        first, second = await asyncio.gather(
+            client.post("/webhooks/github", content=body, headers=headers),
+            client.post("/webhooks/github", content=body, headers=headers),
+        )
+    assert {first.status_code, second.status_code} == {202}
+    assert len(sink.events) == 1
 
 
-def test_malformed_payloads_return_400() -> None:
-    async def run() -> None:
-        sink = FakeSink()
-        body = b"not json"
-        async with make_client(sink) as client:
-            github = await client.post(
-                "/webhooks/github",
-                content=body,
-                headers={
-                    "X-Hub-Signature-256": sign_github(body),
-                    "X-GitHub-Event": "push",
-                },
-            )
-            gitea = await client.post(
-                "/webhooks/gitea",
-                content=body,
-                headers={
-                    "X-Gitea-Signature": sign_gitea(body),
-                    "X-Gitea-Event": "push",
-                },
-            )
-        assert github.status_code == 400
-        assert gitea.status_code == 400
-        assert sink.events == []
-
-    asyncio.run(run())
+async def test_malformed_payloads_return_400() -> None:
+    sink = FakeSink()
+    body = b"not json"
+    async with make_client(sink) as client:
+        github = await client.post(
+            "/webhooks/github",
+            content=body,
+            headers={
+                "X-Hub-Signature-256": sign_github(body),
+                "X-GitHub-Event": "push",
+            },
+        )
+        gitea = await client.post(
+            "/webhooks/gitea",
+            content=body,
+            headers={
+                "X-Gitea-Signature": sign_gitea(body),
+                "X-Gitea-Event": "push",
+            },
+        )
+    assert github.status_code == 400
+    assert gitea.status_code == 400
+    assert sink.events == []
 
 
-def test_oversized_payload_rejected() -> None:
+async def test_oversized_payload_rejected() -> None:
     """Bodies over the cap are rejected with 413 before any signature
     or parsing work."""
 
-    async def run() -> None:
-        sink = FakeSink()
-        body = b"x" * (webhooks.MAX_BODY_SIZE + 1)
-        async with make_client(sink) as client:
-            response = await client.post(
-                "/webhooks/github",
-                content=body,
-                headers={
-                    "X-Hub-Signature-256": sign_github(body),
-                    "X-GitHub-Event": "push",
-                },
-            )
-        assert response.status_code == 413
-        assert sink.events == []
-
-    asyncio.run(run())
+    sink = FakeSink()
+    body = b"x" * (webhooks.MAX_BODY_SIZE + 1)
+    async with make_client(sink) as client:
+        response = await client.post(
+            "/webhooks/github",
+            content=body,
+            headers={
+                "X-Hub-Signature-256": sign_github(body),
+                "X-GitHub-Event": "push",
+            },
+        )
+    assert response.status_code == 413
+    assert sink.events == []
 
 
-def test_github_form_encoded_payload() -> None:
-    async def run() -> None:
-        sink = FakeSink()
-        body = urllib.parse.urlencode({"payload": json.dumps(PUSH_PAYLOAD)}).encode()
-        async with make_client(sink) as client:
-            response = await client.post(
-                "/webhooks/github",
-                content=body,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "X-Hub-Signature-256": sign_github(body),
-                    "X-GitHub-Event": "push",
-                    "X-GitHub-Delivery": "guid-form",
-                },
-            )
-        assert response.status_code == 202
-        assert len(sink.events) == 1
-
-    asyncio.run(run())
+async def test_github_form_encoded_payload() -> None:
+    sink = FakeSink()
+    body = urllib.parse.urlencode({"payload": json.dumps(PUSH_PAYLOAD)}).encode()
+    async with make_client(sink) as client:
+        response = await client.post(
+            "/webhooks/github",
+            content=body,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "X-Hub-Signature-256": sign_github(body),
+                "X-GitHub-Event": "push",
+                "X-GitHub-Delivery": "guid-form",
+            },
+        )
+    assert response.status_code == 202
+    assert len(sink.events) == 1
 
 
-def test_db_outage_returns_500() -> None:
-    async def run() -> None:
-        sink = FakeSink(fail=True)
-        body = json.dumps(PUSH_PAYLOAD).encode()
-        async with make_client(sink) as client:
-            response = await client.post(
-                "/webhooks/github",
-                content=body,
-                headers={
-                    "X-Hub-Signature-256": sign_github(body),
-                    "X-GitHub-Event": "push",
-                    "X-GitHub-Delivery": "guid-outage",
-                },
-            )
-        assert response.status_code == 500
-
-    asyncio.run(run())
+async def test_db_outage_returns_500() -> None:
+    sink = FakeSink(fail=True)
+    body = json.dumps(PUSH_PAYLOAD).encode()
+    async with make_client(sink) as client:
+        response = await client.post(
+            "/webhooks/github",
+            content=body,
+            headers={
+                "X-Hub-Signature-256": sign_github(body),
+                "X-GitHub-Event": "push",
+                "X-GitHub-Delivery": "guid-outage",
+            },
+        )
+    assert response.status_code == 500
 
 
-def test_gitea_endpoint_per_repo_secret() -> None:
-    async def run() -> None:
-        sink = FakeSink()
-        payload = {
-            "ref": "refs/heads/main",
-            "after": "ff",
-            "repository": {"id": 3},
-            "commits": [{"message": "m"}],
-        }
-        body = json.dumps(payload).encode()
-        async with make_client(sink) as client:
-            ok = await client.post(
-                "/webhooks/gitea",
-                content=body,
-                headers={
-                    "X-Gitea-Signature": sign_gitea(body),
-                    "X-Gitea-Event": "push",
-                    "X-Gitea-Delivery": "g1",
-                },
-            )
-            bad = await client.post(
-                "/webhooks/gitea",
-                content=body,
-                headers={
-                    "X-Gitea-Signature": "wrong",
-                    "X-Gitea-Event": "push",
-                },
-            )
-            # Legacy alias is gone: old buildbot hooks carried secrets
-            # that could never match the per-repo secrets anyway.
-            legacy = await client.post(
-                "/change_hook/gitea",
-                content=body,
-                headers={
-                    "X-Gitea-Signature": sign_gitea(body),
-                    "X-Gitea-Event": "push",
-                },
-            )
-            # Unknown repo: no secret configured -> rejected.
-            unknown_body = json.dumps({**payload, "repository": {"id": 777}}).encode()
-            unknown = await client.post(
-                "/webhooks/gitea",
-                content=unknown_body,
-                headers={
-                    "X-Gitea-Signature": sign_gitea(unknown_body),
-                    "X-Gitea-Event": "push",
-                },
-            )
-        assert ok.status_code == 202
-        assert bad.status_code == 403
-        assert legacy.status_code == 404
-        assert unknown.status_code == 403
-        assert len(sink.events) == 1
-
-    asyncio.run(run())
+async def test_gitea_endpoint_per_repo_secret() -> None:
+    sink = FakeSink()
+    payload = {
+        "ref": "refs/heads/main",
+        "after": "ff",
+        "repository": {"id": 3},
+        "commits": [{"message": "m"}],
+    }
+    body = json.dumps(payload).encode()
+    async with make_client(sink) as client:
+        ok = await client.post(
+            "/webhooks/gitea",
+            content=body,
+            headers={
+                "X-Gitea-Signature": sign_gitea(body),
+                "X-Gitea-Event": "push",
+                "X-Gitea-Delivery": "g1",
+            },
+        )
+        bad = await client.post(
+            "/webhooks/gitea",
+            content=body,
+            headers={
+                "X-Gitea-Signature": "wrong",
+                "X-Gitea-Event": "push",
+            },
+        )
+        # Legacy alias is gone: old buildbot hooks carried secrets
+        # that could never match the per-repo secrets anyway.
+        legacy = await client.post(
+            "/change_hook/gitea",
+            content=body,
+            headers={
+                "X-Gitea-Signature": sign_gitea(body),
+                "X-Gitea-Event": "push",
+            },
+        )
+        # Unknown repo: no secret configured -> rejected.
+        unknown_body = json.dumps({**payload, "repository": {"id": 777}}).encode()
+        unknown = await client.post(
+            "/webhooks/gitea",
+            content=unknown_body,
+            headers={
+                "X-Gitea-Signature": sign_gitea(unknown_body),
+                "X-Gitea-Event": "push",
+            },
+        )
+    assert ok.status_code == 202
+    assert bad.status_code == 403
+    assert legacy.status_code == 404
+    assert unknown.status_code == 403
+    assert len(sink.events) == 1
 
 
 GITLAB_PUSH = {
@@ -701,42 +672,39 @@ def test_parse_gitlab_events() -> None:
     assert merged is None
 
 
-def test_gitlab_endpoint_token_validation() -> None:
-    async def run() -> None:
-        sink = FakeSink()
-        async with make_client(sink) as client:
-            headers = {
-                "X-Gitlab-Event": "Push Hook",
-                "X-Gitlab-Event-UUID": "u1",
-                "Content-Type": "application/json",
-            }
-            body = json.dumps(GITLAB_PUSH).encode()
-            bad = await client.post(
-                "/webhooks/gitlab",
-                content=body,
-                headers={**headers, "X-Gitlab-Token": "wrong"},
-            )
-            assert bad.status_code == 403
-            ok = await client.post(
-                "/webhooks/gitlab",
-                content=body,
-                headers={**headers, "X-Gitlab-Token": SECRET},
-            )
-            assert ok.status_code == 202
-            dup = await client.post(
-                "/webhooks/gitlab",
-                content=body,
-                headers={**headers, "X-Gitlab-Token": SECRET},
-            )
-            assert dup.status_code == 202
-            assert dup.text == "duplicate delivery"
-        assert len(sink.events) == 1
-        assert sink.events[0].forge == "gitlab"
-
-    asyncio.run(run())
+async def test_gitlab_endpoint_token_validation() -> None:
+    sink = FakeSink()
+    async with make_client(sink) as client:
+        headers = {
+            "X-Gitlab-Event": "Push Hook",
+            "X-Gitlab-Event-UUID": "u1",
+            "Content-Type": "application/json",
+        }
+        body = json.dumps(GITLAB_PUSH).encode()
+        bad = await client.post(
+            "/webhooks/gitlab",
+            content=body,
+            headers={**headers, "X-Gitlab-Token": "wrong"},
+        )
+        assert bad.status_code == 403
+        ok = await client.post(
+            "/webhooks/gitlab",
+            content=body,
+            headers={**headers, "X-Gitlab-Token": SECRET},
+        )
+        assert ok.status_code == 202
+        dup = await client.post(
+            "/webhooks/gitlab",
+            content=body,
+            headers={**headers, "X-Gitlab-Token": SECRET},
+        )
+        assert dup.status_code == 202
+        assert dup.text == "duplicate delivery"
+    assert len(sink.events) == 1
+    assert sink.events[0].forge == "gitlab"
 
 
-def test_pr_merges_into_current_base_tip(tmp_path: Path) -> None:
+async def test_pr_merges_into_current_base_tip(tmp_path: Path) -> None:
     """A PR opened before the base branch advanced must still be tested
     against the current base tip, not the payload's frozen base.sha
     (GitHub never updates base.sha as the base branch moves)."""
@@ -768,21 +736,18 @@ def test_pr_merges_into_current_base_tip(tmp_path: Path) -> None:
     )
     assert isinstance(event, ChangeRequest)
 
-    async def run() -> None:
-        manager = RepoManager(tmp_path / "state")
-        await manager.fetch(
-            "github/acme/widget", str(upstream), ["+refs/heads/*:refs/heads/*"]
-        )
-        wt = await manager.checkout_for_build(
-            "github/acme/widget",
-            "build-1",
-            base_commit=event.base_sha or event.commit_sha,
-            head_commit=event.commit_sha,
-        )
-        try:
-            assert (wt.path / "feature.txt").exists()
-            assert (wt.path / "after.txt").exists()
-        finally:
-            await manager.remove_worktree(wt)
-
-    asyncio.run(run())
+    manager = RepoManager(tmp_path / "state")
+    await manager.fetch(
+        "github/acme/widget", str(upstream), ["+refs/heads/*:refs/heads/*"]
+    )
+    wt = await manager.checkout_for_build(
+        "github/acme/widget",
+        "build-1",
+        base_commit=event.base_sha or event.commit_sha,
+        head_commit=event.commit_sha,
+    )
+    try:
+        assert (wt.path / "feature.txt").exists()
+        assert (wt.path / "after.txt").exists()
+    finally:
+        await manager.remove_worktree(wt)

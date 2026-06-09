@@ -5,7 +5,6 @@ unauthorized access on HTML, fragment, log, and SSE endpoints."""
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING
 
 import httpx
@@ -58,8 +57,8 @@ class FakeFetcher:
 
 
 @pytest.fixture(scope="module")
-def postgres_dsn(postgres_dsn: str) -> str:
-    asyncio.run(seed(postgres_dsn))
+async def postgres_dsn(postgres_dsn: str) -> str:
+    await seed(postgres_dsn)
     return postgres_dsn
 
 
@@ -348,7 +347,7 @@ def test_logout_invalidates_access_cache(postgres_dsn: str) -> None:
         assert visibility.cache.get(CAROL.qualified) is None
 
 
-def test_gitlab_repo_access_fetcher() -> None:
+async def test_gitlab_repo_access_fetcher() -> None:
     """Private GitLab projects were invisible to everyone but admins
     because no GitLab access fetcher existed."""
 
@@ -381,12 +380,12 @@ def test_gitlab_repo_access_fetcher() -> None:
         gitlab_url="https://gitlab.example.com",
     )
     user = User(provider="gitlab", username="dora")
-    access = asyncio.run(fetcher.repo_access(user, "tok-gl"))
+    access = await fetcher.repo_access(user, "tok-gl")
     assert access.accessible == frozenset({"gitlab:31", "gitlab:32"})
     assert access.admin == frozenset({"gitlab:31"})
 
 
-def test_github_repo_access_fetcher_enterprise_api_url() -> None:
+async def test_github_repo_access_fetcher_enterprise_api_url() -> None:
     """GitHub Enterprise: the fetch must hit the configured API base,
     not hardcoded api.github.com."""
 
@@ -400,6 +399,6 @@ def test_github_repo_access_fetcher_enterprise_api_url() -> None:
         github_api_url="https://ghe.example.com/api/v3",
     )
     user = User(provider="github", username="erik")
-    access = asyncio.run(fetcher.repo_access(user, "tok"))
+    access = await fetcher.repo_access(user, "tok")
     assert access.accessible == frozenset({"github:5"})
     assert access.admin == frozenset({"github:5"})
