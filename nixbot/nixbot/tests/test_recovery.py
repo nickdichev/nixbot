@@ -17,7 +17,7 @@ from nixbot.recovery import (
     settle_already_built,
 )
 
-from .support import db_pool, insert_build, insert_project
+from .support import insert_build, insert_project
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -50,70 +50,66 @@ async def add_attr(
     )
 
 
-async def test_resume_skips_terminal_attributes(postgres_dsn: str) -> None:
-    async with db_pool(postgres_dsn) as pool:
-        build_id = await make_build(pool, "resume")
-        await add_attr(pool, build_id, "done", "succeeded")
-        await add_attr(pool, build_id, "failed", "failed")
-        await add_attr(pool, build_id, "todo", "pending")
+async def test_resume_skips_terminal_attributes(pool: asyncpg.Pool) -> None:
+    build_id = await make_build(pool, "resume")
+    await add_attr(pool, build_id, "done", "succeeded")
+    await add_attr(pool, build_id, "failed", "failed")
+    await add_attr(pool, build_id, "todo", "pending")
 
-        builds = await find_unfinished_builds(pool)
-        target = next(b for b in builds if b.build_id == build_id)
-        # Terminal attributes never resumed.
-        assert [j.attr for j in target.pending_jobs] == ["todo"]
-        assert not target.effects_started
-
-
-async def test_settle_already_built(postgres_dsn: str) -> None:
-    async with db_pool(postgres_dsn) as pool:
-        build_id = await make_build(pool, "settle")
-        await add_attr(pool, build_id, "present", "pending")
-        await add_attr(pool, build_id, "missing", "pending")
-        builds = await find_unfinished_builds(pool)
-        target = next(b for b in builds if b.build_id == build_id)
-
-        async def checker(paths: list[str]) -> set[str]:
-            return {p for p in paths if "present" in p}
-
-        remaining, settled = await settle_already_built(BuildDB(pool), target, checker)
-        assert [j.attr for j in remaining] == ["missing"]
-        assert settled == [("present", "/nix/store/present-out")]
-        statuses = {
-            r["attr"]: r["status"]
-            for r in await pool.fetch(
-                "SELECT attr, status FROM build_attributes WHERE build_id = $1",
-                build_id,
-            )
-        }
-        # Store-valid path completed without rebuild.
-        assert statuses["present"] == "succeeded"
-        assert statuses["missing"] == "pending"
+    builds = await find_unfinished_builds(pool)
+    target = next(b for b in builds if b.build_id == build_id)
+    # Terminal attributes never resumed.
+    assert [j.attr for j in target.pending_jobs] == ["todo"]
+    assert not target.effects_started
 
 
-async def test_retention_cleanup(postgres_dsn: str, tmp_path: Path) -> None:
-    async with db_pool(postgres_dsn) as pool:
-        build_id = await make_build(pool, "old")
-        await pool.execute(
-            "UPDATE builds SET status='succeeded', "
-            "finished_at = now() - interval '100 days' WHERE id = $1",
+async def test_settle_already_built(pool: asyncpg.Pool) -> None:
+    build_id = await make_build(pool, "settle")
+    await add_attr(pool, build_id, "present", "pending")
+    await add_attr(pool, build_id, "missing", "pending")
+    builds = await find_unfinished_builds(pool)
+    target = next(b for b in builds if b.build_id == build_id)
+
+    async def checker(paths: list[str]) -> set[str]:
+        return {p for p in paths if "present" in p}
+
+    remaining, settled = await settle_already_built(BuildDB(pool), target, checker)
+    assert [j.attr for j in remaining] == ["missing"]
+    assert settled == [("present", "/nix/store/present-out")]
+    statuses = {
+        r["attr"]: r["status"]
+        for r in await pool.fetch(
+            "SELECT attr, status FROM build_attributes WHERE build_id = $1",
             build_id,
         )
-        recent_id = await make_build(pool, "recent")
-        await pool.execute(
-            "UPDATE builds SET status='succeeded', finished_at = now() WHERE id = $1",
-            recent_id,
-        )
-        log_dir = tmp_path / "logs" / str(build_id)
-        log_dir.mkdir(parents=True)
-        (log_dir / "a.zst").write_bytes(b"x")
+    }
+    # Store-valid path completed without rebuild.
+    assert statuses["present"] == "succeeded"
+    assert statuses["missing"] == "pending"
 
-        deleted = await cleanup_old_builds(pool, tmp_path, 90)
-        assert deleted == 1
-        assert not log_dir.exists()
-        assert (
-            await pool.fetchval("SELECT count(*) FROM builds WHERE id = $1", recent_id)
-            == 1
-        )
+
+async def test_retention_cleanup(pool: asyncpg.Pool, tmp_path: Path) -> None:
+    build_id = await make_build(pool, "old")
+    await pool.execute(
+        "UPDATE builds SET status='succeeded', "
+        "finished_at = now() - interval '100 days' WHERE id = $1",
+        build_id,
+    )
+    recent_id = await make_build(pool, "recent")
+    await pool.execute(
+        "UPDATE builds SET status='succeeded', finished_at = now() WHERE id = $1",
+        recent_id,
+    )
+    log_dir = tmp_path / "logs" / str(build_id)
+    log_dir.mkdir(parents=True)
+    (log_dir / "a.zst").write_bytes(b"x")
+
+    deleted = await cleanup_old_builds(pool, tmp_path, 90)
+    assert deleted == 1
+    assert not log_dir.exists()
+    assert (
+        await pool.fetchval("SELECT count(*) FROM builds WHERE id = $1", recent_id) == 1
+    )
 
 
 class _FakePool:
@@ -166,74 +162,67 @@ async def test_orphan_log_dirs_scan_before_id_snapshot(tmp_path: Path) -> None:
 
 
 async def test_resume_includes_interrupted_building_attributes(
-    postgres_dsn: str,
+    pool: asyncpg.Pool,
 ) -> None:
     # An attribute that was 'building' when the service died must
     # resume like a pending one (it is not terminal).
-    async with db_pool(postgres_dsn) as pool:
-        build_id = await make_build(pool, "resume-building")
-        await add_attr(pool, build_id, "inflight", "building")
-        await add_attr(pool, build_id, "done", "succeeded")
-        builds = await find_unfinished_builds(pool)
-        target = next(b for b in builds if b.build_id == build_id)
-        assert [j.attr for j in target.pending_jobs] == ["inflight"]
+    build_id = await make_build(pool, "resume-building")
+    await add_attr(pool, build_id, "inflight", "building")
+    await add_attr(pool, build_id, "done", "succeeded")
+    builds = await find_unfinished_builds(pool)
+    target = next(b for b in builds if b.build_id == build_id)
+    assert [j.attr for j in target.pending_jobs] == ["inflight"]
 
 
 async def test_retention_skips_restarted_builds(
-    postgres_dsn: str, tmp_path: Path
+    pool: asyncpg.Pool, tmp_path: Path
 ) -> None:
     # A restarted build briefly keeps its old finished_at while its
     # status is 'building' again; the hourly sweep must not delete it
     # mid-rerun.
-    async with db_pool(postgres_dsn) as pool:
-        build_id = await make_build(pool, "restarted-old")
-        await pool.execute(
-            "UPDATE builds SET status = 'building', "
-            "finished_at = now() - interval '100 days' WHERE id = $1",
-            build_id,
-        )
-        await cleanup_old_builds(pool, tmp_path, 90)
-        assert (
-            await pool.fetchval("SELECT count(*) FROM builds WHERE id = $1", build_id)
-            == 1
-        )
+    build_id = await make_build(pool, "restarted-old")
+    await pool.execute(
+        "UPDATE builds SET status = 'building', "
+        "finished_at = now() - interval '100 days' WHERE id = $1",
+        build_id,
+    )
+    await cleanup_old_builds(pool, tmp_path, 90)
+    assert (
+        await pool.fetchval("SELECT count(*) FROM builds WHERE id = $1", build_id) == 1
+    )
 
 
 async def test_retention_ages_out_failed_caches(
-    postgres_dsn: str, tmp_path: Path
+    pool: asyncpg.Pool, tmp_path: Path
 ) -> None:
-    async with db_pool(postgres_dsn) as pool:
-        old_ts = time.time() - 100 * 86400
-        await pool.execute(
-            "INSERT INTO failed_statuses (revision, status_name, timestamp) "
-            "VALUES ('old-rev', 'ctx', $1), ('new-rev', 'ctx', $2)",
-            old_ts,
-            time.time(),
-        )
-        cache_project = await insert_project(
-            pool, "cache-age", forge_repo_id="cache-age"
-        )
-        await pool.execute(
-            "INSERT INTO failed_builds (project_id, derivation, timestamp, url) "
-            "VALUES ($3, '/nix/store/old.drv', $1, 'u'), "
-            "($3, '/nix/store/new.drv', $2, 'u')",
-            old_ts,
-            time.time(),
-            cache_project,
-        )
-        await cleanup_old_builds(pool, tmp_path, 90)
-        revisions = {
-            r["revision"]
-            for r in await pool.fetch("SELECT revision FROM failed_statuses")
-        }
-        assert "old-rev" not in revisions
-        assert "new-rev" in revisions
-        drvs = {
-            r["derivation"]
-            for r in await pool.fetch("SELECT derivation FROM failed_builds")
-        }
-        assert "/nix/store/old.drv" not in drvs
-        assert "/nix/store/new.drv" in drvs
+    old_ts = time.time() - 100 * 86400
+    await pool.execute(
+        "INSERT INTO failed_statuses (revision, status_name, timestamp) "
+        "VALUES ('old-rev', 'ctx', $1), ('new-rev', 'ctx', $2)",
+        old_ts,
+        time.time(),
+    )
+    cache_project = await insert_project(pool, "cache-age", forge_repo_id="cache-age")
+    await pool.execute(
+        "INSERT INTO failed_builds (project_id, derivation, timestamp, url) "
+        "VALUES ($3, '/nix/store/old.drv', $1, 'u'), "
+        "($3, '/nix/store/new.drv', $2, 'u')",
+        old_ts,
+        time.time(),
+        cache_project,
+    )
+    await cleanup_old_builds(pool, tmp_path, 90)
+    revisions = {
+        r["revision"] for r in await pool.fetch("SELECT revision FROM failed_statuses")
+    }
+    assert "old-rev" not in revisions
+    assert "new-rev" in revisions
+    drvs = {
+        r["derivation"]
+        for r in await pool.fetch("SELECT derivation FROM failed_builds")
+    }
+    assert "/nix/store/old.drv" not in drvs
+    assert "/nix/store/new.drv" in drvs
 
 
 async def test_check_store_paths_reads_the_nix_db(tmp_path: Path) -> None:
@@ -257,94 +246,90 @@ async def test_check_store_paths_reads_the_nix_db(tmp_path: Path) -> None:
     assert missing == set()
 
 
-async def test_failed_rebuild_settles_pending_effects(postgres_dsn: str) -> None:
+async def test_failed_rebuild_settles_pending_effects(pool: asyncpg.Pool) -> None:
     """A failed rebuild must settle its pending effect rows."""
 
-    async with db_pool(postgres_dsn) as pool:
-        build_id = await make_build(pool, "fx-failed-rebuild")
-        await pool.execute(
-            "INSERT INTO build_effects (build_id, name, status) "
-            "VALUES ($1, 'deploy', 'pending')",
-            build_id,
-        )
-        await BuildDB(pool).set_build_status(build_id, "failed")
-        row = await pool.fetchrow(
-            "SELECT status, error FROM build_effects WHERE build_id = $1",
-            build_id,
-        )
-        assert row["status"] == "failed"
-        assert "did not succeed" in row["error"]
+    build_id = await make_build(pool, "fx-failed-rebuild")
+    await pool.execute(
+        "INSERT INTO build_effects (build_id, name, status) "
+        "VALUES ($1, 'deploy', 'pending')",
+        build_id,
+    )
+    await BuildDB(pool).set_build_status(build_id, "failed")
+    row = await pool.fetchrow(
+        "SELECT status, error FROM build_effects WHERE build_id = $1",
+        build_id,
+    )
+    assert row["status"] == "failed"
+    assert "did not succeed" in row["error"]
 
 
-async def test_eval_start_clears_stale_eval_warnings(postgres_dsn: str) -> None:
+async def test_eval_start_clears_stale_eval_warnings(pool: asyncpg.Pool) -> None:
     """A re-run build must not show the previous attempt's warnings."""
 
-    async with db_pool(postgres_dsn) as pool:
-        build_id = await make_build(pool, "lw-rerun")
-        db = BuildDB(pool)
-        await db.set_eval_warnings(
-            build_id, '[{"level": "warning", "message": "old", "count": 3}]'
-        )
-        await db.set_build_status(build_id, "failed")
-        assert await pool.fetchval(
-            "SELECT eval_warnings FROM builds WHERE id = $1", build_id
-        )
-        await db.set_build_status(build_id, "evaluating")
-        assert (
-            await pool.fetchval(
-                "SELECT eval_warnings FROM builds WHERE id = $1", build_id
-            )
-            is None
-        )
+    build_id = await make_build(pool, "lw-rerun")
+    db = BuildDB(pool)
+    await db.set_eval_warnings(
+        build_id, '[{"level": "warning", "message": "old", "count": 3}]'
+    )
+    await db.set_build_status(build_id, "failed")
+    assert await pool.fetchval(
+        "SELECT eval_warnings FROM builds WHERE id = $1", build_id
+    )
+    await db.set_build_status(build_id, "evaluating")
+    assert (
+        await pool.fetchval("SELECT eval_warnings FROM builds WHERE id = $1", build_id)
+        is None
+    )
 
 
-async def test_interrupted_effects_fail_on_recovery(postgres_dsn: str) -> None:
+async def test_interrupted_effects_fail_on_recovery(pool: asyncpg.Pool) -> None:
     """Effects never auto-re-run, so rows left running by a crash
     would spin forever without the startup sweep."""
 
-    async with db_pool(postgres_dsn) as pool:
-        build_id = await make_build(pool, "fx-sweep")
-        await pool.execute(
-            "INSERT INTO build_effects (build_id, name) VALUES ($1, 'deploy')",
-            build_id,
+    build_id = await make_build(pool, "fx-sweep")
+    await pool.execute(
+        "INSERT INTO build_effects (build_id, name) VALUES ($1, 'deploy')",
+        build_id,
+    )
+    project_id = await pool.fetchval(
+        "SELECT project_id FROM builds WHERE id = $1", build_id
+    )
+    await pool.execute(
+        "INSERT INTO scheduled_effect_runs (project_id, schedule_name, "
+        "effect) VALUES ($1, 's', 'beat')",
+        project_id,
+    )
+    await fail_interrupted_effects(pool, datetime.now(UTC) + timedelta(minutes=1))
+    for table, column in [
+        ("build_effects", "build_id"),
+        ("scheduled_effect_runs", "project_id"),
+    ]:
+        row = await pool.fetchrow(
+            f"SELECT status, error, finished_at FROM {table} "  # noqa: S608
+            f"WHERE {column} = $1",
+            build_id if column == "build_id" else project_id,
         )
-        project_id = await pool.fetchval(
-            "SELECT project_id FROM builds WHERE id = $1", build_id
-        )
-        await pool.execute(
-            "INSERT INTO scheduled_effect_runs (project_id, schedule_name, "
-            "effect) VALUES ($1, 's', 'beat')",
-            project_id,
-        )
-        await fail_interrupted_effects(pool, datetime.now(UTC) + timedelta(minutes=1))
-        for table, column in [
-            ("build_effects", "build_id"),
-            ("scheduled_effect_runs", "project_id"),
-        ]:
-            row = await pool.fetchrow(
-                f"SELECT status, error, finished_at FROM {table} "  # noqa: S608
-                f"WHERE {column} = $1",
-                build_id if column == "build_id" else project_id,
-            )
-            assert row["status"] == "failed"
-            assert "interrupted" in row["error"]
-            assert row["finished_at"] is not None
+        assert row["status"] == "failed"
+        assert "interrupted" in row["error"]
+        assert row["finished_at"] is not None
 
 
-async def test_interrupted_effects_sweep_spares_live_effects(postgres_dsn: str) -> None:
+async def test_interrupted_effects_sweep_spares_live_effects(
+    pool: asyncpg.Pool,
+) -> None:
     """The startup sweep runs concurrently with the work loop: effect
     rows created after process start are live deploys and must not be
     flipped to failed."""
 
-    async with db_pool(postgres_dsn) as pool:
-        build_id = await make_build(pool, "fx-live")
-        process_start = datetime.now(UTC)
-        await pool.execute(
-            "INSERT INTO build_effects (build_id, name) VALUES ($1, 'deploy')",
-            build_id,
-        )
-        await fail_interrupted_effects(pool, process_start)
-        status = await pool.fetchval(
-            "SELECT status FROM build_effects WHERE build_id = $1", build_id
-        )
-        assert status == "running"
+    build_id = await make_build(pool, "fx-live")
+    process_start = datetime.now(UTC)
+    await pool.execute(
+        "INSERT INTO build_effects (build_id, name) VALUES ($1, 'deploy')",
+        build_id,
+    )
+    await fail_interrupted_effects(pool, process_start)
+    status = await pool.fetchval(
+        "SELECT status FROM build_effects WHERE build_id = $1", build_id
+    )
+    assert status == "running"
