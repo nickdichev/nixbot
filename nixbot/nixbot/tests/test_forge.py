@@ -62,34 +62,36 @@ def repo(owner: str, name: str, topics: tuple[str, ...] = ()) -> DiscoveredRepo:
 # --- filters ------------------------------------------------------------------
 
 
-def test_filter_no_allowlists_allows_all() -> None:
-    repos = [repo("a", "x"), repo("b", "y")]
-    assert filter_repos(RepoFilters(), repos) == repos
+FILTER_REPOS = [
+    repo("a", "x", topics=("build-with-buildbot",)),
+    repo("b", "y"),
+    repo("c", "z"),
+]
 
 
-def test_filter_user_allowlist() -> None:
-    repos = [repo("a", "x"), repo("b", "y")]
-    assert filter_repos(RepoFilters(user_allowlist=["a"]), repos) == [repos[0]]
-
-
-def test_filter_repo_allowlist() -> None:
-    repos = [repo("a", "x"), repo("b", "y")]
-    assert filter_repos(RepoFilters(repo_allowlist=["b/y"]), repos) == [repos[1]]
-
-
-def test_filter_union_of_allowlists() -> None:
-    repos = [repo("a", "x"), repo("b", "y"), repo("c", "z")]
-    filtered = filter_repos(
-        RepoFilters(user_allowlist=["a"], repo_allowlist=["b/y"]), repos
-    )
-    assert filtered == [repos[0], repos[1]]
-
-
-def test_topic_does_not_filter_discovery() -> None:
-    # The topic only drives the one-shot legacy enablement import
-    # (projects.py); it must not exclude repos from discovery.
-    repos = [repo("a", "x", topics=("build-with-buildbot",)), repo("b", "y")]
-    assert filter_repos(RepoFilters(topic="build-with-buildbot"), repos) == repos
+@pytest.mark.parametrize(
+    ("filters", "expected_indices"),
+    [
+        pytest.param(RepoFilters(), [0, 1, 2], id="no-allowlists-allow-all"),
+        pytest.param(RepoFilters(user_allowlist=["a"]), [0], id="user-allowlist"),
+        pytest.param(RepoFilters(repo_allowlist=["b/y"]), [1], id="repo-allowlist"),
+        pytest.param(
+            RepoFilters(user_allowlist=["a"], repo_allowlist=["b/y"]),
+            [0, 1],
+            id="union-of-allowlists",
+        ),
+        # The topic only drives the one-shot legacy enablement import
+        # (projects.py); it must not exclude repos from discovery.
+        pytest.param(
+            RepoFilters(topic="build-with-buildbot"),
+            [0, 1, 2],
+            id="topic-does-not-filter",
+        ),
+    ],
+)
+def test_filter_repos(filters: RepoFilters, expected_indices: list[int]) -> None:
+    expected = [FILTER_REPOS[i] for i in expected_indices]
+    assert filter_repos(filters, FILTER_REPOS) == expected
 
 
 # --- GitHub client ---------------------------------------------------------------
