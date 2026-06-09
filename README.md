@@ -223,10 +223,6 @@ The following instances integrated with Gitea:
   | [Instance](https://buildbot.clan.lol/)
 -->
 
-## Get in touch
-
-We have a matrix channel at [nixbot](https://matrix.to/#/#nixbot:thalheim.io).
-
 ## Need commercial support or customization?
 
 For commercial support, please contact [Mic92](https://github.com/Mic92/) at
