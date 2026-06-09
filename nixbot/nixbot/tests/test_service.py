@@ -23,7 +23,7 @@ from nixbot.config import (
 from nixbot.events import NullStatusReporter
 from nixbot.forge import DiscoveredRepo
 from nixbot.scheduled import DueEffect, ScheduleWhen
-from nixbot.service import scheduled_worktree_id
+from nixbot.scheduled_runs import scheduled_worktree_id
 from nixbot.webhooks import ChangeRequest, PrClosed
 
 from .support import FakeGitlab, git, insert_build, insert_project, make_config

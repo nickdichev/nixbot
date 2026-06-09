@@ -9,18 +9,15 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from . import discovery, restarts
+from . import discovery, restarts, scheduled_runs
 from .config import ScheduleWhen
 from .db import BuildStatus
-from .effects import EffectsContext, effects_context
-from .events import ChangeEvent, RepoInfo, StatusReporter
-from .executor import LogWriter
+from .events import ChangeEvent, StatusReporter
 from .gitrepo import (
     CredentialsProvider,
     FetchCredentials,
@@ -34,12 +31,7 @@ from .recovery import (
     settle_already_built,
 )
 from .repos import repo_info
-from .scheduled import (
-    DueEffect,
-    ScheduledEffectsStore,
-    discover_schedules,
-    run_scheduled_effect,
-)
+from .scheduled import DueEffect
 from .webhooks import (
     ChangeRequest,
     PrClosed,
@@ -70,14 +62,6 @@ _STATIC_CREDENTIALS = StaticCredentialsProvider()
 DISCOVERY_INTERVAL = 60 * 60
 REFRESH_COOLDOWN = 60
 MAINTENANCE_INTERVAL = 60 * 60
-
-
-def scheduled_worktree_id(due: DueEffect, run_id: int) -> str:
-    """Per-run worktree id: concurrent effects (or a run outlasting the
-    next due fire) must not share a checkout. Schedule/effect names are
-    repo-controlled, so sanitize against path traversal."""
-    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{due.schedule_name}-{due.effect}")
-    return f"scheduled-{due.project_id}-{safe}-{run_id}"
 
 
 class PullBasedCredentialsProvider:
@@ -346,15 +330,18 @@ class CIService:
                 payload.get("retry_at"),
             )
         elif item.kind == "refresh-schedules":
-            await self._refresh_schedules_item(payload["project_id"], payload["rev"])
+            await scheduled_runs.refresh_schedules(
+                self, payload["project_id"], payload["rev"]
+            )
         elif item.kind == "scheduled":
-            await self._run_scheduled(
+            await scheduled_runs.run_scheduled(
+                self,
                 DueEffect(
                     project_id=payload["project_id"],
                     schedule_name=payload["schedule_name"],
                     effect=payload["effect"],
                     when=ScheduleWhen.model_validate(payload["when"]),
-                )
+                ),
             )
         else:
             msg = f"unknown work kind {item.kind!r}"
@@ -426,36 +413,6 @@ class CIService:
                 build_id, name, success=False, error=str(e) or type(e).__name__
             )
             raise
-
-    async def _refresh_schedules_item(self, project_id: int, rev: str) -> None:
-        """Discover and store onSchedule definitions at the commit."""
-        project = await self.repo_store.by_id(project_id)
-        if project is None or not project.enabled:
-            return
-        info = repo_info(project)
-        credentials = await self.credentials_provider(info.forge).get(info.clone_url)
-        await self.orchestrator.repos.fetch(
-            info.key, info.clone_url, ["+refs/heads/*:refs/heads/*"], credentials
-        )
-        worktree = await self.orchestrator.repos.checkout_for_build(
-            info.key,
-            f"schedules-{project_id}",
-            base_commit=rev,
-        )
-        try:
-            ctx = EffectsContext(
-                worktree_path=worktree.path,
-                rev=rev,
-                branch=info.default_branch,
-                repo=info.name,
-                extra_sandbox_paths=self.config.effects_extra_sandbox_paths,
-            )
-            schedules = await discover_schedules(ctx)
-            await ScheduledEffectsStore(self.pool).replace_schedules(
-                project_id, schedules
-            )
-        finally:
-            await self.orchestrator.repos.remove_worktree(worktree)
 
     async def _rerun(self, build_id: int) -> None:
         await restarts.rerun(self, build_id)
@@ -592,86 +549,4 @@ class CIService:
             await asyncio.sleep(MAINTENANCE_INTERVAL)
 
     async def scheduled_effects_loop(self) -> None:
-        store = ScheduledEffectsStore(self.pool)
-        while True:
-            try:
-                for due in await store.due_effects():
-                    logger.info(
-                        "scheduled effect due",
-                        extra={
-                            "schedule": due.schedule_name,
-                            "effect": due.effect,
-                        },
-                    )
-                    # Enqueue before mark_run: the reverse order loses
-                    # the occurrence when we crash in between.
-                    await self.enqueue_work(
-                        "scheduled",
-                        f"scheduled-{due.project_id}-{due.schedule_name}-{due.effect}",
-                        {
-                            "project_id": due.project_id,
-                            "schedule_name": due.schedule_name,
-                            "effect": due.effect,
-                            "when": due.when.model_dump(exclude_none=True),
-                        },
-                    )
-                    await store.mark_run(due)
-            except Exception:
-                logger.exception("scheduled-effects sweep failed")
-            # Sleep to the next minute boundary: is_due matches exactly
-            # one wall-clock minute, so a fixed 60s sleep after the sweep
-            # work would drift and silently skip minutes.
-            await asyncio.sleep(60 - (time.time() % 60))
-
-    async def _run_scheduled(self, due: DueEffect) -> None:
-        project = await self.repo_store.by_id(due.project_id)
-        if project is None or not project.enabled:
-            return
-        info = repo_info(project)
-        store = ScheduledEffectsStore(self.pool)
-        run_id = await store.start_run(due)
-        try:
-            success = await self._run_scheduled_inner(due, info, run_id)
-            await store.finish_run(run_id, success=success)
-        except Exception as e:
-            # Spawned task: an exception would only surface as "Task
-            # exception was never retrieved" and leave the row running.
-            logger.exception("scheduled effect crashed", extra={"run_id": run_id})
-            await store.finish_run(run_id, success=False, error=str(e))
-
-    async def _run_scheduled_inner(
-        self, due: DueEffect, info: RepoInfo, run_id: int
-    ) -> bool:
-        credentials = await self.credentials_provider(info.forge).get(info.clone_url)
-        await self.orchestrator.repos.fetch(
-            info.key, info.clone_url, ["+refs/heads/*:refs/heads/*"], credentials
-        )
-        worktree = await self.orchestrator.repos.checkout_for_build(
-            info.key,
-            scheduled_worktree_id(due, run_id),
-            base_commit=info.default_branch,
-        )
-        task_token = self.orchestrator.task_tokens.issue(due.project_id)
-        log_dir = self.config.state_dir / "logs" / "scheduled"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log = LogWriter(
-            path=log_dir / f"{run_id}.zst",
-            size_limit=self.config.log_size_limit,
-        )
-        try:
-            ctx = effects_context(
-                self.config,
-                info,
-                worktree_path=worktree.path,
-                rev=await worktree.rev_parse("HEAD"),
-                branch=info.default_branch,
-                git_token=credentials.token if credentials is not None else None,
-                task_token=task_token,
-            )
-            return await run_scheduled_effect(
-                ctx, due.schedule_name, due.effect, log.write
-            )
-        finally:
-            self.orchestrator.task_tokens.revoke(task_token)
-            await log.close()
-            await self.orchestrator.repos.remove_worktree(worktree)
+        await scheduled_runs.scheduled_effects_loop(self)
