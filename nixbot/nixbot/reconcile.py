@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 from .webhooks import ChangeRequest
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     import asyncpg
 
     from .forge import GiteaClient, GitHubAppClient, GitlabClient
@@ -33,10 +36,39 @@ class RemoteHead:
     pr_number: int | None = None
     pr_author: str | None = None
     base_sha: str | None = None
+    # Forge-clock PR update time; feeds the reconcile watermark.
+    updated_at: datetime | None = None
+
+
+def max_pr_updated(heads: list[RemoteHead]) -> datetime | None:
+    """Newest PR update time seen; the next reconcile's watermark."""
+    times = [h.updated_at for h in heads if h.updated_at is not None]
+    return max(times) if times else None
+
+
+async def _collect_until(
+    pages: AsyncIterator[list[dict[str, Any]]],
+    updated_since: datetime | None,
+) -> list[dict[str, Any]]:
+    """Collect update-sorted (desc) PRs, stopping pagination at the
+    first PR not updated since the watermark (inclusive boundary:
+    equal timestamps are kept, is_built dedupes them)."""
+    results: list[dict[str, Any]] = []
+    async for page in pages:
+        for pull in page:
+            if (
+                updated_since is not None
+                and datetime.fromisoformat(pull["updated_at"]) < updated_since
+            ):
+                return results
+            results.append(pull)
+    return results
 
 
 async def github_heads(
-    client: GitHubAppClient, project: RepoRecord
+    client: GitHubAppClient,
+    project: RepoRecord,
+    updated_since: datetime | None = None,
 ) -> list[RemoteHead]:
     installation_id = await client.installation_for_repo(
         f"{project.owner}/{project.name}"
@@ -57,7 +89,13 @@ async def github_heads(
                 commit_sha=response.json()["commit"]["sha"],
             )
         )
-    pulls = await client.paginated(f"{repo_url}/pulls?state=open&per_page=100", token)
+    pulls = await _collect_until(
+        client.paginated_pages(
+            f"{repo_url}/pulls?state=open&per_page=100&sort=updated&direction=desc",
+            token,
+        ),
+        updated_since,
+    )
     heads.extend(
         RemoteHead(
             branch=pull["base"]["ref"],
@@ -67,13 +105,18 @@ async def github_heads(
             # base.sha is frozen at PR creation; merge into the current
             # base branch tip instead (see webhooks._parse_pr_event).
             base_sha=f"refs/heads/{pull['base']['ref']}",
+            updated_at=datetime.fromisoformat(pull["updated_at"]),
         )
         for pull in pulls
     )
     return heads
 
 
-async def gitea_heads(client: GiteaClient, project: RepoRecord) -> list[RemoteHead]:
+async def gitea_heads(
+    client: GiteaClient,
+    project: RepoRecord,
+    updated_since: datetime | None = None,
+) -> list[RemoteHead]:
     repo_url = f"{client.instance_url}/api/v1/repos/{project.owner}/{project.name}"
     heads = []
     response = await client.http.get(
@@ -87,7 +130,12 @@ async def gitea_heads(client: GiteaClient, project: RepoRecord) -> list[RemoteHe
                 commit_sha=response.json()["commit"]["id"],
             )
         )
-    pulls = await client.paginated(f"{repo_url}/pulls?state=open&limit=50")
+    pulls = await _collect_until(
+        client.paginated_pages(
+            f"{repo_url}/pulls?state=open&limit=50&sort=recentupdate"
+        ),
+        updated_since,
+    )
     heads.extend(
         RemoteHead(
             branch=pull["base"]["ref"],
@@ -95,13 +143,18 @@ async def gitea_heads(client: GiteaClient, project: RepoRecord) -> list[RemoteHe
             pr_number=pull["number"],
             pr_author=f"gitea:{pull['user']['login']}",
             base_sha=f"refs/heads/{pull['base']['ref']}",
+            updated_at=datetime.fromisoformat(pull["updated_at"]),
         )
         for pull in pulls
     )
     return heads
 
 
-async def gitlab_heads(client: GitlabClient, project: RepoRecord) -> list[RemoteHead]:
+async def gitlab_heads(
+    client: GitlabClient,
+    project: RepoRecord,
+    updated_since: datetime | None = None,
+) -> list[RemoteHead]:
     repo_url = client.project_api_url(project.owner, project.name)
     heads = []
     response = await client.http.get(
@@ -115,9 +168,14 @@ async def gitlab_heads(client: GitlabClient, project: RepoRecord) -> list[Remote
                 commit_sha=response.json()["commit"]["id"],
             )
         )
-    pulls = await client.paginated(
-        f"{repo_url}/merge_requests?state=opened&per_page=100"
-    )
+    mr_url = f"{repo_url}/merge_requests?state=opened&per_page=100"
+    if updated_since is not None:
+        # updated_after is exclusive, but the watermark equals a seen
+        # MR's updated_at; back off one second to keep the boundary
+        # inclusive like the other forges (is_built dedupes overlap).
+        cutoff = (updated_since - timedelta(seconds=1)).isoformat()
+        mr_url += f"&updated_after={quote(cutoff, safe='')}"
+    pulls = await client.paginated(mr_url)
     heads.extend(
         RemoteHead(
             branch=pull["target_branch"],
@@ -127,6 +185,7 @@ async def gitlab_heads(client: GitlabClient, project: RepoRecord) -> list[Remote
             # The MR API exposes no base sha; merge against the
             # target branch ref instead.
             base_sha=f"refs/heads/{pull['target_branch']}",
+            updated_at=datetime.fromisoformat(pull["updated_at"]),
         )
         for pull in pulls
     )

@@ -17,14 +17,17 @@ import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import httpx
 
 from nixbot.gitrepo import FetchCredentials
 
-from .base import DiscoveredRepo, ForgeError, paginate_link
+from .base import DiscoveredRepo, ForgeError, paginate_link, paginate_link_pages
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +144,15 @@ class GitHubAppClient:
             "Accept": "application/vnd.github+json",
         }
         return await paginate_link(self.http, url, headers, "GitHub", subkey=subkey)
+
+    def paginated_pages(
+        self, url: str, token: str
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        }
+        return paginate_link_pages(self.http, url, headers, "GitHub")
 
     async def check_app_webhook(self, base_url: str) -> list[str]:
         """Return problems with the GitHub App's webhook configuration.

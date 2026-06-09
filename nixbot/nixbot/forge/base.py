@@ -15,6 +15,8 @@ import httpx
 from nixbot.gitrepo import FetchCredentials
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from nixbot.config import RepoFilters
 
 
@@ -35,6 +37,26 @@ def check_response(response: httpx.Response, forge_name: str) -> None:
         raise ForgeError(msg, status_code=response.status_code)
 
 
+async def paginate_link_pages(
+    http: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    forge_name: str,
+    subkey: str | None = None,
+) -> AsyncIterator[list[dict[str, Any]]]:
+    """Yield pages of a Link-header (RFC 5988) paginated endpoint.
+    `subkey` extracts a nested list from each page (GitHub wraps some
+    collections in an object). Page-wise so callers fetching
+    update-sorted lists can stop early at a watermark."""
+    next_url: str | None = url
+    while next_url:
+        response = await http.get(next_url, headers=headers)
+        check_response(response, forge_name)
+        data = response.json()
+        yield data[subkey] if subkey else data
+        next_url = response.links.get("next", {}).get("url")
+
+
 async def paginate_link(
     http: httpx.AsyncClient,
     url: str,
@@ -42,17 +64,10 @@ async def paginate_link(
     forge_name: str,
     subkey: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Collect all pages of a Link-header (RFC 5988) paginated endpoint.
-    `subkey` extracts a nested list from each page (GitHub wraps some
-    collections in an object)."""
+    """Collect all pages of a Link-header (RFC 5988) paginated endpoint."""
     results: list[dict[str, Any]] = []
-    next_url: str | None = url
-    while next_url:
-        response = await http.get(next_url, headers=headers)
-        check_response(response, forge_name)
-        data = response.json()
-        results.extend(data[subkey] if subkey else data)
-        next_url = response.links.get("next", {}).get("url")
+    async for page in paginate_link_pages(http, url, headers, forge_name, subkey):
+        results.extend(page)
     return results
 
 
@@ -77,6 +92,9 @@ class TokenForgeClient:
 
     async def paginated(self, url: str) -> list[dict[str, Any]]:
         return await paginate_link(self.http, url, self.auth_headers(), self.forge_name)
+
+    def paginated_pages(self, url: str) -> AsyncIterator[list[dict[str, Any]]]:
+        return paginate_link_pages(self.http, url, self.auth_headers(), self.forge_name)
 
 
 @dataclass(frozen=True)

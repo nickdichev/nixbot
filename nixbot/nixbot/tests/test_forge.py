@@ -9,6 +9,7 @@ import base64
 import json
 import shutil
 import subprocess
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import httpx
@@ -28,7 +29,13 @@ from nixbot.gitea_hooks import (
 )
 from nixbot.gitlab_hooks import register_repo_hook as gitlab_register_repo_hook
 from nixbot.hook_secrets import WebhookSecrets
-from nixbot.reconcile import gitea_heads, gitlab_heads, reconcile_repo
+from nixbot.reconcile import (
+    RemoteHead,
+    gitea_heads,
+    gitlab_heads,
+    max_pr_updated,
+    reconcile_repo,
+)
 from nixbot.repos import RepoStore
 from nixbot.status import (
     GiteaStatusPoster,
@@ -571,6 +578,7 @@ async def test_gitlab_heads_carry_target_branch_base(pool: asyncpg.Pool) -> None
                         "sha": "head-mr5",
                         "target_branch": "main",
                         "author": {"username": "alice"},
+                        "updated_at": "2026-06-09T10:00:00.000Z",
                     }
                 ],
             )
@@ -631,12 +639,14 @@ async def test_reconcile_unbuilt_heads(pool: asyncpg.Pool) -> None:
                         "user": {"login": "alice"},
                         "head": {"sha": "head-pr5"},
                         "base": {"ref": "main", "sha": "base-pr5"},
+                        "updated_at": "2026-06-09T10:00:00Z",
                     },
                     {
                         "number": 6,
                         "user": {"login": "bob"},
                         "head": {"sha": "already-built"},
                         "base": {"ref": "main", "sha": "base-pr6"},
+                        "updated_at": "2026-06-09T09:00:00Z",
                     },
                 ],
             )
@@ -687,6 +697,123 @@ async def test_reconcile_unbuilt_heads(pool: asyncpg.Pool) -> None:
     events.clear()
     submitted = await reconcile_repo(pool, project, heads, Sink())
     assert submitted == 0  # main head cancelled, PRs skipped
+
+
+async def test_gitea_watermark_stops_pagination(pool: asyncpg.Pool) -> None:
+    """PRs are fetched newest-update-first; pagination must stop at
+    the first PR older than the watermark instead of walking the
+    whole open-PR backlog (nixpkgs-scale repos)."""
+    requested_pages: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/repos/acme/wm/branches/main":
+            return httpx.Response(200, json={"commit": {"id": "head-main"}})
+        if path == "/api/v1/repos/acme/wm/pulls":
+            assert request.url.params["sort"] == "recentupdate"
+            page = int(request.url.params.get("page", "1"))
+            requested_pages.append(page)
+            pages = {
+                1: [
+                    {
+                        "number": 2,
+                        "user": {"login": "alice"},
+                        "head": {"sha": "head-pr2"},
+                        "base": {"ref": "main", "sha": "b"},
+                        "updated_at": "2026-06-09T10:00:00Z",
+                    }
+                ],
+                2: [
+                    {
+                        "number": 1,
+                        "user": {"login": "bob"},
+                        "head": {"sha": "head-pr1"},
+                        "base": {"ref": "main", "sha": "b"},
+                        "updated_at": "2026-06-09T08:00:00Z",
+                    }
+                ],
+            }
+            return httpx.Response(200, json=pages.get(page, []))
+        return httpx.Response(404)
+
+    await insert_project(pool, "wm", forge="gitea", forge_repo_id="wm-1")
+    project = await RepoStore(pool).by_forge_id("gitea", "wm-1")
+    assert project is not None
+    client = gitea_client(handler)
+
+    watermark = datetime(2026, 6, 9, 9, 0, tzinfo=UTC)
+    heads = await gitea_heads(client, project, watermark)
+    # main + PR 2; PR 1 (older than watermark) excluded, page 3 never
+    # requested.
+    assert [h.commit_sha for h in heads] == ["head-main", "head-pr2"]
+    assert requested_pages == [1, 2]
+
+    # Watermark boundary is inclusive: a PR updated exactly at the
+    # watermark is still returned (dedup happens via is_built).
+    requested_pages.clear()
+    heads = await gitea_heads(client, project, datetime(2026, 6, 9, 10, 0, tzinfo=UTC))
+    assert [h.commit_sha for h in heads] == ["head-main", "head-pr2"]
+
+    # No watermark (first reconcile): full fetch.
+    requested_pages.clear()
+    heads = await gitea_heads(client, project)
+    assert [h.commit_sha for h in heads] == ["head-main", "head-pr2", "head-pr1"]
+    assert requested_pages == [1, 2, 3]
+
+
+async def test_gitlab_heads_filter_updated_after(pool: asyncpg.Pool) -> None:
+    """GitLab filters server-side: the MR listing must carry
+    updated_after, backed off one second to keep the watermark
+    boundary inclusive."""
+    seen_params: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v4/projects/acme/glwm/repository/branches/main":
+            return httpx.Response(200, json={"commit": {"id": "head-main"}})
+        if path == "/api/v4/projects/acme/glwm/merge_requests":
+            seen_params.append(dict(request.url.params))
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    await insert_project(pool, "glwm", forge="gitlab", forge_repo_id="glwm-1")
+    project = await RepoStore(pool).by_forge_id("gitlab", "glwm-1")
+    assert project is not None
+    client = gitlab_client(handler)
+
+    await gitlab_heads(client, project)
+    assert "updated_after" not in seen_params[0]
+
+    await gitlab_heads(client, project, datetime(2026, 6, 9, 9, 0, tzinfo=UTC))
+    assert (
+        seen_params[1]["updated_after"]
+        == datetime(2026, 6, 9, 8, 59, 59, tzinfo=UTC).isoformat()
+    )
+
+
+async def test_reconcile_watermark_store(pool: asyncpg.Pool) -> None:
+    """Watermark derives from the newest PR update time and never
+    rewinds (a filtered fetch sees fewer PRs than a full one)."""
+    project_id = await insert_project(
+        pool, "wmstore", forge="gitea", forge_repo_id="wmstore-1"
+    )
+    store = RepoStore(pool)
+    assert await store.reconcile_watermark(project_id) is None
+
+    older = datetime(2026, 6, 9, 8, 0, tzinfo=UTC)
+    newer = datetime(2026, 6, 9, 10, 0, tzinfo=UTC)
+    heads = [
+        RemoteHead(branch="main", commit_sha="m"),  # no PR: no timestamp
+        RemoteHead(branch="main", commit_sha="a", pr_number=1, updated_at=older),
+        RemoteHead(branch="main", commit_sha="b", pr_number=2, updated_at=newer),
+    ]
+    assert max_pr_updated(heads) == newer
+    assert max_pr_updated([heads[0]]) is None
+
+    await store.set_reconcile_watermark(project_id, newer)
+    assert await store.reconcile_watermark(project_id) == newer
+    await store.set_reconcile_watermark(project_id, older)  # must not rewind
+    assert await store.reconcile_watermark(project_id) == newer
 
 
 # --- status posting against fake forge APIs -------------------------
