@@ -224,14 +224,13 @@ async def run_event(
     return build, reporter, pool
 
 
-async def run_effect_build(
-    dsn: str,
-    tmp_path: Path,
-    upstream: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> tuple[BuildRecord | None, Orchestrator, RepoInfo, asyncpg.Pool, list[str]]:
-    """One default-branch build with a fake "deploy" effect; returns
-    the recorded effect runs for further assertions."""
+def patch_effects(
+    monkeypatch: pytest.MonkeyPatch, run_effect: object | None = None
+) -> list[str]:
+    """Replace effect discovery/run with a fake "deploy" effect.
+
+    Returns the list that records executed effect names. A custom
+    run_effect replaces the recording default."""
     ran: list[str] = []
 
     async def fake_list(ctx: object) -> list[str]:
@@ -242,7 +241,19 @@ async def run_effect_build(
         return True
 
     monkeypatch.setattr(effects_run_mod, "list_effects", fake_list)
-    monkeypatch.setattr(effects_run_mod, "run_effect", fake_run)
+    monkeypatch.setattr(effects_run_mod, "run_effect", run_effect or fake_run)
+    return ran
+
+
+async def run_effect_build(
+    dsn: str,
+    tmp_path: Path,
+    upstream: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[BuildRecord | None, Orchestrator, RepoInfo, asyncpg.Pool, list[str]]:
+    """One default-branch build with a fake "deploy" effect; returns
+    the recorded effect runs for further assertions."""
+    ran = patch_effects(monkeypatch)
     pool = await asyncpg.create_pool(dsn)
     orchestrator, _ = make_orchestrator(
         pool, tmp_path, FakeEvalRunner([mk_job("a")]), FakeExecutor()
@@ -1181,17 +1192,7 @@ def test_pr_worktree_config_cannot_grant_effects(
         git(upstream, "checkout", "main")
         base = git(upstream, "rev-parse", "HEAD")
 
-        ran: list[str] = []
-
-        async def fake_list(ctx: object) -> list[str]:
-            return ["deploy"]
-
-        async def fake_run(ctx: object, name: str, log_write: object = None) -> bool:
-            ran.append(name)
-            return True
-
-        monkeypatch.setattr(effects_run_mod, "list_effects", fake_list)
-        monkeypatch.setattr(effects_run_mod, "run_effect", fake_run)
+        ran = patch_effects(monkeypatch)
         pool, orchestrator, _, project = await make_env(
             postgres_dsn,
             tmp_path,
@@ -1506,15 +1507,11 @@ def test_effect_crash_settles_the_row(
     next service restart."""
 
     async def run() -> None:
-        async def fake_list(ctx: object) -> list[str]:
-            return ["deploy"]
-
         async def broken_run(ctx: object, name: str, log_write: object = None) -> bool:
             msg = "unexpected"
             raise RuntimeError(msg)
 
-        monkeypatch.setattr(effects_run_mod, "list_effects", fake_list)
-        monkeypatch.setattr(effects_run_mod, "run_effect", broken_run)
+        patch_effects(monkeypatch, run_effect=broken_run)
         add_commit(upstream, "eff-crash")
         pool, orchestrator, _, project = await make_env(
             postgres_dsn,
@@ -1732,18 +1729,8 @@ def test_reuse_for_default_branch_push_runs_effects(
     """A main push reusing a succeeded PR build must still deploy:
     the PR run never started effects."""
 
-    ran: list[str] = []
-
-    async def fake_list(ctx: object) -> list[str]:
-        return ["deploy"]
-
-    async def fake_run(ctx: object, name: str, log_write: object = None) -> bool:
-        ran.append(name)
-        return True
-
     async def run() -> None:
-        monkeypatch.setattr(effects_run_mod, "list_effects", fake_list)
-        monkeypatch.setattr(effects_run_mod, "run_effect", fake_run)
+        ran = patch_effects(monkeypatch)
         add_commit(upstream, "reuse-deploy")
         sha = git(upstream, "rev-parse", "HEAD")
         pool, orchestrator, _, project = await make_env(
@@ -1872,15 +1859,8 @@ def test_effect_log_does_not_collide_with_attribute_log(
     """An attribute named "effect-deploy" and an effect named "deploy"
     must not share one log file."""
 
-    async def fake_list(ctx: object) -> list[str]:
-        return ["deploy"]
-
-    async def fake_run(ctx: object, name: str, log_write: object = None) -> bool:
-        return True
-
     async def run() -> None:
-        monkeypatch.setattr(effects_run_mod, "list_effects", fake_list)
-        monkeypatch.setattr(effects_run_mod, "run_effect", fake_run)
+        patch_effects(monkeypatch)
         add_commit(upstream, "log-collide")
         pool, orchestrator, _, project = await make_env(
             postgres_dsn,
