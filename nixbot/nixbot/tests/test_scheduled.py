@@ -45,14 +45,13 @@ def test_parse_schedules() -> None:
     assert schedules["monthly"].when.dayOfMonth == [1]
 
 
-def test_is_due_exact() -> None:
+def test_is_due() -> None:
+    # Scalar hour (separate branch from the hour-list case below).
     when = ScheduleWhen(minute=30, hour=2)
     assert is_due(when, "s", datetime(2026, 6, 5, 2, 30, tzinfo=UTC))
     assert not is_due(when, "s", datetime(2026, 6, 5, 2, 31, tzinfo=UTC))
     assert not is_due(when, "s", datetime(2026, 6, 5, 3, 30, tzinfo=UTC))
 
-
-def test_is_due_hour_list_and_days() -> None:
     when = ScheduleWhen(minute=0, hour=[6, 18], dayOfWeek=["Mon"])
     monday = datetime(2026, 6, 1, 6, 0, tzinfo=UTC)  # a Monday
     tuesday = datetime(2026, 6, 2, 6, 0, tzinfo=UTC)
@@ -282,20 +281,13 @@ def test_due_effects_window_and_bad_spec(postgres_dsn: str) -> None:
 
             # The sweep drifted past 2:30: the occurrence is still found,
             # and the malformed schedule is skipped instead of raising.
+            # (mark_run/no-refire lifecycle is covered by
+            # test_store_roundtrip_and_due.)
             late = datetime(2026, 6, 5, 2, 31, 40, tzinfo=UTC)
             due = [
                 d for d in await store.due_effects(late) if d.project_id == project_id
             ]
             assert [d.schedule_name for d in due] == ["nightly"]
-
-            # Marked as run at the sweep time: the same occurrence does
-            # not fire again on the next sweep.
-            await store.mark_run(due[0], late)
-            assert [
-                d
-                for d in await store.due_effects(late.replace(minute=32))
-                if d.project_id == project_id
-            ] == []
         finally:
             await pool.close()
 
