@@ -5,35 +5,25 @@ from __future__ import annotations
 
 from typing import Any
 
-import httpx
-
-from .base import DiscoveredRepo, ForgeError
+from .base import DiscoveredRepo, TokenForgeClient, check_response
 
 
-class GiteaClient:
-    def __init__(
-        self,
-        instance_url: str,
-        token: str,
-        http: httpx.AsyncClient | None = None,
-    ) -> None:
-        self.instance_url = instance_url.rstrip("/")
-        self.token = token
-        self.http = http or httpx.AsyncClient()
+class GiteaClient(TokenForgeClient):
+    forge_name = "Gitea"
 
     def auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"token {self.token}"}
 
     async def paginated(self, url: str) -> list[dict[str, Any]]:
+        # Gitea does not emit RFC 5988 Link headers reliably; walk
+        # ?page=N until an empty page.
         results: list[dict[str, Any]] = []
         page = 1
         while True:
             response = await self.http.get(
                 f"{url}&page={page}", headers=self.auth_headers()
             )
-            if response.status_code >= 400:  # noqa: PLR2004
-                msg = f"Gitea request failed: {response.status_code} {response.text}"
-                raise ForgeError(msg, status_code=response.status_code)
+            check_response(response, self.forge_name)
             data = response.json()
             if not data:
                 return results

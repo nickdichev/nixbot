@@ -4,24 +4,13 @@ equivalent exists, so auth follows the Gitea model."""
 
 from __future__ import annotations
 
-from typing import Any
 from urllib.parse import quote
 
-import httpx
-
-from .base import DiscoveredRepo, ForgeError
+from .base import DiscoveredRepo, TokenForgeClient
 
 
-class GitlabClient:
-    def __init__(
-        self,
-        instance_url: str,
-        token: str,
-        http: httpx.AsyncClient | None = None,
-    ) -> None:
-        self.instance_url = instance_url.rstrip("/")
-        self.token = token
-        self.http = http or httpx.AsyncClient()
+class GitlabClient(TokenForgeClient):
+    forge_name = "GitLab"
 
     def auth_headers(self) -> dict[str, str]:
         return {"PRIVATE-TOKEN": self.token}
@@ -32,18 +21,6 @@ class GitlabClient:
         return (
             f"{self.instance_url}/api/v4/projects/{quote(f'{owner}/{repo}', safe='')}"
         )
-
-    async def paginated(self, url: str) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
-        next_url: str | None = url
-        while next_url:
-            response = await self.http.get(next_url, headers=self.auth_headers())
-            if response.status_code >= 400:  # noqa: PLR2004
-                msg = f"GitLab request failed: {response.status_code} {response.text}"
-                raise ForgeError(msg, status_code=response.status_code)
-            results.extend(response.json())
-            next_url = response.links.get("next", {}).get("url")
-        return results
 
     async def discover_repos(self) -> list[DiscoveredRepo]:
         repos = []

@@ -24,7 +24,7 @@ import httpx
 
 from nixbot.gitrepo import FetchCredentials
 
-from .base import DiscoveredRepo, ForgeError
+from .base import DiscoveredRepo, ForgeError, paginate_link
 
 logger = logging.getLogger(__name__)
 
@@ -136,23 +136,11 @@ class GitHubAppClient:
     async def paginated(
         self, url: str, token: str, subkey: str | None = None
     ) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
-        next_url: str | None = url
-        while next_url:
-            response = await self.http.get(
-                next_url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/vnd.github+json",
-                },
-            )
-            if response.status_code >= 400:  # noqa: PLR2004
-                msg = f"GitHub request failed: {response.status_code} {response.text}"
-                raise ForgeError(msg, status_code=response.status_code)
-            data = response.json()
-            results.extend(data[subkey] if subkey else data)
-            next_url = response.links.get("next", {}).get("url")
-        return results
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        }
+        return await paginate_link(self.http, url, headers, "GitHub", subkey=subkey)
 
     async def check_app_webhook(self, base_url: str) -> list[str]:
         """Return problems with the GitHub App's webhook configuration.
