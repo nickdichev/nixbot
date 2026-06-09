@@ -15,7 +15,7 @@ import asyncpg
 import pytest
 
 from nixbot import build_run as build_run_mod
-from nixbot import orchestrator as orch_mod
+from nixbot import effects_run as effects_run_mod
 from nixbot.config import Config
 from nixbot.db import BuildDB, BuildStatus
 from nixbot.events import ChangeEvent, RepoInfo
@@ -228,8 +228,8 @@ async def run_effect_build(
         ran.append(name)
         return True
 
-    monkeypatch.setattr(orch_mod, "list_effects", fake_list)
-    monkeypatch.setattr(orch_mod, "run_effect", fake_run)
+    monkeypatch.setattr(effects_run_mod, "list_effects", fake_list)
+    monkeypatch.setattr(effects_run_mod, "run_effect", fake_run)
     pool = await asyncpg.create_pool(dsn)
     orchestrator, _ = make_orchestrator(
         pool, tmp_path, FakeEvalRunner([mk_job("a")]), FakeExecutor()
@@ -1197,8 +1197,8 @@ def test_pr_worktree_config_cannot_grant_effects(
             ran.append(name)
             return True
 
-        monkeypatch.setattr(orch_mod, "list_effects", fake_list)
-        monkeypatch.setattr(orch_mod, "run_effect", fake_run)
+        monkeypatch.setattr(effects_run_mod, "list_effects", fake_list)
+        monkeypatch.setattr(effects_run_mod, "run_effect", fake_run)
         pool, orchestrator, _, project = await make_env(
             postgres_dsn,
             tmp_path,
@@ -1520,8 +1520,8 @@ def test_effect_crash_settles_the_row(
             msg = "unexpected"
             raise RuntimeError(msg)
 
-        monkeypatch.setattr(orch_mod, "list_effects", fake_list)
-        monkeypatch.setattr(orch_mod, "run_effect", broken_run)
+        monkeypatch.setattr(effects_run_mod, "list_effects", fake_list)
+        monkeypatch.setattr(effects_run_mod, "run_effect", broken_run)
         add_commit(upstream, "eff-crash")
         pool, orchestrator, _, project = await make_env(
             postgres_dsn,
@@ -1749,8 +1749,8 @@ def test_reuse_for_default_branch_push_runs_effects(
         return True
 
     async def run() -> None:
-        monkeypatch.setattr(orch_mod, "list_effects", fake_list)
-        monkeypatch.setattr(orch_mod, "run_effect", fake_run)
+        monkeypatch.setattr(effects_run_mod, "list_effects", fake_list)
+        monkeypatch.setattr(effects_run_mod, "run_effect", fake_run)
         add_commit(upstream, "reuse-deploy")
         sha = git(upstream, "rev-parse", "HEAD")
         pool, orchestrator, _, project = await make_env(
@@ -1886,8 +1886,8 @@ def test_effect_log_does_not_collide_with_attribute_log(
         return True
 
     async def run() -> None:
-        monkeypatch.setattr(orch_mod, "list_effects", fake_list)
-        monkeypatch.setattr(orch_mod, "run_effect", fake_run)
+        monkeypatch.setattr(effects_run_mod, "list_effects", fake_list)
+        monkeypatch.setattr(effects_run_mod, "run_effect", fake_run)
         add_commit(upstream, "log-collide")
         pool, orchestrator, _, project = await make_env(
             postgres_dsn,
@@ -1987,7 +1987,7 @@ def test_effects_phase_error_keeps_succeeded_build(
         raise RuntimeError(msg)
 
     async def run() -> None:
-        monkeypatch.setattr(orch_mod, "list_effects", boom_list)
+        monkeypatch.setattr(effects_run_mod, "list_effects", boom_list)
         add_commit(upstream, "late-boom")
         pool, orchestrator, reporter, project = await make_env(
             postgres_dsn,

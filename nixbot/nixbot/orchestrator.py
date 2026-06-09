@@ -18,9 +18,8 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
-from urllib.parse import quote
 
-from . import build_run, gcroots, outputs
+from . import build_run, effects_run, gcroots, outputs
 from .canceller import (
     CancellationManager,
     RegisterOutcome,
@@ -28,19 +27,10 @@ from .canceller import (
     has_skip_ci_marker,
 )
 from .db import BuildStatus
-from .effects import (
-    EffectsContext,
-    EffectsError,
-    effects_context,
-    list_effects,
-    run_effect,
-    should_run_effects,
-)
 from .effects_state import TaskTokens
 from .events import ChangeEvent, NullStatusReporter, RepoInfo, StatusReporter
-from .executor import LogWriter, failure_excerpt
+from .executor import LogWriter
 from .gitrepo import GitError, MergeConflictError, run_git
-from .repo_config import CONFIG_FILENAMES, BranchConfig
 from .web.logs import LogRegistry
 from .work_queue import WorkQueue
 
@@ -58,6 +48,7 @@ if TYPE_CHECKING:
         JobBatchCallback,
         StderrLineCallback,
     )
+    from .repo_config import BranchConfig
     from .scheduler import AttributeResult, BuildOutcome, FailedBuildCache
 
     GcrootRegistrar = Callable[[Path, str, str, str], Awaitable[None]]
@@ -458,68 +449,9 @@ class Orchestrator:
         worktree_path: Path,
         credentials: FetchCredentials | None = None,
     ) -> None:
-        repo = event.repo
-        # Gating config comes from the default branch of the central
-        # clone: the worktree is PR-controlled, so its nixbot.toml
-        # could grant the PR effects (and deploy secrets).
-        # refs/heads/ prefix: a bare branch name would resolve a tag
-        # of the same name first (tags auto-follow into the clone).
-        config_text = None
-        for filename in CONFIG_FILENAMES:
-            config_text = await self.repos.show_file(
-                repo.key, f"refs/heads/{repo.default_branch}", filename
-            )
-            if config_text is not None:
-                break
-        default_branch_config = BranchConfig.loads(config_text)
-        if not should_run_effects(
-            default_branch_config,
-            repo.default_branch,
-            event.branch,
-            is_pull_request=event.pr_number is not None,
-        ):
-            return
-        # The started-flag guards against auto-re-running effects on
-        # crash recovery (deploys are not idempotent).
-        if not await self.db.mark_effects_started(build.id):
-            return
-        task_token = self.task_tokens.issue(build.project_id)
-        ctx = effects_context(
-            self.config,
-            repo,
-            worktree_path=worktree_path,
-            rev=event.commit_sha,
-            branch=event.branch,
-            git_token=credentials.token if credentials is not None else None,
-            task_token=task_token,
+        await effects_run.maybe_run_effects(
+            self, event, build, worktree_path, credentials
         )
-        try:
-            names = await list_effects(ctx)
-        except (EffectsError, OSError):
-            # OSError: nixbot-effects not installed; effects are
-            # best-effort and must not fail the (already reported) build.
-            logger.exception("effects discovery failed", extra={"build_id": build.id})
-            return
-        finally:
-            self.task_tokens.revoke(task_token)
-        # Effects removed from the flake since the last run would
-        # otherwise linger as stale pending rows.
-        await self.db.pool.execute(
-            "DELETE FROM build_effects WHERE build_id = $1 "
-            "AND NOT (name = ANY($2::text[]))",
-            build.id,
-            names,
-        )
-        await self._enqueue_effects(build, names)
-
-    async def _enqueue_effects(self, build: BuildRecord, names: list[str]) -> None:
-        """One queue item per effect, on the build's dedup key."""
-        queue = WorkQueue(self.db.pool)
-        for name in names:
-            await self.db.start_effect(build.id, name, status="pending")
-            await queue.enqueue(
-                "effect", f"build-{build.id}", {"build_id": build.id, "name": name}
-            )
 
     async def run_effect_item(
         self,
@@ -529,33 +461,7 @@ class Orchestrator:
         credentials: FetchCredentials | None = None,
     ) -> None:
         """Dispatcher entry for one queued effect."""
-        row = await self.db.pool.fetchval(
-            "SELECT status FROM build_effects WHERE build_id = $1 AND name = $2",
-            build.id,
-            name,
-        )
-        if row != "pending":
-            # Swept after a crash mid-run, or already terminal; started
-            # effects never auto-re-run (deploys are not idempotent).
-            return
-        async with self.rerun_worktree(info, build, "effect", credentials) as (
-            event,
-            worktree_path,
-        ):
-            task_token = self.task_tokens.issue(build.project_id)
-            try:
-                ctx = effects_context(
-                    self.config,
-                    info,
-                    worktree_path=worktree_path,
-                    rev=event.commit_sha,
-                    branch=event.branch,
-                    git_token=credentials.token if credentials is not None else None,
-                    task_token=task_token,
-                )
-                await self._run_one_effect(ctx, build, name)
-            finally:
-                self.task_tokens.revoke(task_token)
+        await effects_run.run_effect_item(self, info, build, name, credentials)
 
     @asynccontextmanager
     async def open_log(
@@ -571,44 +477,6 @@ class Orchestrator:
         finally:
             await writer.close()
             self.log_registry.unregister(build_id, key)
-
-    async def _run_one_effect(
-        self, ctx: EffectsContext, build: BuildRecord, name: str
-    ) -> None:
-        """One effect with its own row and log."""
-        await self.db.start_effect(build.id, name)
-        # Effect names come from untrusted flakes; percent-encode so
-        # the log file cannot escape the log directory. The "effects/"
-        # subdirectory keeps them apart from attribute logs (a flat
-        # prefix would collide with an attribute named "effect-X").
-        async with self.open_log(
-            build.id, f"effect:{name}", f"effects/{quote(name, safe='')}.zst"
-        ) as writer:
-            try:
-                success = await run_effect(ctx, name, writer.write)
-            except Exception as e:
-                # Any escape would leave the row running forever
-                # (nothing re-runs effects) and kill the loop for the
-                # remaining effects.
-                logger.exception(
-                    "effect crashed",
-                    extra={"build_id": build.id, "effect": name},
-                )
-                await writer.write(f"\n{e}\n".encode())
-                success = False
-        error = None
-        if not success:
-            logger.error("effect failed", extra={"build_id": build.id, "effect": name})
-            error = failure_excerpt(writer.tail_lines()) or None
-        await self.db.finish_effect(
-            build.id,
-            name,
-            success=success,
-            error=error,
-            log_path=str(writer.path.relative_to(self.config.state_dir)),
-            log_size=writer.bytes_seen,
-            log_truncated=writer.truncated,
-        )
 
     async def _attach_linked_event(
         self, event: ChangeEvent, build: BuildRecord
