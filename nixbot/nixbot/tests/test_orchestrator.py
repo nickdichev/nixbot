@@ -104,6 +104,19 @@ class FakeExecutor:
         return self.outcomes.get(job.attr, BuildOutcome.success)
 
 
+class RecordingCache:
+    """Failed-build cache fake recording added drv paths."""
+
+    def __init__(self) -> None:
+        self.added: list[str] = []
+
+    async def check(self, drv_path: str) -> None:
+        return None
+
+    async def add(self, drv_path: str, url: str) -> None:
+        self.added.append(drv_path)
+
+
 @dataclass
 class RecordingReporter:
     events: list[tuple] = field(default_factory=list)
@@ -585,16 +598,6 @@ def test_internal_error_not_recorded_in_failed_build_cache(
                 msg = "executor exploded"
                 raise RuntimeError(msg)
 
-        class RecordingCache:
-            def __init__(self) -> None:
-                self.added: list[str] = []
-
-            async def check(self, drv_path: str) -> None:
-                return None
-
-            async def add(self, drv_path: str, url: str) -> None:
-                self.added.append(drv_path)
-
         sha = add_commit(upstream, "crash")
         pool, orchestrator, _, project = await make_env(
             postgres_dsn,
@@ -792,16 +795,6 @@ def test_recovery_rerun_failures_not_cached(
     """Jobs reconstructed on recovery have empty dependency closures:
     dependents of one broken drv fail individually and must not enter
     the failed-build cache."""
-
-    class RecordingCache:
-        def __init__(self) -> None:
-            self.added: list[str] = []
-
-        async def check(self, drv_path: str) -> None:
-            return None
-
-        async def add(self, drv_path: str, url: str) -> None:
-            self.added.append(drv_path)
 
     async def run() -> None:
         sha = add_commit(upstream, "recov")
