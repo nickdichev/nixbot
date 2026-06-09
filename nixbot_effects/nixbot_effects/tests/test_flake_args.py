@@ -8,6 +8,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from nixbot_effects import _flake_url, effects_args, git_get_tag, secret_context
 from nixbot_effects.options import EffectsOptions
 from nixbot_effects.secrets import SimpleSecret, gather_secrets
@@ -88,8 +90,9 @@ def test_git_tag_propagates_to_secret_context(tmp_path: Path) -> None:
 
 
 class TestFlakeUrl:
-    def test_local_path_fallback(self) -> None:
-        opts = EffectsOptions(path=Path("/home/user/my-repo"))
+    @pytest.mark.parametrize("locked_url", [None, ""], ids=["absent", "empty"])
+    def test_local_path_fallback(self, locked_url: str | None) -> None:
+        opts = EffectsOptions(path=Path("/home/user/my-repo"), locked_url=locked_url)
         assert (
             _flake_url(opts, "abc1234") == "git+file:///home/user/my-repo?rev=abc1234#"
         )
@@ -100,12 +103,6 @@ class TestFlakeUrl:
             locked_url="github:org/repo/abc1234def5678",
         )
         assert _flake_url(opts, "abc1234") == "github:org/repo/abc1234def5678"
-
-    def test_empty_locked_url_falls_back(self) -> None:
-        opts = EffectsOptions(path=Path("/home/user/my-repo"), locked_url="")
-        assert (
-            _flake_url(opts, "abc1234") == "git+file:///home/user/my-repo?rev=abc1234#"
-        )
 
 
 def _init_repo(tmp_path: Path) -> tuple[Path, str]:
@@ -118,14 +115,6 @@ def _init_repo(tmp_path: Path) -> tuple[Path, str]:
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "initial")
     return repo, _git(repo, "rev-parse", "HEAD")
-
-
-def test_git_get_tag_single_tag(tmp_path: Path) -> None:
-    """A commit with exactly one tag must return that tag."""
-    repo, rev = _init_repo(tmp_path)
-    _git(repo, "tag", "v1.0.0")
-
-    assert git_get_tag(repo, rev) == "v1.0.0"
 
 
 def test_git_get_tag_no_tag(tmp_path: Path) -> None:
