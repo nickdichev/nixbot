@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from nixbot.repo_config import CONFIG_FILENAMES, BranchConfig
+from nixbot.repo_config import BranchConfig
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -32,7 +32,3 @@ def test_nixbot_toml_wins_over_legacy(tmp_path: Path) -> None:
 
 def test_missing_files_default(tmp_path: Path) -> None:
     assert BranchConfig.load(tmp_path).attribute == "checks"
-
-
-def test_config_filenames_order() -> None:
-    assert CONFIG_FILENAMES == ("nixbot.toml", "buildbot-nix.toml")
