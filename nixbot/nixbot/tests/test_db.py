@@ -17,6 +17,7 @@ from nixbot.failed_builds import PostgresFailedBuildCache
 from nixbot.migrations import apply_migrations, load_migrations
 from nixbot.models import CacheStatus
 from nixbot.scheduler import AttributeResult, AttributeStatus
+from nixbot.status import FailedStatusStore
 
 from .support import insert_build, insert_project, mk_job
 
@@ -90,7 +91,11 @@ def test_huge_attr_name_does_not_break_notify_trigger(postgres_dsn: str) -> None
     asyncio.run(run())
 
 
-def test_project_build_attribute_crud(postgres_dsn: str) -> None:
+def test_schema_constraints(postgres_dsn: str) -> None:
+    """Schema invariants no component test exercises directly: the
+    stable forge-id uniqueness and the project -> build -> attribute
+    -> log cascade delete."""
+
     async def run() -> None:
         conn = await _connect(postgres_dsn)
         try:
@@ -113,28 +118,15 @@ def test_project_build_attribute_crud(postgres_dsn: str) -> None:
                     """
                 )
 
-            # Allocate a per-project build number atomically.
-            number = await conn.fetchval(
-                """
-                UPDATE projects
-                SET next_build_number = next_build_number + 1
-                WHERE id = $1
-                RETURNING next_build_number - 1
-                """,
-                project_id,
-            )
-            assert number == 1
             build_id = await conn.fetchval(
                 """
                 INSERT INTO builds (project_id, number, tree_hash, commit_sha,
-                                    branch, pr_number, pr_author)
-                VALUES ($1, $2, 'tree123', 'abc', 'main', 7, 'github:alice')
+                                    branch)
+                VALUES ($1, 1, 'tree123', 'abc', 'main')
                 RETURNING id
                 """,
                 project_id,
-                number,
             )
-
             attr_id = await conn.fetchval(
                 """
                 INSERT INTO build_attributes (build_id, attr, system, drv_path)
@@ -145,35 +137,10 @@ def test_project_build_attribute_crud(postgres_dsn: str) -> None:
                 build_id,
             )
             await conn.execute(
-                """
-                UPDATE build_attributes
-                SET status = 'succeeded',
-                    outputs = '{"out": "/nix/store/foo"}',
-                    finished_at = now()
-                WHERE id = $1
-                """,
-                attr_id,
-            )
-            await conn.execute(
                 "INSERT INTO logs (attribute_id, path, size_bytes) "
                 "VALUES ($1, 'a/b.zst', 42)",
                 attr_id,
             )
-
-            row = await conn.fetchrow(
-                """
-                SELECT b.status, a.status AS attr_status, l.size_bytes
-                FROM builds b
-                JOIN build_attributes a ON a.build_id = b.id
-                JOIN logs l ON l.attribute_id = a.id
-                WHERE b.id = $1
-                """,
-                build_id,
-            )
-            assert row is not None
-            assert row["status"] == "pending"
-            assert row["attr_status"] == "succeeded"
-            assert row["size_bytes"] == 42
 
             # Cascade delete: removing the project removes everything.
             await conn.execute("DELETE FROM projects WHERE id = $1", project_id)
@@ -185,51 +152,25 @@ def test_project_build_attribute_crud(postgres_dsn: str) -> None:
     asyncio.run(run())
 
 
-def test_failed_builds_and_statuses_upsert(postgres_dsn: str) -> None:
-    async def run() -> None:
-        conn = await _connect(postgres_dsn)
-        try:
-            project_id = await conn.fetchval(
-                """
-                INSERT INTO projects (forge, forge_repo_id, owner, name,
-                                      default_branch, url, private, enabled)
-                VALUES ('github', 'upsert-1', 'acme', 'upsert', 'main', 'u',
-                        FALSE, TRUE)
-                RETURNING id
-                """
-            )
-            for ts in (1.0, 2.0):
-                await conn.execute(
-                    """
-                    INSERT INTO failed_builds
-                        (project_id, derivation, timestamp, url)
-                    VALUES ($2, '/nix/store/x.drv', $1, 'http://ci/1')
-                    ON CONFLICT (project_id, derivation)
-                    DO UPDATE SET timestamp = EXCLUDED.timestamp
-                    """,
-                    ts,
-                    project_id,
-                )
-            assert (
-                await conn.fetchval(
-                    "SELECT timestamp FROM failed_builds "
-                    "WHERE derivation = '/nix/store/x.drv'"
-                )
-                == 2.0
-            )
+def test_failed_status_store_component(postgres_dsn: str) -> None:
+    """FailedStatusStore is the only consumer of failed_statuses; its
+    mark/upsert/get/clear cycle covers the table semantics."""
 
-            await conn.execute(
-                """
-                INSERT INTO failed_statuses (revision, status_name, timestamp)
-                VALUES ('abc', 'nix-build', 1.0)
-                ON CONFLICT (revision, status_name)
-                DO UPDATE SET timestamp = EXCLUDED.timestamp
-                """
-            )
-            assert await conn.fetchval("SELECT count(*) FROM failed_statuses") == 1
-            await conn.execute("DELETE FROM failed_statuses WHERE revision = 'abc'")
+    async def run() -> None:
+        pool = await asyncpg.create_pool(postgres_dsn)
+        try:
+            store = FailedStatusStore(pool)
+            assert await store.get_failed("abc") == set()
+            await store.mark_failed("abc", "nix-build")
+            # Re-marking upserts instead of violating the primary key.
+            await store.mark_failed("abc", "nix-build")
+            await store.mark_failed("abc", "nix-eval")
+            assert await store.get_failed("abc") == {"nix-build", "nix-eval"}
+            await store.clear("abc", "nix-build")
+            assert await store.get_failed("abc") == {"nix-eval"}
+            await store.clear("abc", "nix-eval")
         finally:
-            await conn.close()
+            await pool.close()
 
     asyncio.run(run())
 
