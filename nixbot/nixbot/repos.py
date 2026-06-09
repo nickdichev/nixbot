@@ -163,10 +163,6 @@ class RepoStore:
         )
         return [_record(row) for row in rows]
 
-    async def all_repos(self) -> list[RepoRecord]:
-        rows = await self.pool.fetch("SELECT * FROM projects ORDER BY owner, name")
-        return [_record(row) for row in rows]
-
     async def by_id(self, project_id: int) -> RepoRecord | None:
         row = await self.pool.fetchrow(
             "SELECT * FROM projects WHERE id = $1", project_id

@@ -45,7 +45,6 @@ class GitError(Exception):
     """A git command failed."""
 
     def __init__(self, args: list[str], returncode: int, stderr: str) -> None:
-        self.args_list = args
         self.returncode = returncode
         self.stderr = stderr
         super().__init__(f"git {' '.join(args)} failed ({returncode}): {stderr}")

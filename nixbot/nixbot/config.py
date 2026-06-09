@@ -164,10 +164,6 @@ class GitHubConfig(BaseModel):
     oauth_private_repo_scope: bool = False
 
     @property
-    def secret_key(self) -> str:
-        return read_secret_file(self.secret_key_file)
-
-    @property
     def webhook_secret(self) -> str:
         return read_secret_file(self.webhook_secret_file)
 
