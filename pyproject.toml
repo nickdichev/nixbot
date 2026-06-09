@@ -2,6 +2,7 @@
 pythonpath = ["nixbot"]
 testpaths = ["tests"]
 timeout = 60
+asyncio_mode = "auto"
 
 [tool.mypy]
 # asyncpg ships no type stubs and no py.typed marker.

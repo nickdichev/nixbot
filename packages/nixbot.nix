@@ -5,6 +5,7 @@
   nix,
   pydantic,
   pytestCheckHook,
+  pytest-asyncio,
   pytest-timeout,
   pytest-xdist,
   pytest-benchmark,
@@ -52,6 +53,7 @@ buildPythonPackage (finalAttrs: {
   nativeCheckInputs = [
     git
     pytestCheckHook
+    pytest-asyncio
     pytest-timeout
     pytest-xdist
     pytest-benchmark
