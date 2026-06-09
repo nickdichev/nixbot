@@ -32,6 +32,7 @@ from nixbot.web.control_routes import (
     create_control_router,
 )
 from nixbot.web.token_routes import create_token_router
+from nixbot.work_queue import WorkQueue
 
 from .support import (
     WebHarness,
@@ -143,10 +144,10 @@ def harness(postgres_dsn: str) -> Iterator[WebHarness]:
 
 def test_control_buttons_hidden_without_permission(harness: WebHarness) -> None:
     url = "/repos/github/acme/widget/builds/1"
-    assert "rebuild failed" not in harness.get(url).text
-    assert "rebuild failed" not in harness.get(url, MALLORY).text
-    assert "rebuild failed" in harness.get(url, ROOT).text
-    assert "rebuild failed" in harness.get(url, ALICE).text
+    assert ">restart</button>" not in harness.get(url).text
+    assert ">restart</button>" not in harness.get(url, MALLORY).text
+    assert ">restart</button>" in harness.get(url, ROOT).text
+    assert ">restart</button>" in harness.get(url, ALICE).text
 
 
 def test_admin_can_restart_and_cancel(harness: WebHarness) -> None:
@@ -253,17 +254,6 @@ def test_restart_attribute_with_special_chars_redirects_encoded(
     assert response.status_code == 303
     assert response.headers["location"].endswith(f"/logs/{encoded}")
     assert [a for _, a in BACKEND.attr_restarts] == [attr]
-
-
-def test_rebuild_all_failed(harness: WebHarness) -> None:
-    BACKEND.attr_restarts.clear()
-    assert (
-        harness.post(
-            "/repos/github/acme/widget/builds/1/rebuild-failed", ROOT
-        ).status_code
-        == 303
-    )
-    assert sorted(a for _, a in BACKEND.attr_restarts) == ["bad1", "bad2"]
 
 
 def project_enabled(harness: WebHarness) -> bool:
@@ -496,8 +486,9 @@ async def test_build_service_composition(postgres_dsn: str, tmp_path: Path) -> N
 
 
 async def test_restart_clears_failed_cache_and_guards_running(
-    postgres_dsn: str, tmp_path: Path
+    postgres_dsn: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr("nixbot.restarts.RESTART_RETRY_SECONDS", 0.0)
     config = Config(
         db_url=postgres_dsn,
         build_systems=["x86_64-linux"],
@@ -523,10 +514,13 @@ async def test_restart_clears_failed_cache_and_guards_running(
             project_id,
         )
 
-        # Running build: restart refuses, cache row stays.
+        # Running build: restart defers (stays queued), cache row stays.
         service.orchestrator.cancel_events[build_id] = asyncio.Event()
         await service.restart_build(build_id)
-        await service.drain_work()
+        queue = WorkQueue(pool)
+        item = await queue.claim_next()
+        assert item is not None
+        await service._execute_work(queue, item)  # noqa: SLF001
         assert await pool.fetchval("SELECT count(*) FROM failed_builds") == 1
         assert (
             await pool.fetchval(
@@ -536,9 +530,9 @@ async def test_restart_clears_failed_cache_and_guards_running(
             == "failed"
         )
 
-        # Not running: cache cleared, attributes reset.
+        # Not running: the deferred intent goes through, cache
+        # cleared, attributes reset.
         del service.orchestrator.cancel_events[build_id]
-        await service.restart_build(build_id)
         await service.drain_work()
         assert await pool.fetchval("SELECT count(*) FROM failed_builds") == 0
         assert (

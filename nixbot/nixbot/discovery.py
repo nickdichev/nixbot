@@ -13,7 +13,13 @@ from .forge import filter_repos
 from .gitea_hooks import register_repo_hook
 from .gitlab_hooks import register_repo_hook as register_gitlab_repo_hook
 from .hook_secrets import WebhookSecrets
-from .reconcile import gitea_heads, github_heads, gitlab_heads, reconcile_repo
+from .reconcile import (
+    gitea_heads,
+    github_heads,
+    gitlab_heads,
+    max_pr_updated,
+    reconcile_repo,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -27,18 +33,26 @@ logger = logging.getLogger(__name__)
 
 async def reconcile_once(s: CIService) -> None:
     """Build default-branch and open-PR heads that got no build
-    record while the service was down (missed webhooks)."""
+    record while the service was down (missed webhooks). The
+    per-project watermark bounds the PR listing to PRs updated
+    since the last successful reconcile."""
     for project in await s.repo_store.enabled_repos():
         try:
+            watermark = await s.repo_store.reconcile_watermark(project.id)
             if project.forge == "github" and s.github is not None:
-                heads = await github_heads(s.github, project)
+                heads = await github_heads(s.github, project, watermark)
             elif project.forge == "gitea" and s.gitea is not None:
-                heads = await gitea_heads(s.gitea, project)
+                heads = await gitea_heads(s.gitea, project, watermark)
             elif project.forge == "gitlab" and s.gitlab is not None:
-                heads = await gitlab_heads(s.gitlab, project)
+                heads = await gitlab_heads(s.gitlab, project, watermark)
             else:
                 continue
             await reconcile_repo(s.pool, project, heads, s)
+            # Only after all submits succeeded: a crash mid-reconcile
+            # must retry the same window on the next startup.
+            new_watermark = max_pr_updated(heads)
+            if new_watermark is not None:
+                await s.repo_store.set_reconcile_watermark(project.id, new_watermark)
         except Exception:
             logger.exception(
                 "reconciliation failed",

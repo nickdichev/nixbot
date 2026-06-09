@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .base import DiscoveredRepo, TokenForgeClient, check_response
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 
 class GiteaClient(TokenForgeClient):
@@ -14,10 +17,9 @@ class GiteaClient(TokenForgeClient):
     def auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"token {self.token}"}
 
-    async def paginated(self, url: str) -> list[dict[str, Any]]:
+    async def paginated_pages(self, url: str) -> AsyncIterator[list[dict[str, Any]]]:
         # Gitea does not emit RFC 5988 Link headers reliably; walk
         # ?page=N until an empty page.
-        results: list[dict[str, Any]] = []
         page = 1
         while True:
             response = await self.http.get(
@@ -26,9 +28,15 @@ class GiteaClient(TokenForgeClient):
             check_response(response, self.forge_name)
             data = response.json()
             if not data:
-                return results
-            results.extend(data)
+                return
+            yield data
             page += 1
+
+    async def paginated(self, url: str) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        async for page in self.paginated_pages(url):
+            results.extend(page)
+        return results
 
     async def discover_repos(
         self, *, fetch_topics: bool = False

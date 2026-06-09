@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 from .events import RepoInfo
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     import asyncpg
 
     from .forge import DiscoveredRepo
@@ -183,6 +185,22 @@ class RepoStore:
             "SELECT * FROM projects WHERE id = $1", project_id
         )
         return _record(row) if row else None
+
+    async def reconcile_watermark(self, project_id: int) -> datetime | None:
+        return await self.pool.fetchval(
+            "SELECT reconcile_watermark FROM projects WHERE id = $1", project_id
+        )
+
+    async def set_reconcile_watermark(
+        self, project_id: int, watermark: datetime
+    ) -> None:
+        """Advance (never rewind) the reconcile watermark."""
+        await self.pool.execute(
+            "UPDATE projects SET reconcile_watermark = $2 WHERE id = $1 "
+            "AND (reconcile_watermark IS NULL OR reconcile_watermark < $2)",
+            project_id,
+            watermark,
+        )
 
     async def by_forge_id(self, forge: str, forge_repo_id: str) -> RepoRecord | None:
         row = await self.pool.fetchrow(

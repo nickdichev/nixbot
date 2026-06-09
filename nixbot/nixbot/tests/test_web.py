@@ -252,7 +252,7 @@ def test_build_page_live_markers(client: WebHarness) -> None:
     # refetched and morphed on events.
     assert 'sse-connect="/events?build=' in running.text
     assert 'hx-trigger="sse:message' in running.text
-    # Finished pages re-check on connect too (rebuild-failed).
+    # Finished pages re-check on connect too (attr restart).
     finished = client.get("/repos/github/acme/widget/builds/2")
     assert "htmx:sseOpen" in finished.text
     # PR link on the PR build.

@@ -61,6 +61,7 @@ class BuildRecord:
     status: str
     status_generation: int
     effects_started: bool
+    eval_completed: bool
 
 
 def _build_record(row: asyncpg.Record) -> BuildRecord:
@@ -75,6 +76,7 @@ def _build_record(row: asyncpg.Record) -> BuildRecord:
         status=row["status"],
         status_generation=row["status_generation"],
         effects_started=row["effects_started"],
+        eval_completed=row["eval_completed"],
     )
 
 
@@ -231,6 +233,12 @@ class BuildDB:
                     WHEN $2 = 'evaluating' THEN NULL
                     ELSE eval_warnings
                 END,
+                -- A fresh eval invalidates the recorded job set until
+                -- it completes again.
+                eval_completed = CASE
+                    WHEN $2 = 'evaluating' THEN FALSE
+                    ELSE eval_completed
+                END,
                 started_at = CASE
                     WHEN started_at IS NULL AND $2 <> 'pending' THEN now()
                     ELSE started_at
@@ -259,6 +267,56 @@ class BuildDB:
                 """,
                 build_id,
             )
+
+    async def mark_eval_completed(self, build_id: int) -> None:
+        """The full eval result is recorded in build_attributes; a later
+        build of the same tree may reuse it instead of re-evaluating."""
+        await self.pool.execute(
+            "UPDATE builds SET eval_completed = TRUE WHERE id = $1", build_id
+        )
+
+    async def find_completed_eval(
+        self, project_id: int, tree_hash: str, exclude_build_id: int
+    ) -> int | None:
+        """Most recent other build of the same tree whose eval result is
+        fully recorded (e.g. a build cancelled after its eval)."""
+        return await self.pool.fetchval(
+            "SELECT id FROM builds WHERE project_id = $1 AND tree_hash = $2 "
+            "AND eval_completed AND id <> $3 ORDER BY id DESC LIMIT 1",
+            project_id,
+            tree_hash,
+            exclude_build_id,
+        )
+
+    async def get_eval_jobs(self, build_id: int) -> list[NixEvalJobSuccess] | None:
+        """Reconstruct the eval job set from the build's attribute rows;
+        None when any row lacks a drv_path (eval failures must be
+        reproduced by a fresh evaluation). Reconstructed jobs carry no
+        dependency closures, like the crash-recovery rerun path."""
+        rows = await self.pool.fetch(
+            "SELECT attr, system, drv_path, outputs FROM build_attributes "
+            "WHERE build_id = $1",
+            build_id,
+        )
+        jobs = []
+        for row in rows:
+            if not row["drv_path"]:
+                return None
+            outputs = json.loads(row["outputs"]) if row["outputs"] else {}
+            jobs.append(
+                NixEvalJobSuccess(
+                    attr=row["attr"],
+                    attr_path=row["attr"].split("."),
+                    cache_status=CacheStatus.not_built,
+                    needed_builds=[],
+                    needed_substitutes=[],
+                    drv_path=row["drv_path"],
+                    name=row["attr"],
+                    outputs=outputs or {"out": None},
+                    system=row["system"] or "",
+                )
+            )
+        return jobs
 
     async def get_build(self, build_id: int) -> BuildRecord | None:
         row = await self.pool.fetchrow("SELECT * FROM builds WHERE id = $1", build_id)

@@ -166,6 +166,9 @@ async def _run_build_inner(
     await o.reporter.build_started(event, build)
     await o.db.set_build_status(build.id, BuildStatus.EVALUATING)
 
+    if await _try_reuse_eval(o, event, build, worktree_path, credentials):
+        return
+
     branch_config = BranchConfig.load(worktree_path)
     eval_settings = _eval_settings(o, event, build, credentials)
     # Race the evaluation against the cancel event: a superseded
@@ -251,6 +254,7 @@ async def _run_build_inner(
                 and job.system in o.config.build_systems
             ],
         )
+        await o.db.mark_eval_completed(build.id)
         await o.reporter.eval_finished(
             event,
             build,
@@ -273,6 +277,59 @@ async def _run_build_inner(
 
     if status == BuildStatus.SUCCEEDED:
         await o.maybe_run_effects(event, build, worktree_path, credentials)
+
+
+async def _reusable_eval_jobs(
+    o: Orchestrator, build: BuildRecord
+) -> list[NixEvalJobSuccess] | None:
+    """Eval result of another build of the same tree (e.g. cancelled
+    after evaluation, retried later), reusable when its derivations
+    are still in the store; None means evaluate afresh."""
+    if build.tree_hash is None:
+        return None
+    source_id = await o.db.find_completed_eval(
+        build.project_id, build.tree_hash, build.id
+    )
+    if source_id is None:
+        return None
+    jobs = await o.db.get_eval_jobs(source_id)
+    if jobs is None:
+        return None
+    # The recorded set may predate a build_systems config change.
+    jobs = [job for job in jobs if job.system in o.config.build_systems]
+    valid = await o.check_store_paths([job.drv_path for job in jobs])
+    if any(job.drv_path not in valid for job in jobs):
+        return None  # garbage-collected since the eval
+    logger.info(
+        "reusing eval results from earlier build",
+        extra={"build_id": build.id, "source_build_id": source_id},
+    )
+    return jobs
+
+
+async def _try_reuse_eval(
+    o: Orchestrator,
+    event: ChangeEvent,
+    build: BuildRecord,
+    worktree_path: Path,
+    credentials: FetchCredentials | None,
+) -> bool:
+    """Skip nix-eval-jobs and build from a reused eval result; False
+    when a fresh evaluation is needed."""
+    reused = await _reusable_eval_jobs(o, build)
+    if reused is None:
+        return False
+    await o.db.record_attributes(build.id, reused)
+    await o.db.mark_eval_completed(build.id)
+    await o.db.set_build_status(build.id, BuildStatus.BUILDING)
+    await o.reporter.eval_finished(event, build, success=True, warnings=[])
+    # cache_failures=False: see _ReadOnlyFailedBuildCache.
+    status = await build_attributes(
+        o, event, build, worktree_path, reused, cache_failures=False
+    )
+    if status == BuildStatus.SUCCEEDED:
+        await o.maybe_run_effects(event, build, worktree_path, credentials)
+    return True
 
 
 async def build_attributes(  # noqa: PLR0913
