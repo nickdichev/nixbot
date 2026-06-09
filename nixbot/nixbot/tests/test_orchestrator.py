@@ -778,39 +778,6 @@ def test_eval_warnings_null_when_empty(
     asyncio.run(run())
 
 
-def test_rerun_fetches_pr_refs(
-    postgres_dsn: str, tmp_path: Path, upstream: Path
-) -> None:
-    """PR heads are only reachable via refs/pull/*."""
-
-    async def run() -> None:
-        git(upstream, "checkout", "-b", "prsrc")
-        pr_sha = add_commit(upstream, "pr")
-        git(upstream, "update-ref", "refs/pull/7/head", pr_sha)
-        git(upstream, "checkout", "main")
-        git(upstream, "branch", "-D", "prsrc")
-
-        pool, orchestrator, _, project = await make_env(
-            postgres_dsn,
-            tmp_path,
-            upstream,
-            FakeEvalRunner([]),
-            FakeExecutor(),
-            "prref",
-        )
-        db = BuildDB(pool)
-        build, _ = await db.get_or_create_build(
-            project.id, "pr-tree", pr_sha, "main", pr_number=7
-        )
-        try:
-            await orchestrator.rerun_pending_attributes(project, build, [mk_job("a")])
-            assert await db.get_attribute_statuses(build.id) == {"a": "succeeded"}
-        finally:
-            await pool.close()
-
-    asyncio.run(run())
-
-
 def test_recovery_rerun_failures_not_cached(
     postgres_dsn: str, tmp_path: Path, upstream: Path
 ) -> None:
@@ -845,33 +812,37 @@ def test_recovery_rerun_failures_not_cached(
     asyncio.run(run())
 
 
-async def make_gitlab_mr_env(
-    dsn: str,
-    tmp_path: Path,
+# Each forge serves change-request heads under its own ref namespace.
+FORGE_HEAD_REFS = {
+    "github": "refs/pull/7/head",
+    "gitlab": "refs/merge-requests/7/head",
+}
+
+
+async def setup_forge_mr(
+    orchestrator: Orchestrator,
+    project: RepoInfo,
     upstream: Path,
-    eval_runner: EvalRunnerLike,
-    name: str,
-) -> tuple[asyncpg.Pool, Orchestrator, RepoInfo, str]:
-    """GitLab project whose MR head is only reachable via
-    refs/merge-requests/7/head. The file:// URL forces the full
-    transfer protocol, and the bare clone is created before the MR ref
+    forge: str,
+) -> tuple[RepoInfo, str]:
+    """Turn a make_env project into one whose PR/MR head is only
+    reachable via the forge's ref namespace (refs/pull/* or
+    refs/merge-requests/*). The file:// URL forces the full transfer
+    protocol, and the bare clone is created before the head ref
     exists: a local-path clone would copy all objects regardless of
     the fetch refspec, masking a wrong refspec."""
-    pool, orchestrator, _, project = await make_env(
-        dsn, tmp_path, upstream, eval_runner, FakeExecutor(), name
-    )
     project = RepoInfo(
-        **{**project.__dict__, "forge": "gitlab", "clone_url": f"file://{upstream}"}
+        **{**project.__dict__, "forge": forge, "clone_url": f"file://{upstream}"}
     )
     await orchestrator.repos.fetch(
         project.key, project.clone_url, ["+refs/heads/*:refs/heads/*"]
     )
     git(upstream, "checkout", "-b", "mrsrc")
     mr_sha = add_commit(upstream, "mr")
-    git(upstream, "update-ref", "refs/merge-requests/7/head", mr_sha)
+    git(upstream, "update-ref", FORGE_HEAD_REFS[forge], mr_sha)
     git(upstream, "checkout", "main")
     git(upstream, "branch", "-D", "mrsrc")
-    return pool, orchestrator, project, mr_sha
+    return project, mr_sha
 
 
 def test_gitlab_mr_fetches_merge_request_refs(
@@ -881,8 +852,16 @@ def test_gitlab_mr_fetches_merge_request_refs(
     GitHub-style refs/pull/*."""
 
     async def run() -> None:
-        pool, orchestrator, project, mr_sha = await make_gitlab_mr_env(
-            postgres_dsn, tmp_path, upstream, FakeEvalRunner([mk_job("a")]), "glmr"
+        pool, orchestrator, _, project = await make_env(
+            postgres_dsn,
+            tmp_path,
+            upstream,
+            FakeEvalRunner([mk_job("a")]),
+            FakeExecutor(),
+            "glmr",
+        )
+        project, mr_sha = await setup_forge_mr(
+            orchestrator, project, upstream, "gitlab"
         )
         event = ChangeEvent(
             repo=project,
@@ -901,15 +880,24 @@ def test_gitlab_mr_fetches_merge_request_refs(
     asyncio.run(run())
 
 
-def test_gitlab_rerun_fetches_merge_request_refs(
-    postgres_dsn: str, tmp_path: Path, upstream: Path
+@pytest.mark.parametrize("forge", ["github", "gitlab"])
+def test_rerun_fetches_forge_change_request_refs(
+    postgres_dsn: str, tmp_path: Path, upstream: Path, forge: str
 ) -> None:
-    """The rerun path must use the GitLab MR refspec too."""
+    """The rerun path must fetch the forge-specific head refspec:
+    PR/MR heads are only reachable via refs/pull/* (GitHub) or
+    refs/merge-requests/* (GitLab)."""
 
     async def run() -> None:
-        pool, orchestrator, project, mr_sha = await make_gitlab_mr_env(
-            postgres_dsn, tmp_path, upstream, FakeEvalRunner([]), "glmrrerun"
+        pool, orchestrator, _, project = await make_env(
+            postgres_dsn,
+            tmp_path,
+            upstream,
+            FakeEvalRunner([]),
+            FakeExecutor(),
+            f"rerun-{forge}",
         )
+        project, mr_sha = await setup_forge_mr(orchestrator, project, upstream, forge)
         db = BuildDB(pool)
         build, _ = await db.get_or_create_build(
             project.id, "mr-tree", mr_sha, "main", pr_number=7
