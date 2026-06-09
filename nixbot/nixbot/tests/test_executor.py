@@ -367,7 +367,12 @@ def test_executor_hard_cancel_kills_process_group(
     tmp_path: Path, fake_nix: Path
 ) -> None:
     """Cancelling the build task itself (not via the cancel event) must
-    not leak the running nix process group."""
+    not leak the running nix process group.
+
+    Group-kill semantics themselves are covered by
+    test_proc.test_reap_kills_whole_group; this checks the executor's
+    hard-cancel wiring (the finally path that also stops the log pump).
+    """
     fake_nix.write_text("hangpid")
     pidfile = tmp_path / "pid"
 

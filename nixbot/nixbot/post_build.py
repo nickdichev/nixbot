@@ -12,16 +12,15 @@ failing the attribute.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 import re
-import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .gcroots import safe_attr_filename
+from .proc import ProcessGroup
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -128,13 +127,12 @@ async def run_post_build_step(
         )
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *command,
+        group = await ProcessGroup.start(
+            command,
             cwd=cwd,
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,  # own process group for clean kill
         )
     except OSError as e:
         # Missing/unexecutable step binary: a post-build failure, not
@@ -146,15 +144,12 @@ async def run_post_build_step(
             output=f"failed to start post-build step {command[0]!r}: {e}",
         )
 
-    def kill() -> None:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
-
     try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=step_timeout)
+        stdout, _ = await asyncio.wait_for(
+            group.proc.communicate(), timeout=step_timeout
+        )
     except TimeoutError:
-        kill()
-        await proc.wait()
+        await group.reap()
         return PostBuildStepResult(
             name=step.name,
             success=False,
@@ -163,16 +158,15 @@ async def run_post_build_step(
         )
     except asyncio.CancelledError:
         # Build cancelled: do not leave the step's process tree running.
-        kill()
-        await proc.wait()
+        await group.reap()
         raise
     output = stdout.decode(errors="replace")
-    success = proc.returncode == 0
+    success = group.returncode == 0
     if not success:
         logger.log(
             logging.WARNING if step.warn_only else logging.ERROR,
             "post-build step failed",
-            extra={"step": step.name, "returncode": proc.returncode},
+            extra={"step": step.name, "returncode": group.returncode},
         )
     return PostBuildStepResult(
         name=step.name, success=success, warn_only=step.warn_only, output=output
