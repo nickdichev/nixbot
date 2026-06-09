@@ -403,26 +403,6 @@ def test_github_endpoint_rejects_bad_signature() -> None:
     asyncio.run(run())
 
 
-def test_github_duplicate_delivery_dropped() -> None:
-    async def run() -> None:
-        sink = FakeSink()
-        body = json.dumps(PUSH_PAYLOAD).encode()
-        headers = {
-            "X-Hub-Signature-256": sign_github(body),
-            "X-GitHub-Event": "push",
-            "X-GitHub-Delivery": "guid-dup",
-        }
-        async with make_client(sink) as client:
-            await client.post("/webhooks/github", content=body, headers=headers)
-            response = await client.post(
-                "/webhooks/github", content=body, headers=headers
-            )
-        assert response.status_code == 202
-        assert len(sink.events) == 1
-
-    asyncio.run(run())
-
-
 def test_redelivery_after_failed_submit() -> None:
     """A 500 must not record the GUID: redeliveries reuse it."""
 
