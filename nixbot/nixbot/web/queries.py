@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+from ..db_gen import web as gen  # noqa: TID252
 
 if TYPE_CHECKING:
     import asyncpg
@@ -40,19 +43,6 @@ def _like_pattern(q: str | None) -> str | None:
     return f"%{_like_escape(q)}%" if q else None
 
 
-# Display order: failures first, then running, then the rest.
-FAILED_FIRST_ORDER = """
-    CASE
-        WHEN a.status IN ('failed', 'failed_eval', 'dependency_failed',
-                          'cached_failure') THEN 0
-        WHEN a.status = 'building' THEN 1
-        WHEN a.status = 'pending' THEN 2
-        WHEN a.status = 'cancelled' THEN 3
-        ELSE 4
-    END
-"""
-
-
 @dataclass(frozen=True)
 class Page:
     items: list[dict[str, Any]]
@@ -60,8 +50,9 @@ class Page:
     has_next: bool
 
 
-def _rows(records: list[asyncpg.Record]) -> list[dict[str, Any]]:
-    return [dict(r) for r in records]
+def _dicts(rows: Any) -> list[dict[str, Any]]:
+    """Generated row dataclasses -> template-friendly dicts."""
+    return [dataclasses.asdict(r) for r in rows]
 
 
 class WebQueries:
@@ -71,41 +62,20 @@ class WebQueries:
     async def projects(
         self, *, enabled: bool | None = True, q: str | None = None
     ) -> list[dict[str, Any]]:
-        return _rows(
-            await self.pool.fetch(
-                """
-                SELECT * FROM projects
-                WHERE ($1::boolean IS NULL OR enabled = $1)
-                  AND ($2::text IS NULL OR owner || '/' || name ILIKE $2)
-                ORDER BY owner, name
-                """,
-                enabled,
-                _like_pattern(q),
-            )
+        return _dicts(
+            await gen.web_projects(self.pool, enabled=enabled, pattern=_like_pattern(q))
         )
 
     async def repo_by_name(
         self, forge: str, owner: str, name: str
     ) -> dict[str, Any] | None:
-        row = await self.pool.fetchrow(
-            "SELECT * FROM projects WHERE forge = $1 AND owner = $2 AND name = $3",
-            forge,
-            owner,
-            name,
-        )
-        return dict(row) if row else None
+        row = await gen.web_repo(self.pool, forge=forge, owner=owner, name=name)
+        return dataclasses.asdict(row) if row else None
 
     async def repo_candidates(self, owner: str, name: str) -> list[dict[str, Any]]:
         """All forges' rows for an unqualified owner/name; used by the
         legacy-URL redirect to pick a target."""
-        return _rows(
-            await self.pool.fetch(
-                "SELECT * FROM projects WHERE owner = $1 AND name = $2 "
-                "ORDER BY forge, id",
-                owner,
-                name,
-            )
-        )
+        return _dicts(await gen.web_repo_candidates(self.pool, owner=owner, name=name))
 
     async def repo_overview(
         self, project_ids: list[int] | None = None, q: str | None = None
@@ -113,87 +83,24 @@ class WebQueries:
         """Homepage pipeline rows: each project with its latest build,
         the last ten builds (status + duration) for the bar chart, and
         median duration/pass rate over the last thirty builds."""
-        rows = await self.pool.fetch(
-            """
-            SELECT p.*,
-                   lb.number AS last_number, lb.status AS last_status,
-                   lb.branch AS last_branch, lb.created_at AS last_created_at,
-                   lb.started_at, lb.finished_at,
-                   h.history, m.median_secs, m.pass_rate
-            FROM projects p
-            LEFT JOIN LATERAL (
-                SELECT * FROM builds b WHERE b.project_id = p.id
-                ORDER BY b.number DESC LIMIT 1
-            ) lb ON true
-            LEFT JOIN LATERAL (
-                SELECT json_agg(
-                    json_build_object(
-                        'number', t.number, 'status', t.status,
-                        'secs', EXTRACT(EPOCH FROM (t.finished_at - t.started_at))
-                    )
-                    ORDER BY t.number
-                ) AS history
-                FROM (
-                    SELECT number, status, started_at, finished_at FROM builds b
-                    WHERE b.project_id = p.id
-                    ORDER BY number DESC LIMIT 10
-                ) t
-            ) h ON true
-            LEFT JOIN LATERAL (
-                -- Median, not mean: one build stuck behind a busy nix
-                -- daemon must not dominate the typical duration.
-                SELECT percentile_cont(0.5) WITHIN GROUP (
-                           ORDER BY EXTRACT(EPOCH FROM (t.finished_at - t.started_at))
-                       ) FILTER (WHERE t.status = 'succeeded') AS median_secs,
-                       -- Cancelled builds say nothing about the code:
-                       -- they must not drag the pass rate toward zero.
-                       count(*) FILTER (WHERE t.status = 'succeeded')::float
-                           / NULLIF(
-                               count(*) FILTER (
-                                   WHERE t.status IN ('succeeded', 'failed')
-                               ), 0) AS pass_rate
-                FROM (
-                    SELECT status, started_at, finished_at FROM builds b
-                    WHERE b.project_id = p.id
-                      AND b.status IN ('succeeded', 'failed', 'cancelled')
-                    ORDER BY b.number DESC LIMIT 30
-                ) t
-            ) m ON true
-            WHERE p.enabled AND ($1::bigint[] IS NULL OR p.id = ANY($1))
-              AND ($2::text IS NULL OR p.owner || '/' || p.name ILIKE $2)
-            ORDER BY p.owner, p.name
-            """,
-            project_ids,
-            _like_pattern(q),
+        rows = await gen.web_repo_overview(
+            self.pool, project_ids=project_ids, pattern=_like_pattern(q)
         )
-        overview = _rows(rows)
+        overview = _dicts(rows)
         for row in overview:
             row["history"] = json.loads(row["history"]) if row["history"] else []
         return overview
 
     async def repo_count(self, project_ids: list[int] | None = None) -> int:
-        return await self.pool.fetchval(
-            """
-            SELECT count(*) FROM projects
-            WHERE enabled AND ($1::bigint[] IS NULL OR id = ANY($1))
-            """,
-            project_ids,
-        )
+        count = await gen.web_repo_count(self.pool, project_ids=project_ids)
+        return count or 0
 
     async def status_counts(
         self, project_ids: list[int] | None = None
     ) -> dict[str, int]:
         """Running/queued counts for the homepage summary strip."""
-        rows = await self.pool.fetch(
-            """
-            SELECT status, count(*) AS n FROM builds
-            WHERE status IN ('pending', 'evaluating', 'building')
-              AND ($1::bigint[] IS NULL OR project_id = ANY($1))
-            GROUP BY status
-            """,
-            project_ids,
-        )
-        return {r["status"]: r["n"] for r in rows}
+        rows = await gen.web_status_counts(self.pool, project_ids=project_ids)
+        return {r.status: r.n for r in rows}
 
     async def recent_builds(
         self,
@@ -202,18 +109,9 @@ class WebQueries:
         before: int | None = None,
     ) -> list[dict[str, Any]]:
         """Activity feed; cursor on build id for infinite scroll."""
-        return _rows(
-            await self.pool.fetch(
-                """
-                SELECT b.*, p.owner, p.name AS project_name, p.forge, p.url
-                FROM builds b JOIN projects p ON p.id = b.project_id
-                WHERE ($2::bigint[] IS NULL OR b.project_id = ANY($2))
-                  AND ($3::bigint IS NULL OR b.id < $3)
-                ORDER BY b.id DESC LIMIT $1
-                """,
-                limit,
-                project_ids,
-                before,
+        return _dicts(
+            await gen.web_recent_builds(
+                self.pool, project_ids=project_ids, before=before, limit_=limit
             )
         )
 
@@ -227,96 +125,52 @@ class WebQueries:
     ) -> Page:
         f = filters or BuildFilters()
         page = max(page, 1)
-        conditions = ["project_id = $1"]
-        args: list[Any] = [project_id]
-        if f.status:
-            args.append(f.status)
-            conditions.append(f"status = ${len(args)}")
-        if f.branch:
-            args.append(f.branch)
-            conditions.append(f"branch = ${len(args)}")
-        if f.pr_number is not None:
-            args.append(f.pr_number)
-            conditions.append(f"pr_number = ${len(args)}")
-        if f.commit:
-            # Prefix match so agents can pass short revs.
-            args.append(f.commit)
-            conditions.append(f"starts_with(commit_sha, ${len(args)})")
-        if f.before is not None:
-            args.append(f.before)
-            conditions.append(f"id < ${len(args)}")
-        args.append(limit + 1)
-        args.append((page - 1) * limit)
-        rows = await self.pool.fetch(
-            f"""
-            SELECT * FROM builds WHERE {" AND ".join(conditions)}
-            ORDER BY number DESC LIMIT ${len(args) - 1} OFFSET ${len(args)}
-            """,  # noqa: S608
-            *args,
+        rows = await gen.web_builds_for_repo(
+            self.pool,
+            project_id=project_id,
+            # `or None`: empty strings from query params mean "no filter".
+            status=f.status or None,
+            branch=f.branch or None,
+            pr_number=f.pr_number,
+            commit_prefix=f.commit or None,
+            before=f.before,
+            limit=limit + 1,
+            offset=(page - 1) * limit,
         )
-        return Page(items=_rows(rows[:limit]), page=page, has_next=len(rows) > limit)
+        return Page(items=_dicts(rows[:limit]), page=page, has_next=len(rows) > limit)
 
     async def build_by_number(
         self, project_id: int, number: int
     ) -> dict[str, Any] | None:
-        row = await self.pool.fetchrow(
-            "SELECT * FROM builds WHERE project_id = $1 AND number = $2",
-            project_id,
-            number,
+        row = await gen.web_build_by_number(
+            self.pool, project_id=project_id, number=number
         )
-        return dict(row) if row else None
+        return dataclasses.asdict(row) if row else None
 
     async def neighbor_numbers(
         self, project_id: int, number: int
     ) -> tuple[int | None, int | None]:
         """Prev/next build numbers within the project."""
-        prev_number = await self.pool.fetchval(
-            "SELECT max(number) FROM builds WHERE project_id = $1 AND number < $2",
-            project_id,
-            number,
+        row = await gen.web_neighbor_numbers(
+            self.pool, project_id=project_id, number=number
         )
-        next_number = await self.pool.fetchval(
-            "SELECT min(number) FROM builds WHERE project_id = $1 AND number > $2",
-            project_id,
-            number,
-        )
-        return prev_number, next_number
+        return (row.prev, row.next) if row else (None, None)
 
     async def attributes(self, build_id: int) -> list[dict[str, Any]]:
         """Attributes, failed first, then by name."""
-        return _rows(
-            await self.pool.fetch(
-                f"""
-                SELECT a.*, l.path AS log_path, l.size_bytes AS log_size
-                FROM build_attributes a
-                LEFT JOIN logs l ON l.attribute_id = a.id
-                WHERE a.build_id = $1
-                ORDER BY {FAILED_FIRST_ORDER}, a.attr
-                """,  # noqa: S608
-                build_id,
-            )
-        )
+        return _dicts(await gen.web_attributes(self.pool, build_id=build_id))
 
     async def effects(self, build_id: int) -> list[dict[str, Any]]:
-        return _rows(
-            await self.pool.fetch(
-                "SELECT * FROM build_effects WHERE build_id = $1 ORDER BY name",
-                build_id,
-            )
-        )
+        return _dicts(await gen.web_effects(self.pool, build_id=build_id))
 
     async def attribute_counts(
         self, build_id: int, q: str | None = None
     ) -> dict[str, int]:
         """Attribute counts per status, optionally name-filtered."""
-        rows = await self.pool.fetch(
-            "SELECT status, count(*) AS count FROM build_attributes"
-            " WHERE build_id = $1 AND ($2::text IS NULL OR attr ILIKE $2)"
-            " GROUP BY status",
-            build_id,
-            _like_pattern(q),
+        rows = await gen.web_attribute_counts(
+            self.pool, build_id=build_id, pattern=_like_pattern(q)
         )
-        return {r["status"]: r["count"] for r in rows}
+        return {r.status: r.count for r in rows}
 
     async def attribute_page(
         self,
@@ -327,40 +181,23 @@ class WebQueries:
         q: str | None = None,
     ) -> Page:
         """One page of attributes with the given statuses, by name."""
-        rows = await self.pool.fetch(
-            """
-            SELECT a.*, l.path AS log_path, l.size_bytes AS log_size
-            FROM build_attributes a
-            LEFT JOIN logs l ON l.attribute_id = a.id
-            WHERE a.build_id = $1 AND a.status = any($2::text[])
-              AND ($5::text IS NULL OR a.attr ILIKE $5)
-            ORDER BY a.attr LIMIT $3 OFFSET $4
-            """,
-            build_id,
-            list(statuses),
-            limit + 1,
-            (page - 1) * limit,
-            _like_pattern(q),
+        rows = await gen.web_attribute_page(
+            self.pool,
+            build_id=build_id,
+            statuses=list(statuses),
+            pattern=_like_pattern(q),
+            limit_=limit + 1,
+            offset_=(page - 1) * limit,
         )
-        return Page(items=_rows(rows[:limit]), page=page, has_next=len(rows) > limit)
+        return Page(items=_dicts(rows[:limit]), page=page, has_next=len(rows) > limit)
 
     async def attribute_history(
         self, project_id: int, attr: str, limit: int = 50
     ) -> list[dict[str, Any]]:
         """Results of the same attribute across a project's builds."""
-        return _rows(
-            await self.pool.fetch(
-                """
-                SELECT a.*, b.number AS build_number, b.branch, b.commit_sha,
-                       b.created_at AS build_created_at
-                FROM build_attributes a
-                JOIN builds b ON b.id = a.build_id
-                WHERE b.project_id = $1 AND a.attr = $2
-                ORDER BY b.number DESC LIMIT $3
-                """,
-                project_id,
-                attr,
-                limit,
+        return _dicts(
+            await gen.web_attribute_history(
+                self.pool, project_id=project_id, attr=attr, limit_=limit
             )
         )
 
@@ -368,27 +205,10 @@ class WebQueries:
         self, project_id: int, attr: str, build_number: int
     ) -> tuple[int | None, int | None]:
         """Prev/next build numbers containing the same attribute."""
-        prev_number = await self.pool.fetchval(
-            """
-            SELECT max(b.number) FROM build_attributes a
-            JOIN builds b ON b.id = a.build_id
-            WHERE b.project_id = $1 AND a.attr = $2 AND b.number < $3
-            """,
-            project_id,
-            attr,
-            build_number,
+        row = await gen.web_attribute_neighbor_numbers(
+            self.pool, project_id=project_id, attr=attr, build_number=build_number
         )
-        next_number = await self.pool.fetchval(
-            """
-            SELECT min(b.number) FROM build_attributes a
-            JOIN builds b ON b.id = a.build_id
-            WHERE b.project_id = $1 AND a.attr = $2 AND b.number > $3
-            """,
-            project_id,
-            attr,
-            build_number,
-        )
-        return prev_number, next_number
+        return (row.prev, row.next) if row else (None, None)
 
     async def queue(self, project_ids: list[int] | None = None) -> list[dict[str, Any]]:
         """Pending (FIFO position by id) and running builds.
@@ -396,24 +216,4 @@ class WebQueries:
         queue_position numbers the GLOBAL queue of pending builds:
         computed before any visibility filter so every viewer sees the
         same position, and NULL for already-running builds."""
-        project_filter = "" if project_ids is None else "AND p.id = ANY($1::bigint[])"
-        args = [] if project_ids is None else [project_ids]
-        return _rows(
-            await self.pool.fetch(
-                f"""
-                SELECT b.*, p.owner, p.name AS project_name, p.forge, p.url,
-                       q.queue_position
-                FROM builds b
-                JOIN projects p ON p.id = b.project_id
-                LEFT JOIN (
-                    SELECT id, row_number() OVER (ORDER BY id) AS queue_position
-                    FROM builds WHERE status = 'pending'
-                ) q ON q.id = b.id
-                WHERE b.status IN ('pending', 'evaluating', 'building')
-                {project_filter}
-                -- Active builds first; queue_position stays FIFO.
-                ORDER BY b.status = 'pending', b.id
-                """,  # noqa: S608
-                *args,
-            )
-        )
+        return _dicts(await gen.web_queue(self.pool, project_ids=project_ids))

@@ -121,10 +121,12 @@ class _FakePool:
         self.ids = ids
         self.on_fetch = on_fetch
 
-    async def fetch(self, _query: str) -> list[dict]:
+    async def fetch(self, _query: str) -> list[tuple[int]]:
         if self.on_fetch is not None:
             self.on_fetch()
-        return [{"id": build_id} for build_id in self.ids]
+        # Positional access like asyncpg.Record (the sqlc-generated
+        # decode hooks index by column position).
+        return [(build_id,) for build_id in self.ids]
 
 
 async def test_orphan_log_dirs(tmp_path: Path) -> None:

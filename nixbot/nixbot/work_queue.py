@@ -12,6 +12,8 @@ from typing import Any
 
 import asyncpg
 
+from .db_gen import work_queue as q
+
 
 @dataclass(frozen=True)
 class WorkItem:
@@ -30,18 +32,11 @@ class WorkQueue:
     ) -> bool:
         """Returns False when an identical pending item already exists."""
         return (
-            await self.pool.fetchval(
-                """
-                INSERT INTO work_queue (kind, dedup_key, payload)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (kind, dedup_key, md5(payload::text))
-                WHERE status = 'pending'
-                DO NOTHING
-                RETURNING id
-                """,
-                kind,
-                dedup_key,
-                json.dumps(payload or {}),
+            await q.enqueue_work_item(
+                self.pool,
+                kind=kind,
+                dedup_key=dedup_key,
+                payload=json.dumps(payload or {}),
             )
             is not None
         )
@@ -57,41 +52,21 @@ class WorkQueue:
         if row is None:
             return None
         return WorkItem(
-            id=row["id"],
-            kind=row["kind"],
-            dedup_key=row["dedup_key"],
-            payload=json.loads(row["payload"]),
+            id=row.id,
+            kind=row.kind,
+            dedup_key=row.dedup_key,
+            payload=json.loads(row.payload),
         )
 
-    async def _claim_row(self) -> asyncpg.Record | None:
-        return await self.pool.fetchrow(
-            """
-            UPDATE work_queue SET status = 'running', claimed_at = now()
-            WHERE id = (
-                SELECT id FROM work_queue w
-                WHERE w.status = 'pending'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM work_queue r
-                    WHERE r.dedup_key = w.dedup_key AND r.status = 'running'
-                  )
-                ORDER BY w.created_at
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            RETURNING id, kind, dedup_key, payload
-            """
-        )
+    async def _claim_row(self) -> q.ClaimNextWorkItemRow | None:
+        return await q.claim_next_work_item(self.pool)
 
     async def finish(self, item_id: int, *, error: str | None = None) -> None:
-        await self.pool.execute(
-            """
-            UPDATE work_queue
-            SET status = $2, error = $3, finished_at = now()
-            WHERE id = $1
-            """,
-            item_id,
-            "done" if error is None else "failed",
-            error,
+        await q.finish_work_item(
+            self.pool,
+            id_=item_id,
+            status="done" if error is None else "failed",
+            error=error,
         )
 
     async def settle_interrupted(self) -> None:
@@ -101,32 +76,7 @@ class WorkQueue:
         so re-dispatching is safe. Assumes a single dispatcher process;
         with several, this would steal live work (a claimed_at lease
         would be needed instead)."""
-        await self.pool.execute(
-            """
-            UPDATE work_queue w SET status = 'pending', claimed_at = NULL
-            WHERE status = 'running' AND NOT EXISTS (
-                SELECT 1 FROM work_queue p
-                WHERE p.kind = w.kind AND p.dedup_key = w.dedup_key
-                  AND p.status = 'pending'
-            )
-            """
-        )
-        # An identical intent was re-enqueued before the crash; the
-        # pending row carries it, requeueing would hit pending_uniq.
-        await self.pool.execute(
-            """
-            UPDATE work_queue SET status = 'failed', finished_at = now(),
-                error = 'interrupted; superseded by a newer request'
-            WHERE status = 'running'
-            """
-        )
+        await q.settle_interrupted_work(self.pool)
 
     async def cleanup(self, retention_days: int) -> None:
-        await self.pool.execute(
-            """
-            DELETE FROM work_queue
-            WHERE finished_at IS NOT NULL
-              AND finished_at < now() - make_interval(days => $1)
-            """,
-            retention_days,
-        )
+        await q.cleanup_work_queue(self.pool, retention_days=retention_days)

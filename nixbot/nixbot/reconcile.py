@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
+from .db_gen import maintenance as q
 from .webhooks import ChangeRequest
 
 if TYPE_CHECKING:
@@ -195,23 +196,12 @@ async def gitlab_heads(
 async def _has_builds(pool: asyncpg.Pool, project_id: int) -> bool:
     """Cancelled builds don't count: an operator cancelling the storm
     after enabling must not turn the project non-fresh."""
-    return (
-        await pool.fetchval(
-            "SELECT 1 FROM builds WHERE project_id = $1 "
-            "AND status != 'cancelled' LIMIT 1",
-            project_id,
-        )
-        is not None
-    )
+    return await q.project_has_builds(pool, project_id=project_id) is not None
 
 
 async def is_built(pool: asyncpg.Pool, project_id: int, commit_sha: str) -> bool:
     return (
-        await pool.fetchval(
-            "SELECT 1 FROM builds WHERE project_id = $1 AND commit_sha = $2 LIMIT 1",
-            project_id,
-            commit_sha,
-        )
+        await q.commit_built(pool, project_id=project_id, commit_sha=commit_sha)
         is not None
     )
 

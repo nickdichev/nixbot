@@ -8,6 +8,9 @@ from __future__ import annotations
 import secrets
 from typing import TYPE_CHECKING
 
+from .db_gen import projects as q
+from .sql_util import expect
+
 if TYPE_CHECKING:
     import asyncpg
 
@@ -25,47 +28,28 @@ class WebhookSecrets:
         if self.forge is None:
             msg = "secret_for_repo needs a forge-scoped store"
             raise RuntimeError(msg)
-        return await self.pool.fetchval(
-            """
-            SELECT s.secret FROM webhook_secrets s
-            JOIN projects p ON p.id = s.project_id
-            WHERE p.forge = $1 AND p.forge_repo_id = $2
-            """,
-            self.forge,
-            forge_repo_id,
+        return await q.webhook_secret_by_forge_repo(
+            self.pool, forge=self.forge, forge_repo_id=forge_repo_id
         )
 
     async def get_or_create(self, project_id: int) -> str:
-        secret = await self.pool.fetchval(
-            "SELECT secret FROM webhook_secrets WHERE project_id = $1",
-            project_id,
-        )
+        secret = await q.webhook_secret(self.pool, project_id=project_id)
         if secret is not None:
             return secret
         secret = secrets.token_hex(32)
         # Concurrent creation: first writer wins.
-        return await self.pool.fetchval(
-            """
-            INSERT INTO webhook_secrets (project_id, secret)
-            VALUES ($1, $2)
-            ON CONFLICT (project_id) DO UPDATE SET secret = webhook_secrets.secret
-            RETURNING secret
-            """,
-            project_id,
-            secret,
+        return expect(
+            await q.create_webhook_secret(
+                self.pool, project_id=project_id, secret=secret
+            )
         )
 
     async def rotate(self, project_id: int) -> str:
         """Replace the secret; the old one stops verifying immediately.
         Auto-managed hooks re-sync on the next discovery cycle."""
         secret = secrets.token_hex(32)
-        return await self.pool.fetchval(
-            """
-            INSERT INTO webhook_secrets (project_id, secret)
-            VALUES ($1, $2)
-            ON CONFLICT (project_id) DO UPDATE SET secret = EXCLUDED.secret
-            RETURNING secret
-            """,
-            project_id,
-            secret,
+        return expect(
+            await q.rotate_webhook_secret(
+                self.pool, project_id=project_id, secret=secret
+            )
         )

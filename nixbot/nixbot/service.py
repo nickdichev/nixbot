@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Any
 from . import discovery, restarts, scheduled_runs
 from .config import ScheduleWhen
 from .db import BuildStatus
+from .db_gen import builds as builds_q
+from .db_gen import maintenance as q
 from .events import ChangeEvent, StatusReporter
 from .gitrepo import (
     CredentialsProvider,
@@ -204,17 +206,11 @@ class CIService:
             if project is not None:
                 self.orchestrator.canceller.cancel_pr(project.id, event.pr_number)
             # Queued events for the PR would build it after the close.
-            await self.pool.execute(
-                """
-                UPDATE work_queue SET status = 'done', finished_at = now()
-                WHERE kind = 'change' AND status = 'pending'
-                  AND payload->>'forge' = $1
-                  AND payload->>'forge_repo_id' = $2
-                  AND (payload->>'pr_number')::int = $3
-                """,
-                event.forge,
-                event.forge_repo_id,
-                event.pr_number,
+            await q.supersede_pending_changes(
+                self.pool,
+                forge=event.forge,
+                forge_repo_id=event.forge_repo_id,
+                pr_number=event.pr_number,
             )
             return
         await self._submit_change(event)
@@ -373,9 +369,7 @@ class CIService:
             commit_sha=build.commit_sha,
             pr_number=build.pr_number,
         )
-        rows = await self.pool.fetch(
-            "SELECT attr, status FROM build_attributes WHERE build_id = $1", build_id
-        )
+        rows = await builds_q.attribute_statuses(self.pool, build_id=build_id)
         reporter = self.orchestrator.reporter
         if isinstance(reporter, RetryingReporter):
             # Post via the inner reporter: the wrapper would enqueue a
@@ -390,7 +384,7 @@ class CIService:
                 build.status,
                 build.status_generation,
                 [],
-                attr_statuses={row["attr"]: row["status"] for row in rows},
+                attr_statuses={row.attr: row.status for row in rows},
             )
         except Exception as e:
             if attempt < MAX_REPORT_ATTEMPTS:
@@ -454,15 +448,8 @@ class CIService:
             return
         # Not queued or running (e.g. leftover from an interrupted
         # build): mark it cancelled directly.
-        result = await self.pool.execute(
-            "UPDATE build_attributes SET status = 'cancelled', "
-            "finished_at = now() "
-            "WHERE build_id = $1 AND attr = $2 "
-            "AND status IN ('pending', 'building')",
-            build_id,
-            attr,
-        )
-        if result != "UPDATE 1":
+        cancelled = await q.cancel_attribute(self.pool, build_id=build_id, attr=attr)
+        if cancelled != 1:
             return
         # No running pipeline re-aggregates for us; without this the
         # build stays non-terminal forever once all rows are settled.
@@ -476,17 +463,11 @@ class CIService:
             event.set()
             return
         # Not running: mark cancelled directly.
-        generation = await self.pool.fetchval(
-            "UPDATE builds SET status = 'cancelled', finished_at = now(), "
-            "status_generation = status_generation + 1 "
-            "WHERE id = $1 AND status IN ('pending', 'evaluating', 'building') "
-            "RETURNING status_generation",
-            build_id,
-        )
+        generation = await q.cancel_build(self.pool, id_=build_id)
         if generation is None:
             return
-        # Leftover pending/building rows would look running forever.
-        await self.orchestrator.db.settle_unfinished_attributes(build_id)
+        # CancelBuild also settled leftover pending/building attribute
+        # rows in the same statement.
         await self._report_direct_finish(build_id, BuildStatus.CANCELLED, generation)
 
     async def _report_direct_finish(

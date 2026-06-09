@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from . import build_run
 from .canceller import branch_key
 from .db import BuildStatus
+from .db_gen import maintenance as q
 from .events import ChangeEvent
 from .gitrepo import pr_refspec
 
@@ -89,11 +90,10 @@ async def rerun_pending_attributes(
             job for job in pending_jobs if job.system not in o.config.build_systems
         ]
         if unsupported:
-            await o.db.pool.execute(
-                "DELETE FROM build_attributes WHERE build_id = $1 "
-                "AND attr = ANY($2::text[])",
-                build.id,
-                [job.attr for job in unsupported],
+            await q.delete_attributes_by_name(
+                o.db.pool,
+                build_id=build.id,
+                attrs=[job.attr for job in unsupported],
             )
             pending_jobs = [
                 job for job in pending_jobs if job.system in o.config.build_systems
@@ -152,15 +152,7 @@ async def rerun_effects(
     try:
         # Reset under the claim: resetting earlier (e.g. in the
         # service) could clobber a rerun already in flight.
-        await o.db.pool.execute(
-            "UPDATE builds SET effects_started = FALSE WHERE id = $1", build.id
-        )
-        await o.db.pool.execute(
-            "UPDATE build_effects SET status = 'pending', error = NULL, "
-            "finished_at = NULL, log_path = NULL, log_size = 0, "
-            "log_truncated = FALSE WHERE build_id = $1",
-            build.id,
-        )
+        await q.reset_effects_state(o.db.pool, build_id=build.id)
         async with rerun_worktree(o, info, build, "effects", credentials) as (
             event,
             worktree_path,

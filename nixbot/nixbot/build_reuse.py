@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from .canceller import RegisterOutcome
 from .db import BuildStatus
+from .db_gen import maintenance as q
 from .gitrepo import GitError, run_git
 
 if TYPE_CHECKING:
@@ -160,16 +161,12 @@ async def _post_process_existing(
 ) -> None:
     """Gcroots/outputs updates for a context reusing an already
     succeeded build (e.g. default-branch push reusing a PR build)."""
-    rows = await o.db.pool.fetch(
-        "SELECT attr, outputs FROM build_attributes "
-        "WHERE build_id = $1 AND status IN ('succeeded', 'skipped_local')",
-        build.id,
-    )
+    rows = await q.succeeded_attribute_outputs(o.db.pool, build_id=build.id)
     pairs = []
     for row in rows:
-        out = (json.loads(row["outputs"]) if row["outputs"] else {}).get("out")
+        out = (json.loads(row.outputs) if row.outputs else {}).get("out")
         if out:
-            pairs.append((row["attr"], out))
+            pairs.append((row.attr, out))
     await post_process_skipped(o, event, pairs)
 
 

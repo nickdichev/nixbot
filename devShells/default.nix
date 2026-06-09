@@ -11,6 +11,9 @@ let
     nixbot = self.packages.${system}.nixbot;
     nixbot-effects = self.packages.${system}.nixbot-effects or null;
   };
+  # sqlc wrapped with the nix-pinned codegen plugin (same version as
+  # the sqlc-generated flake check); works offline.
+  sqlc = import ../nix/sqlc.nix { inherit pkgs; };
 in
 {
   default = pkgs.mkShell {
@@ -20,6 +23,9 @@ in
       pkgs.ruff
       pkgs.postgresql
       pkgs.nix-eval-jobs
+      # SQL codegen: `sqlc generate` regenerates nixbot/nixbot/db_gen
+      # from sqlc.yaml.
+      sqlc
       devProcessCompose
       (pkgs.python3.withPackages (
         ps:

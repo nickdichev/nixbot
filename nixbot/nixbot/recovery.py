@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 
 import asyncpg
 
+from .db_gen import maintenance as q
 from .models import CacheStatus, NixEvalJobSuccess
 from .scheduler import AttributeResult, AttributeStatus
 
@@ -78,57 +79,50 @@ class ResumableBuild:
 async def find_unfinished_builds(
     pool: asyncpg.Pool, build_id: int | None = None
 ) -> list[ResumableBuild]:
-    rows = await pool.fetch(
-        "SELECT * FROM builds WHERE status = ANY($1::text[]) "
-        "AND ($2::bigint IS NULL OR id = $2) ORDER BY id",
-        list(UNFINISHED_STATUSES),
-        build_id,
+    rows = await q.find_unfinished_builds(
+        pool, statuses=list(UNFINISHED_STATUSES), build_id=build_id
     )
     if not rows:
         return []
     # One round-trip for all attribute rows, not one per build.
-    attr_rows = await pool.fetch(
-        "SELECT build_id, attr, system, drv_path, outputs, status "
-        "FROM build_attributes WHERE build_id = ANY($1::bigint[])",
-        [row["id"] for row in rows],
-    )
-    attrs_by_build: dict[int, list[asyncpg.Record]] = {}
+    attr_rows = await q.attributes_for_builds(pool, build_ids=[row.id for row in rows])
+    attrs_by_build: dict[int, list[q.AttributesForBuildsRow]] = {}
     for attr in attr_rows:
-        attrs_by_build.setdefault(attr["build_id"], []).append(attr)
+        attrs_by_build.setdefault(attr.build_id, []).append(attr)
     builds = []
     for row in rows:
-        attrs = attrs_by_build.get(row["id"], [])
+        attrs = attrs_by_build.get(row.id, [])
         pending_jobs = []
         for attr in attrs:
             # 'building' rows are attributes that were running when the
             # service died; they must resume like pending ones.
-            if attr["status"] not in ("pending", "building"):
+            if attr.status not in ("pending", "building"):
                 continue  # terminal in DB: never redone
-            if not attr["drv_path"]:
+            if not attr.drv_path:
                 continue
-            outputs = json.loads(attr["outputs"]) if attr["outputs"] else {}
+            outputs = json.loads(attr.outputs) if attr.outputs else {}
             pending_jobs.append(
                 NixEvalJobSuccess(
-                    attr=attr["attr"],
-                    attr_path=attr["attr"].split("."),
+                    attr=attr.attr,
+                    attr_path=attr.attr.split("."),
                     cache_status=CacheStatus.not_built,
                     needed_builds=[],
                     needed_substitutes=[],
-                    drv_path=attr["drv_path"],
-                    name=attr["attr"],
+                    drv_path=attr.drv_path,
+                    name=attr.attr,
                     outputs=outputs or {"out": None},
-                    system=attr["system"] or "",
+                    system=attr.system or "",
                 )
             )
         builds.append(
             ResumableBuild(
-                build_id=row["id"],
-                project_id=row["project_id"],
-                branch=row["branch"],
-                commit_sha=row["commit_sha"],
-                pr_number=row["pr_number"],
-                status=row["status"],
-                effects_started=row["effects_started"],
+                build_id=row.id,
+                project_id=row.project_id,
+                branch=row.branch,
+                commit_sha=row.commit_sha,
+                pr_number=row.pr_number,
+                status=row.status,
+                effects_started=row.effects_started,
                 has_attributes=len(attrs) > 0,
                 pending_jobs=pending_jobs,
             )
@@ -167,22 +161,8 @@ async def fail_interrupted_effects(
     after the requeue. Only rows started before `started_before`
     (process start) are swept: the sweep runs concurrently with the
     work loop, and newer rows are live effects."""
-    await pool.execute(
-        """
-        UPDATE build_effects SET status = 'failed',
-            error = 'interrupted by a service restart', finished_at = now()
-        WHERE status = 'running' AND started_at < $1
-        """,
-        started_before,
-    )
-    await pool.execute(
-        """
-        UPDATE scheduled_effect_runs SET status = 'failed',
-            error = 'interrupted by a service restart', finished_at = now()
-        WHERE status = 'running' AND started_at < $1
-        """,
-        started_before,
-    )
+    await q.fail_interrupted_effects(pool, started_before=started_before)
+    await q.fail_interrupted_scheduled_runs(pool, started_before=started_before)
 
 
 async def check_store_paths(paths: list[str], nix_db: Path = NIX_DB) -> set[str]:
@@ -239,45 +219,19 @@ async def cleanup_old_builds(
 ) -> int:
     """Delete builds (cascading to attributes/log rows) and their log
     directories past the retention horizon. Returns deleted count."""
-    rows = await pool.fetch(
-        """
-        DELETE FROM builds
-        WHERE finished_at IS NOT NULL
-          AND finished_at < now() - make_interval(days => $1)
-          -- A restarted build keeps its old finished_at until it
-          -- re-aggregates; never delete a build that is running again.
-          AND status IN ('succeeded', 'failed', 'cancelled')
-        RETURNING id
-        """,
-        retention_days,
-    )
-    # Age out the per-revision caches; rows are otherwise only removed
-    # on a success flip or explicit rebuild and accumulate forever.
-    for table in ("failed_statuses", "failed_builds"):
-        await pool.execute(
-            f"DELETE FROM {table} "  # noqa: S608 (fixed table names)
-            "WHERE to_timestamp(timestamp) < now() - make_interval(days => $1)",
-            retention_days,
-        )
-    old_runs = await pool.fetch(
-        """
-        DELETE FROM scheduled_effect_runs
-        WHERE finished_at IS NOT NULL
-          AND finished_at < now() - make_interval(days => $1)
-        RETURNING id
-        """,
-        retention_days,
-    )
-    for row in rows:
-        log_dir = state_dir / "logs" / str(row["id"])
+    rows = await q.cleanup_old_rows(pool, retention_days=retention_days)
+    deleted_ids = [r.id for r in rows if r.kind == "build"]
+    old_run_ids = [r.id for r in rows if r.kind == "scheduled_run"]
+    for build_id in deleted_ids:
+        log_dir = state_dir / "logs" / str(build_id)
         with contextlib.suppress(OSError):
             shutil.rmtree(log_dir)
-    for row in old_runs:
+    for run_id in old_run_ids:
         with contextlib.suppress(OSError):
-            (state_dir / "logs" / "scheduled" / f"{row['id']}.zst").unlink()
-    if rows:
-        logger.info("retention cleanup", extra={"deleted_builds": len(rows)})
-    return len(rows)
+            (state_dir / "logs" / "scheduled" / f"{run_id}.zst").unlink()
+    if deleted_ids:
+        logger.info("retention cleanup", extra={"deleted_builds": len(deleted_ids)})
+    return len(deleted_ids)
 
 
 ORPHAN_LOG_GRACE_SECONDS = 3600
@@ -308,7 +262,7 @@ async def cleanup_orphan_log_dirs(
                 candidates.append((build_id, entry.path))
     if not candidates:
         return
-    build_ids = {row["id"] for row in await pool.fetch("SELECT id FROM builds")}
+    build_ids = set(await q.all_build_ids(pool))
     for build_id, path in candidates:
         if build_id not in build_ids:
             with contextlib.suppress(OSError):
