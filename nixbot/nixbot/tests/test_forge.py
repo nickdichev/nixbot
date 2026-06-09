@@ -19,10 +19,8 @@ from nixbot.config import RepoFilters
 from nixbot.forge import (
     DiscoveredRepo,
     ForgeError,
-    GiteaClient,
     GitHubAppClient,
     GitHubFetchCredentialsProvider,
-    GitlabClient,
     NetrcFetchCredentialsProvider,
     filter_repos,
 )
@@ -39,7 +37,14 @@ from nixbot.status import (
     StatusState,
 )
 
-from .support import db_pool, insert_build, insert_project
+from .support import (
+    FakeGitea,
+    db_pool,
+    gitea_client,
+    gitlab_client,
+    insert_build,
+    insert_project,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -314,51 +319,33 @@ def test_github_jwt_is_signed(github_client: GitHubAppClient) -> None:
 
 
 def test_gitea_discovery() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        assert request.headers["Authorization"] == "token tkn"
-        if path == "/api/v1/user/repos":
-            page = int(request.url.params["page"])
-            if page > 1:
-                return httpx.Response(200, json=[])
-            return httpx.Response(
-                200,
-                json=[
-                    {
-                        "id": 7,
-                        "name": "widget",
-                        "owner": {"login": "acme"},
-                        "default_branch": "main",
-                        "clone_url": "https://gitea.example.com/acme/widget.git",
-                        "private": True,
-                        # null permissions: allowed, must not crash.
-                        "permissions": None,
-                    },
-                    {
-                        # No admin permission: still discovered; hook
-                        # registration degrades to a manual-setup hint.
-                        "id": 8,
-                        "name": "readonly",
-                        "owner": {"login": "acme"},
-                        "default_branch": "main",
-                        "clone_url": "https://gitea.example.com/acme/readonly.git",
-                        "private": False,
-                        "permissions": {"admin": False},
-                    },
-                ],
-            )
-        if path == "/api/v1/repos/acme/widget/topics":
-            return httpx.Response(200, json={"topics": ["ci"]})
-        if path == "/api/v1/repos/acme/readonly/topics":
-            return httpx.Response(200, json={"topics": []})
-        return httpx.Response(404)
-
-    client = GiteaClient(
-        "https://gitea.example.com",
-        "tkn",
-        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    forge = FakeGitea(
+        [
+            {
+                "id": 7,
+                "name": "widget",
+                "owner": {"login": "acme"},
+                "default_branch": "main",
+                "clone_url": "https://gitea.example.com/acme/widget.git",
+                "private": True,
+                # null permissions: allowed, must not crash.
+                "permissions": None,
+            },
+            {
+                # No admin permission: still discovered; hook
+                # registration degrades to a manual-setup hint.
+                "id": 8,
+                "name": "readonly",
+                "owner": {"login": "acme"},
+                "default_branch": "main",
+                "clone_url": "https://gitea.example.com/acme/readonly.git",
+                "private": False,
+                "permissions": {"admin": False},
+            },
+        ],
+        topics={"widget": ["ci"], "readonly": []},
     )
-    repos = asyncio.run(client.discover_repos(fetch_topics=True))
+    repos = asyncio.run(forge.client().discover_repos(fetch_topics=True))
     assert [r.forge_repo_id for r in repos] == ["7", "8"]
     assert repos[0].forge == "gitea"
     assert repos[0].topics == ("ci",)
@@ -368,74 +355,40 @@ def test_gitea_discovery() -> None:
 def test_gitea_discovery_skips_topics_by_default() -> None:
     """Topics are only the one-shot legacy import aid; the hourly sync
     must not pay one extra request per repo for them."""
-    topics_requests = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal topics_requests
-        path = request.url.path
-        if path == "/api/v1/user/repos":
-            if int(request.url.params["page"]) > 1:
-                return httpx.Response(200, json=[])
-            return httpx.Response(
-                200,
-                json=[
-                    {
-                        "id": 7,
-                        "name": "widget",
-                        "owner": {"login": "acme"},
-                        "default_branch": "main",
-                        "clone_url": "https://gitea.example.com/acme/widget.git",
-                        "private": False,
-                    }
-                ],
-            )
-        if path.endswith("/topics"):
-            topics_requests += 1
-            return httpx.Response(200, json={"topics": ["ci"]})
-        return httpx.Response(404)
-
-    client = GiteaClient(
-        "https://gitea.example.com",
-        "tkn",
-        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    forge = FakeGitea(
+        [
+            {
+                "id": 7,
+                "name": "widget",
+                "owner": {"login": "acme"},
+                "default_branch": "main",
+                "clone_url": "https://gitea.example.com/acme/widget.git",
+                "private": False,
+            }
+        ],
+        topics={"widget": ["ci"]},
     )
-    repos = asyncio.run(client.discover_repos())
-    assert topics_requests == 0
+    repos = asyncio.run(forge.client().discover_repos())
+    assert forge.topics_requests == 0
     assert repos[0].topics == ()
 
 
 def test_gitea_discovery_null_topics() -> None:
     """Gitea returns {"topics": null} for repos without topics; that
     must not crash discovery."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path == "/api/v1/user/repos":
-            if int(request.url.params["page"]) > 1:
-                return httpx.Response(200, json=[])
-            return httpx.Response(
-                200,
-                json=[
-                    {
-                        "id": 7,
-                        "name": "widget",
-                        "owner": {"login": "acme"},
-                        "default_branch": "main",
-                        "clone_url": "https://gitea.example.com/acme/widget.git",
-                        "private": False,
-                    }
-                ],
-            )
-        if path.endswith("/topics"):
-            return httpx.Response(200, json={"topics": None})
-        return httpx.Response(404)
-
-    client = GiteaClient(
-        "https://gitea.example.com",
-        "tkn",
-        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    forge = FakeGitea(
+        [
+            {
+                "id": 7,
+                "name": "widget",
+                "owner": {"login": "acme"},
+                "default_branch": "main",
+                "clone_url": "https://gitea.example.com/acme/widget.git",
+                "private": False,
+            }
+        ]
     )
-    repos = asyncio.run(client.discover_repos(fetch_topics=True))
+    repos = asyncio.run(forge.client().discover_repos(fetch_topics=True))
     assert repos[0].topics == ()
 
 
@@ -573,34 +526,17 @@ def test_project_store_sync_skips_unchanged_rows(postgres_dsn: str) -> None:
 
 
 def test_gitea_hook_registration(postgres_dsn: str) -> None:
-    hooks = [
-        {"id": 1, "config": {"url": "https://ci.example.com/change_hook/gitea"}},
-        {
-            "id": 2,
-            "config": {"url": "https://other-ci.example.com/change_hook/gitea"},
-        },
-        # Trailing-slash legacy variant must be removed too.
-        {"id": 3, "config": {"url": "https://ci.example.com/change_hook/gitea/"}},
-    ]
-    created: list[dict] = []
-    deleted: list[str] = []
-    patched: list[tuple[str, dict]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if request.method == "GET" and path.endswith("/hooks"):
-            page = int(request.url.params.get("page", "1"))
-            return httpx.Response(200, json=hooks if page == 1 else [])
-        if request.method == "DELETE":
-            deleted.append(path.rsplit("/", 1)[-1])
-            return httpx.Response(204)
-        if request.method == "PATCH":
-            patched.append((path.rsplit("/", 1)[-1], json.loads(request.content)))
-            return httpx.Response(200, json={})
-        if request.method == "POST" and path.endswith("/hooks"):
-            created.append(json.loads(request.content))
-            return httpx.Response(201, json={})
-        return httpx.Response(404)
+    forge = FakeGitea(
+        hooks=[
+            {"id": 1, "config": {"url": "https://ci.example.com/change_hook/gitea"}},
+            {
+                "id": 2,
+                "config": {"url": "https://other-ci.example.com/change_hook/gitea"},
+            },
+            # Trailing-slash legacy variant must be removed too.
+            {"id": 3, "config": {"url": "https://ci.example.com/change_hook/gitea/"}},
+        ]
+    )
 
     async def run() -> None:
         async with db_pool(postgres_dsn) as pool:
@@ -608,11 +544,7 @@ def test_gitea_hook_registration(postgres_dsn: str) -> None:
                 pool, forge="gitea", forge_repo_id="hook-1"
             )
             secrets_store = WebhookSecrets(pool, "gitea")
-            client = GiteaClient(
-                "https://gitea.example.com",
-                "tkn",
-                http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-            )
+            client = forge.client()
             await register_repo_hook(
                 client,
                 secrets_store,
@@ -622,8 +554,8 @@ def test_gitea_hook_registration(postgres_dsn: str) -> None:
                 "https://ci.example.com",
             )
             # Hook created with the stored per-repo secret.
-            assert len(created) == 1
-            hook = created[0]
+            assert len(forge.created) == 1
+            hook = forge.created[0]
             assert hook["config"]["url"] == "https://ci.example.com/webhooks/gitea"
             # PR head pushes arrive as pull_request_sync, not pull_request.
             assert hook["events"] == ["push", "pull_request", "pull_request_sync"]
@@ -631,16 +563,16 @@ def test_gitea_hook_registration(postgres_dsn: str) -> None:
             assert hook["config"]["secret"] == secret
             # Legacy hooks removed only when they match OUR base URL,
             # with or without trailing slash.
-            assert deleted == ["1", "3"]
+            assert forge.deleted == ["1", "3"]
 
             # Secret is stable across calls.
             assert await secrets_store.get_or_create(project_id) == secret
 
             # An existing hook is updated in place to re-sync the secret.
-            hooks[:] = [
+            forge.hooks[:] = [
                 {"id": 9, "config": {"url": "https://ci.example.com/webhooks/gitea"}}
             ]
-            deleted.clear()
+            forge.deleted.clear()
             await register_repo_hook(
                 client,
                 secrets_store,
@@ -649,10 +581,10 @@ def test_gitea_hook_registration(postgres_dsn: str) -> None:
                 "widget",
                 "https://ci.example.com",
             )
-            assert len(created) == 1  # no duplicate hook created
-            assert deleted == []
-            assert len(patched) == 1
-            hook_id, patch_body = patched[0]
+            assert len(forge.created) == 1  # no duplicate hook created
+            assert forge.deleted == []
+            assert len(forge.patched) == 1
+            hook_id, patch_body = forge.patched[0]
             assert hook_id == "9"
             assert patch_body["config"]["secret"] == secret
 
@@ -691,11 +623,7 @@ def test_gitlab_heads_carry_target_branch_base(postgres_dsn: str) -> None:
             )
             project = await RepoStore(pool).by_forge_id("gitlab", "glrecon-1")
             assert project is not None
-            client = GitlabClient(
-                "https://gitlab.example.com",
-                "tkn",
-                http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-            )
+            client = gitlab_client(handler)
             heads = await gitlab_heads(client, project)
             mr_head = next(h for h in heads if h.pr_number == 5)
             assert mr_head.base_sha == "refs/heads/main"
@@ -729,11 +657,7 @@ def test_gitea_heads_encode_slashed_default_branch(postgres_dsn: str) -> None:
             )
             project = await RepoStore(pool).by_forge_id("gitea", "slashy-1")
             assert project is not None
-            client = GiteaClient(
-                "https://gitea.example.com",
-                "tkn",
-                http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-            )
+            client = gitea_client(handler)
             heads = await gitea_heads(client, project)
             assert [h.commit_sha for h in heads] == ["head-rel"]
 
@@ -780,11 +704,7 @@ def test_reconcile_unbuilt_heads(postgres_dsn: str) -> None:
             project = await RepoStore(pool).by_forge_id("gitea", "recon-1")
             assert project is not None
 
-            client = GiteaClient(
-                "https://gitea.example.com",
-                "tkn",
-                http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-            )
+            client = gitea_client(handler)
             heads = await gitea_heads(client, project)
             assert len(heads) == 3
 
@@ -877,11 +797,7 @@ def test_gitea_status_post() -> None:
             return httpx.Response(201, json={})
         return httpx.Response(404)
 
-    client = GiteaClient(
-        "https://gitea.example.com",
-        "tkn",
-        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-    )
+    client = gitea_client(handler)
     asyncio.run(
         GiteaStatusPoster(client).post(
             "acme",
@@ -913,11 +829,7 @@ def test_register_repo_hook_without_admin_warns(
             project_id = await insert_project(
                 pool, "locked", forge="gitea", forge_repo_id="hook-403"
             )
-            client = GiteaClient(
-                "https://gitea.example.com",
-                "tkn",
-                http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-            )
+            client = gitea_client(handler)
             await register_repo_hook(
                 client,
                 WebhookSecrets(pool, "gitea"),
@@ -958,10 +870,11 @@ def test_gitlab_discovery() -> None:
             )
         raise AssertionError(request.url.path)
 
-    client = GitlabClient(
-        "https://gitlab.example.com/",
-        "glpat-x",
-        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    # Trailing slash must be normalized away in generated API URLs.
+    client = gitlab_client(
+        handler,
+        base_url="https://gitlab.example.com/",
+        token="glpat-x",  # noqa: S106 (test credential)
     )
     nested, public = asyncio.run(client.discover_repos())
     assert nested == DiscoveredRepo(
@@ -1007,11 +920,7 @@ def test_gitlab_hook_registration(postgres_dsn: str) -> None:
                 pool, forge="gitlab", forge_repo_id="glhook-1"
             )
             secrets_store = WebhookSecrets(pool, "gitlab")
-            client = GitlabClient(
-                "https://gitlab.example.com",
-                "tkn",
-                http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-            )
+            client = gitlab_client(handler)
             await gitlab_register_repo_hook(
                 client,
                 secrets_store,
@@ -1057,11 +966,7 @@ def test_register_repo_hook_500_with_403_in_body_raises(postgres_dsn: str) -> No
             project_id = await insert_project(
                 pool, "err500", forge="gitea", forge_repo_id="hook-500"
             )
-            client = GiteaClient(
-                "https://gitea.example.com",
-                "tkn",
-                http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-            )
+            client = gitea_client(handler)
             with pytest.raises(ForgeError):
                 await register_repo_hook(
                     client,
@@ -1093,11 +998,7 @@ def test_gitlab_register_repo_hook_status_classification(
             project_id = await insert_project(
                 pool, "glperm", forge="gitlab", forge_repo_id="glhook-403"
             )
-            client = GitlabClient(
-                "https://gitlab.example.com",
-                "tkn",
-                http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-            )
+            client = gitlab_client(handler)
             secrets_store = WebhookSecrets(pool, "gitlab")
             await gitlab_register_repo_hook(
                 client,
@@ -1140,31 +1041,19 @@ def test_gitea_legacy_hook_delete_failure_warns(
 ) -> None:
     """A failed legacy-hook DELETE silently leaves the old hook
     delivering forever; it must at least be logged."""
-    hooks = [
-        {"id": 1, "config": {"url": "https://ci.example.com/change_hook/gitea"}},
-    ]
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if request.method == "GET" and path.endswith("/hooks"):
-            page = int(request.url.params.get("page", "1"))
-            return httpx.Response(200, json=hooks if page == 1 else [])
-        if request.method == "DELETE":
-            return httpx.Response(500, text="boom")
-        if request.method == "POST" and path.endswith("/hooks"):
-            return httpx.Response(201, json={})
-        return httpx.Response(404)
+    forge = FakeGitea(
+        hooks=[
+            {"id": 1, "config": {"url": "https://ci.example.com/change_hook/gitea"}},
+        ],
+        delete_status=500,
+    )
 
     async def run() -> None:
         async with db_pool(postgres_dsn) as pool:
             project_id = await insert_project(
                 pool, forge="gitea", forge_repo_id="hook-del-1"
             )
-            client = GiteaClient(
-                "https://gitea.example.com",
-                "tkn",
-                http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-            )
+            client = forge.client()
             with caplog.at_level("WARNING", logger="nixbot.gitea_hooks"):
                 await register_repo_hook(
                     client,

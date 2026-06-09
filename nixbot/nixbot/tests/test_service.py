@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import socket
 import time
 from pathlib import Path
@@ -22,12 +21,12 @@ from nixbot.config import (
     resolve_credential_path,
 )
 from nixbot.events import NullStatusReporter
-from nixbot.forge import DiscoveredRepo, GitlabClient
+from nixbot.forge import DiscoveredRepo
 from nixbot.scheduled import DueEffect, ScheduleWhen
 from nixbot.service import scheduled_worktree_id
 from nixbot.webhooks import ChangeRequest, PrClosed
 
-from .support import git, insert_build, insert_project, make_config
+from .support import FakeGitlab, git, insert_build, insert_project, make_config
 
 pytestmark = pytest.mark.usefixtures("fresh_work_queue")
 
@@ -958,29 +957,18 @@ def test_reeval_failure_marks_build_failed(
 def test_gitlab_discovery_and_hook_registration(
     postgres_dsn: str, tmp_path: Path
 ) -> None:
-    hook_posts: list[dict] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path == "/api/v4/projects" and request.method == "GET":
-            return httpx.Response(
-                200,
-                json=[
-                    {
-                        "id": 41,
-                        "path_with_namespace": "Mic92/dotfiles",
-                        "default_branch": "main",
-                        "http_url_to_repo": "https://gitlab.com/Mic92/dotfiles.git",
-                        "visibility": "public",
-                    }
-                ],
-            )
-        if path.endswith("/hooks") and request.method == "GET":
-            return httpx.Response(200, json=[])
-        if path.endswith("/hooks") and request.method == "POST":
-            hook_posts.append(json.loads(request.content))
-            return httpx.Response(201, json={})
-        return httpx.Response(404)
+    forge = FakeGitlab(
+        [
+            {
+                "id": 41,
+                "path_with_namespace": "Mic92/dotfiles",
+                "default_branch": "main",
+                "http_url_to_repo": "https://gitlab.com/Mic92/dotfiles.git",
+                "visibility": "public",
+            }
+        ],
+        token="glpat-x",  # noqa: S106 (test credential)
+    )
 
     async def run() -> None:
         token = tmp_path / "gitlab-token"
@@ -993,29 +981,25 @@ def test_gitlab_discovery_and_hook_registration(
         service, _app = await build_service(config)
         pool = service.pool
         try:
-            service.gitlab = GitlabClient(
-                "https://gitlab.com",
-                "glpat-x",
-                http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-            )
+            service.gitlab = forge.client(base_url="https://gitlab.com")
             await service.discover_once()
             project = await pool.fetchrow(
                 "SELECT * FROM projects WHERE forge = 'gitlab' AND forge_repo_id = '41'"
             )
             assert project is not None
             assert project["name"] == "dotfiles"
-            assert not hook_posts  # disabled projects get no hook
+            assert not forge.created  # disabled projects get no hook
 
             await pool.execute(
                 "UPDATE projects SET enabled = TRUE WHERE id = $1", project["id"]
             )
             await service._register_hooks()  # noqa: SLF001
-            assert hook_posts[0]["url"] == "http://ci.test/webhooks/gitlab"
+            assert forge.created[0]["url"] == "http://ci.test/webhooks/gitlab"
             secret = await pool.fetchval(
                 "SELECT secret FROM webhook_secrets WHERE project_id = $1",
                 project["id"],
             )
-            assert hook_posts[0]["token"] == secret
+            assert forge.created[0]["token"] == secret
         finally:
             await pool.close()
 

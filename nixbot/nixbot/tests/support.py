@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import json
 import os
+import re
 import secrets
 import subprocess
 import time
@@ -17,6 +19,7 @@ import httpx
 
 from nixbot.auth import SessionSigner
 from nixbot.config import Config
+from nixbot.forge import GiteaClient, GitlabClient
 from nixbot.migrations import apply_migrations
 from nixbot.web.app import WebContext, create_app
 
@@ -65,6 +68,123 @@ def mk_job(
         outputs={"out": out or f"/nix/store/{attr}-out"},
         system=system,
     )
+
+
+def gitea_client(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    base_url: str = "https://gitea.example.com",
+    token: str = "tkn",  # noqa: S107 (test credential)
+) -> GiteaClient:
+    """GiteaClient backed by an httpx mock transport."""
+    return GiteaClient(
+        base_url,
+        token,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+
+def gitlab_client(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    base_url: str = "https://gitlab.example.com",
+    token: str = "tkn",  # noqa: S107 (test credential)
+) -> GitlabClient:
+    """GitlabClient backed by an httpx mock transport."""
+    return GitlabClient(
+        base_url,
+        token,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+
+class FakeGitea:
+    """Minimal Gitea API fake: paged repo list, per-repo topics, and a
+    mutable hooks store recording create/update/delete calls."""
+
+    def __init__(
+        self,
+        repos: list[dict] | None = None,
+        *,
+        topics: dict[str, list[str]] | None = None,
+        hooks: list[dict] | None = None,
+        delete_status: int = 204,
+        token: str = "tkn",  # noqa: S107 (test credential)
+    ) -> None:
+        self.repos = repos or []
+        self.topics = topics or {}
+        self.hooks = hooks or []
+        self.delete_status = delete_status
+        self.token = token
+        self.created: list[dict] = []
+        self.deleted: list[str] = []
+        self.patched: list[tuple[str, dict]] = []
+        self.topics_requests = 0
+
+    def handler(self, request: httpx.Request) -> httpx.Response:  # noqa: PLR0911
+        assert request.headers["Authorization"] == f"token {self.token}"
+        path = request.url.path
+        if path == "/api/v1/user/repos":
+            page = int(request.url.params["page"])
+            return httpx.Response(200, json=self.repos if page == 1 else [])
+        topics = re.fullmatch(r"/api/v1/repos/[^/]+/([^/]+)/topics", path)
+        if topics:
+            self.topics_requests += 1
+            return httpx.Response(200, json={"topics": self.topics.get(topics[1])})
+        if request.method == "GET" and path.endswith("/hooks"):
+            page = int(request.url.params.get("page", "1"))
+            return httpx.Response(200, json=self.hooks if page == 1 else [])
+        if request.method == "DELETE":
+            self.deleted.append(path.rsplit("/", 1)[-1])
+            if self.delete_status >= 400:  # noqa: PLR2004
+                return httpx.Response(self.delete_status, text="boom")
+            return httpx.Response(self.delete_status)
+        if request.method == "PATCH":
+            self.patched.append((path.rsplit("/", 1)[-1], json.loads(request.content)))
+            return httpx.Response(200, json={})
+        if request.method == "POST" and path.endswith("/hooks"):
+            self.created.append(json.loads(request.content))
+            return httpx.Response(201, json={})
+        return httpx.Response(404)
+
+    def client(self) -> GiteaClient:
+        return gitea_client(self.handler, token=self.token)
+
+
+class FakeGitlab:
+    """Minimal GitLab API fake: project list and a mutable hooks store
+    recording create/update calls."""
+
+    def __init__(
+        self,
+        projects: list[dict] | None = None,
+        *,
+        hooks: list[dict] | None = None,
+        token: str = "tkn",  # noqa: S107 (test credential)
+    ) -> None:
+        self.projects = projects or []
+        self.hooks = hooks or []
+        self.token = token
+        self.created: list[dict] = []
+        self.updated: list[tuple[str, dict]] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        assert request.headers["PRIVATE-TOKEN"] == self.token
+        path = request.url.path
+        if path == "/api/v4/projects" and request.method == "GET":
+            return httpx.Response(200, json=self.projects)
+        if path.endswith("/hooks") and request.method == "GET":
+            return httpx.Response(200, json=self.hooks)
+        if path.endswith("/hooks") and request.method == "POST":
+            self.created.append(json.loads(request.content))
+            return httpx.Response(201, json={})
+        if request.method == "PUT":
+            self.updated.append((path.rsplit("/", 1)[-1], json.loads(request.content)))
+            return httpx.Response(200, json={})
+        return httpx.Response(404)
+
+    def client(self, *, base_url: str = "https://gitlab.example.com") -> GitlabClient:
+        return gitlab_client(self.handler, base_url=base_url, token=self.token)
 
 
 @contextlib.asynccontextmanager
