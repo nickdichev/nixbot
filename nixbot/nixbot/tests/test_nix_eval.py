@@ -297,6 +297,18 @@ def test_cgroup_limiter_eval_cgroup_lifecycle(tmp_path: Path) -> None:
     assert not path.exists()
 
 
+def fake_nix_eval_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str
+) -> None:
+    """Install a fake nix-eval-jobs shell script on PATH."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "nix-eval-jobs"
+    fake.write_text("#!/bin/sh\n" + body)
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+
+
 def test_eval_runner_handles_long_json_lines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -318,12 +330,7 @@ def test_eval_runner_handles_long_json_lines(
     payload.write_text(json.dumps(job) + "\n")
     assert payload.stat().st_size > 64 * 1024
 
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    fake = bindir / "nix-eval-jobs"
-    fake.write_text(f'#!/bin/sh\ncat "{payload}"\n')
-    fake.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    fake_nix_eval_jobs(tmp_path, monkeypatch, f'cat "{payload}"\n')
 
     settings = EvalSettings(
         gc_roots_dir=tmp_path / "gcroots", sandbox=False, systemd_scope=False
@@ -358,12 +365,7 @@ def test_eval_runner_streams_job_batches(
     payload = tmp_path / "payload.json"
     payload.write_text("\n".join(lines) + "\n")
 
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    fake = bindir / "nix-eval-jobs"
-    fake.write_text(f'#!/bin/sh\ncat "{payload}"\n')
-    fake.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    fake_nix_eval_jobs(tmp_path, monkeypatch, f'cat "{payload}"\n')
 
     batches: list[int] = []
 
@@ -400,13 +402,10 @@ def test_eval_runner_flushes_partial_batch_on_timeout(
             "system": "x86_64-linux",
         }
     )
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    fake = bindir / "nix-eval-jobs"
     second = job.replace("first", "second")
-    fake.write_text(f"#!/bin/sh\necho '{job}'\nsleep 3\necho '{second}'\n")
-    fake.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    fake_nix_eval_jobs(
+        tmp_path, monkeypatch, f"echo '{job}'\nsleep 3\necho '{second}'\n"
+    )
 
     batches: list[int] = []
 
@@ -440,17 +439,13 @@ def test_eval_failure_with_oom_text_in_stderr_is_not_oom(
     # A failed eval whose trace merely mentions "out of memory" (e.g. a
     # package description or nested builder output) must not be
     # classified as a permanent cgroup OOM.
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    fake = bindir / "nix-eval-jobs"
-    fake.write_text(
-        "#!/bin/sh\n"
+    fake_nix_eval_jobs(
+        tmp_path,
+        monkeypatch,
         'echo "error: package foo: never run out of memory again" >&2\n'
         'echo "error: assertion failed" >&2\n'
-        "exit 1\n"
+        "exit 1\n",
     )
-    fake.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
 
     settings = EvalSettings(
         gc_roots_dir=tmp_path / "gcroots", sandbox=False, systemd_scope=False
@@ -475,14 +470,11 @@ def test_eval_runner_proxy_env_reaches_evaluator(
     # Proxy/TLS settings must reach nix-eval-jobs or evaluation breaks
     # in proxy/custom-CA deployments. The fake echoes its environment
     # into stderr, which the EvalError carries.
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    fake = bindir / "nix-eval-jobs"
-    fake.write_text(
-        '#!/bin/sh\necho "proxy=$https_proxy ca=$NIX_SSL_CERT_FILE" >&2\nexit 1\n'
+    fake_nix_eval_jobs(
+        tmp_path,
+        monkeypatch,
+        'echo "proxy=$https_proxy ca=$NIX_SSL_CERT_FILE" >&2\nexit 1\n',
     )
-    fake.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
     monkeypatch.setenv("https_proxy", "http://proxy:3128")
     monkeypatch.setenv("NIX_SSL_CERT_FILE", "/etc/ssl/ca.pem")
 
@@ -501,12 +493,9 @@ def test_eval_fails_cleanly_on_line_over_stream_limit(
     # out of the reader, leaking a running nix-eval-jobs blocked on the
     # full pipe; it must surface as a clean EvalError instead.
     monkeypatch.setattr(nix_eval, "STREAM_LIMIT", 64 * 1024)
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    fake = bindir / "nix-eval-jobs"
-    fake.write_text("#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'x'\necho\n")
-    fake.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    fake_nix_eval_jobs(
+        tmp_path, monkeypatch, "head -c 200000 /dev/zero | tr '\\0' 'x'\necho\n"
+    )
 
     settings = EvalSettings(
         gc_roots_dir=tmp_path / "gcroots", sandbox=False, systemd_scope=False

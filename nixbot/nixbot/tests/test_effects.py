@@ -85,13 +85,24 @@ def test_should_run_effects_branch_globs() -> None:
     assert not should_run_effects(config, "main", "feature", is_pull_request=False)
 
 
-@pytest.fixture
-def fake_effects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def install_fake_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str
+) -> None:
+    """Install a fake nixbot-effects shell script on PATH."""
     bindir = tmp_path / "bin"
     bindir.mkdir()
     script = bindir / "nixbot-effects"
-    script.write_text(
-        f"""#!/bin/sh
+    script.write_text("#!/bin/sh\n" + body)
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+
+
+@pytest.fixture
+def fake_effects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    install_fake_effects(
+        tmp_path,
+        monkeypatch,
+        f"""\
 echo "$@" >> {tmp_path}/calls
 case "$1" in
   list)
@@ -110,10 +121,8 @@ case "$1" in
     echo "running effect"
     ;;
 esac
-"""
+""",
     )
-    script.chmod(script.stat().st_mode | stat.S_IEXEC)
-    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
     return tmp_path
 
 
@@ -182,24 +191,16 @@ def test_run_effect_inherits_environment(
 def test_long_output_lines(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # A single output line larger than asyncio's 64 KiB StreamReader
     # default must not abort the run.
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    script = bindir / "nixbot-effects"
-    script.write_text('#!/bin/sh\nhead -c 200000 /dev/zero | tr "\\0" x\necho\n')
-    script.chmod(script.stat().st_mode | stat.S_IEXEC)
-    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    install_fake_effects(
+        tmp_path, monkeypatch, 'head -c 200000 /dev/zero | tr "\\0" x\necho\n'
+    )
 
     ok = asyncio.run(run_effect(make_ctx(tmp_path), "deploy"))
     assert ok
 
 
 def test_timeout_kills_effect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    script = bindir / "nixbot-effects"
-    script.write_text("#!/bin/sh\nsleep 60\n")
-    script.chmod(script.stat().st_mode | stat.S_IEXEC)
-    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    install_fake_effects(tmp_path, monkeypatch, "sleep 60\n")
 
     ctx = make_ctx(tmp_path)
     ctx.timeout = 0.2
