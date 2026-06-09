@@ -41,10 +41,6 @@
   };
   programs.ruff.check = true;
   programs.ruff.format = true;
-  # sqlc-generated code (see sqlc.yaml); the freshness check compares
-  # it byte-for-byte against the generator output.
-  settings.formatter.ruff-check.excludes = [ "nixbot/nixbot/db_gen/*" ];
-  settings.formatter.ruff-format.excludes = [ "nixbot/nixbot/db_gen/*" ];
   settings.formatter.shellcheck.options = [
     "-s"
     "bash"

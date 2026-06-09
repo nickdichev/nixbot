@@ -9,3 +9,9 @@ asyncio_mode = "auto"
 [[tool.mypy.overrides]]
 module = "asyncpg.*"
 ignore_missing_imports = true
+
+# sqlc-generated code; the sqlc-generated flake check fails on any
+# drift, so ruff must never rewrite it regardless of invocation cwd.
+[tool.ruff]
+extend-exclude = ["nixbot/nixbot/db_gen"]
+force-exclude = true
