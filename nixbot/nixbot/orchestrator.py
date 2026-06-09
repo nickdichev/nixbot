@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
-from . import build_run, effects_run, gcroots, outputs
+from . import build_run, effects_run, gcroots, outputs, reruns
 from .canceller import (
     CancellationManager,
     RegisterOutcome,
@@ -30,12 +30,13 @@ from .db import BuildStatus
 from .effects_state import TaskTokens
 from .events import ChangeEvent, NullStatusReporter, RepoInfo, StatusReporter
 from .executor import LogWriter
-from .gitrepo import GitError, MergeConflictError, run_git
+from .gitrepo import GitError, MergeConflictError, pr_refspec, run_git
 from .web.logs import LogRegistry
 from .work_queue import WorkQueue
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
+    from contextlib import AbstractAsyncContextManager
     from pathlib import Path
 
     from .config import Config
@@ -55,17 +56,6 @@ if TYPE_CHECKING:
     OutputWriter = Callable[[Path, str, str, str, str, str, str], Path]
 
 logger = logging.getLogger(__name__)
-
-
-def pr_refspec(forge: str, pr_number: int) -> str:
-    """GitLab serves MR heads under refs/merge-requests/<iid>/*;
-    GitHub and Gitea use refs/pull/<number>/*."""
-    ref = (
-        f"refs/merge-requests/{pr_number}"
-        if forge == "gitlab"
-        else f"refs/pull/{pr_number}"
-    )
-    return f"+{ref}/*:{ref}/*"
 
 
 class EvalRunnerLike(Protocol):
@@ -297,36 +287,16 @@ class Orchestrator:
             {"project_id": event.repo.id, "rev": event.commit_sha},
         )
 
-    @asynccontextmanager
-    async def rerun_worktree(
+    def rerun_worktree(
         self,
         info: RepoInfo,
         build: BuildRecord,
         prefix: str,
         credentials: FetchCredentials | None,
-    ) -> AsyncIterator[tuple[ChangeEvent, Path]]:
+    ) -> AbstractAsyncContextManager[tuple[ChangeEvent, Path]]:
         """Event reconstruction plus a fresh worktree at the recorded
         commit; shared by the rerun paths."""
-        event = ChangeEvent(
-            repo=info,
-            branch=build.branch,
-            commit_sha=build.commit_sha,
-            pr_number=build.pr_number,
-        )
-        # PR head commits are only reachable via the PR refs.
-        refspecs = ["+refs/heads/*:refs/heads/*"]
-        if build.pr_number is not None:
-            refspecs.append(pr_refspec(info.forge, build.pr_number))
-        await self.repos.fetch(info.key, info.clone_url, refspecs, credentials)
-        worktree = await self.repos.checkout_for_build(
-            info.key,
-            f"{prefix}-{build.id}",
-            base_commit=build.commit_sha,
-        )
-        try:
-            yield event, worktree.path
-        finally:
-            await self.repos.remove_worktree(worktree)
+        return reruns.rerun_worktree(self, info, build, prefix, credentials)
 
     async def rerun_pending_attributes(
         self,
@@ -338,74 +308,9 @@ class Orchestrator:
         """Re-run only the pending attributes of an existing build using
         the stored eval results — no re-evaluation (attribute restarts
         and crash recovery)."""
-        if build.id in self.cancel_events:
-            # Already running; a concurrent rerun would double-write
-            # attribute completions.
-            return
-        # Claim the slot before the first await; concurrent reruns
-        # must not pass the guard together.
-        cancel_event = self.cancel_events[build.id] = asyncio.Event()
-        try:
-            current = await self.db.get_build(build.id)
-            if current is not None and current.status == "cancelled":
-                # Cancelled between scheduling the rerun and getting here.
-                return
-            # Pending rows for systems no longer in build_systems would
-            # stay non-terminal forever: the scheduler drops their jobs.
-            # Drop the rows too (same as never recording them).
-            unsupported = [
-                job
-                for job in pending_jobs
-                if job.system not in self.config.build_systems
-            ]
-            if unsupported:
-                await self.db.pool.execute(
-                    "DELETE FROM build_attributes WHERE build_id = $1 "
-                    "AND attr = ANY($2::text[])",
-                    build.id,
-                    [job.attr for job in unsupported],
-                )
-                pending_jobs = [
-                    job
-                    for job in pending_jobs
-                    if job.system in self.config.build_systems
-                ]
-            # No re-eval happens on this path; go straight to building.
-            await self.db.set_build_status(build.id, BuildStatus.BUILDING)
-            # Register so supersede/PR-close cancellation also covers
-            # recovered and restarted builds.
-            self.canceller.register(
-                info.id,
-                branch_key(build.branch, build.pr_number),
-                build.id,
-                build.tree_hash or "",
-                build.commit_sha,
-                cancel_event,
-            )
-            async with self.rerun_worktree(info, build, "rerun", credentials) as (
-                event,
-                worktree_path,
-            ):
-                # cache_failures=False: see _ReadOnlyFailedBuildCache.
-                status = await build_run.build_attributes(
-                    self,
-                    event,
-                    build,
-                    worktree_path,
-                    pending_jobs,
-                    cache_failures=False,
-                )
-                if status == BuildStatus.SUCCEEDED:
-                    # Crash recovery before effects started; the
-                    # started-flag keeps already-deployed builds from
-                    # re-deploying.
-                    await self.maybe_run_effects(
-                        event, build, worktree_path, credentials
-                    )
-                    await self.refresh_schedules(event)
-        finally:
-            self.canceller.complete(build.id)
-            self.cancel_events.pop(build.id, None)
+        await reruns.rerun_pending_attributes(
+            self, info, build, pending_jobs, credentials
+        )
 
     async def rerun_effects(
         self,
@@ -415,32 +320,7 @@ class Orchestrator:
     ) -> None:
         """Effects-only restart: fresh worktree at the recorded commit,
         attributes untouched."""
-        if build.id in self.cancel_events:
-            # A concurrent rerun (or double click) would deploy twice.
-            return
-        self.cancel_events[build.id] = asyncio.Event()
-        try:
-            # Reset under the claim: resetting earlier (e.g. in the
-            # service) could clobber a rerun already in flight.
-            await self.db.pool.execute(
-                "UPDATE builds SET effects_started = FALSE WHERE id = $1", build.id
-            )
-            await self.db.pool.execute(
-                "UPDATE build_effects SET status = 'pending', error = NULL, "
-                "finished_at = NULL, log_path = NULL, log_size = 0, "
-                "log_truncated = FALSE WHERE build_id = $1",
-                build.id,
-            )
-            async with self.rerun_worktree(info, build, "effects", credentials) as (
-                event,
-                worktree_path,
-            ):
-                await self.maybe_run_effects(event, build, worktree_path, credentials)
-                await self.refresh_schedules(event)
-            # The enqueued effect items share this build's key and only
-            # become claimable once this item finishes.
-        finally:
-            self.cancel_events.pop(build.id, None)
+        await reruns.rerun_effects(self, info, build, credentials)
 
     async def maybe_run_effects(
         self,
