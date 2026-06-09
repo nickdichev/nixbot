@@ -59,6 +59,12 @@ class FakeEvalRunner:
     last_settings: EvalSettings | None = None
     block: asyncio.Event | None = None
     started: asyncio.Event = field(default_factory=asyncio.Event)
+    # Raised after blocking (and optional streaming): simulates eval
+    # failures (EvalError) or unexpected crashes (other exceptions).
+    error: BaseException | None = None
+    # Deliver jobs via on_jobs before raising, like the incremental
+    # eval stream that fails mid-way.
+    stream_jobs: bool = False
 
     async def run(
         self,
@@ -74,6 +80,11 @@ class FakeEvalRunner:
         settings.gc_roots_dir.mkdir(parents=True, exist_ok=True)
         if self.block is not None:
             await self.block.wait()
+        if self.error is not None:
+            if self.stream_jobs:
+                assert callable(on_jobs)
+                await on_jobs(list(self.jobs))
+            raise self.error
         if callable(on_stderr_line):
             for warning in self.warnings:
                 await on_stderr_line(f"warning: {warning}")
@@ -1027,13 +1038,13 @@ def test_eval_failure_cleans_cancel_events(
     async def run() -> None:
         sha = add_commit(upstream, "evf")
 
-        class FailingEval:
-            async def run(self, *args: object, **kwargs: object) -> EvalResult:
-                msg = "boom"
-                raise EvalError(msg)
-
         pool, orchestrator, _, project = await make_env(
-            postgres_dsn, tmp_path, upstream, FailingEval(), FakeExecutor(), "evf"
+            postgres_dsn,
+            tmp_path,
+            upstream,
+            FakeEvalRunner([], error=EvalError("boom")),
+            FakeExecutor(),
+            "evf",
         )
         try:
             build = await orchestrator.handle_change_event(
@@ -1336,18 +1347,7 @@ def test_linked_context_reported_on_eval_failure(
         sha = add_commit(upstream, "lef")
         git(upstream, "branch", "lef-copy", "main")
 
-        class BlockedFailingEval:
-            def __init__(self) -> None:
-                self.started = asyncio.Event()
-                self.block = asyncio.Event()
-
-            async def run(self, *args: object, **kwargs: object) -> EvalResult:
-                self.started.set()
-                await self.block.wait()
-                msg = "boom"
-                raise EvalError(msg)
-
-        eval_runner = BlockedFailingEval()
+        eval_runner = FakeEvalRunner([], block=asyncio.Event(), error=EvalError("boom"))
         pool, orchestrator, reporter, project = await make_env(
             postgres_dsn, tmp_path, upstream, eval_runner, FakeExecutor(), "lef"
         )
@@ -1361,6 +1361,7 @@ def test_linked_context_reported_on_eval_failure(
             build2 = await orchestrator.handle_change_event(
                 ChangeEvent(repo=project, branch="lef-copy", commit_sha=sha)
             )
+            assert eval_runner.block is not None
             eval_runner.block.set()
             build1 = await task
             assert build1 is not None
@@ -1384,20 +1385,15 @@ def test_eval_failure_settles_streamed_attributes(
         async def run() -> None:
             sha = add_commit(upstream, "evstream")
 
-            class StreamingFailingEval:
-                async def run(
-                    self, *args: object, on_jobs: object = None, **kwargs: object
-                ) -> EvalResult:
-                    assert callable(on_jobs)
-                    await on_jobs([mk_job("streamed")])
-                    msg = "boom after streaming"
-                    raise EvalError(msg)
-
             pool, orchestrator, _, project = await make_env(
                 postgres_dsn,
                 tmp_path,
                 upstream,
-                StreamingFailingEval(),
+                FakeEvalRunner(
+                    [mk_job("streamed")],
+                    error=EvalError("boom after streaming"),
+                    stream_jobs=True,
+                ),
                 FakeExecutor(),
                 "evstream",
             )
@@ -1596,26 +1592,13 @@ def test_unexpected_eval_path_error_settles_build(
     the build as failed instead of wedging it in 'evaluating' and
     leaking the build task blocked on the jobs queue."""
 
-    @dataclass
-    class BoomEvalRunner:
-        async def run(
-            self,
-            worktree_path: Path,
-            branch_config: object,
-            settings: EvalSettings,
-            on_jobs: object = None,
-            on_stderr_line: object = None,
-        ) -> EvalResult:
-            msg = "db outage"
-            raise RuntimeError(msg)
-
     async def run() -> None:
         add_commit(upstream, "eval-boom")
         pool, orchestrator, reporter, project = await make_env(
             postgres_dsn,
             tmp_path,
             upstream,
-            BoomEvalRunner(),
+            FakeEvalRunner([], error=RuntimeError("db outage")),
             FakeExecutor(),
             name="eval-boom",
         )
