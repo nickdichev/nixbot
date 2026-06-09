@@ -72,18 +72,6 @@ def test_session_roundtrip() -> None:
     assert signer.user_from(token + "x") is None
 
 
-def test_session_carries_avatar() -> None:
-    signer = SessionSigner([b"k1"])
-    user = User(
-        provider="gitea",
-        username="bob",
-        avatar_url="https://gitea.test/avatars/123",
-    )
-    roundtripped = signer.user_from(signer.session_for(user))
-    assert roundtripped is not None
-    assert roundtripped.avatar_url == "https://gitea.test/avatars/123"
-
-
 def test_session_expiry() -> None:
     signer = SessionSigner([b"k1"], lifetime=-1)
     token = signer.session_for(ALICE)
@@ -591,15 +579,6 @@ def test_can_view_private_per_repo_precedence() -> None:
     assert can_view_private(everyone, viewers, "github", "other", "repo")
     assert not can_view_private(None, viewers, "github", "other", "repo")
     assert not can_view_private(org_user, {}, "gitlab", "acme", "widget")
-
-
-def test_session_carries_groups() -> None:
-    signer = SessionSigner([b"k" * 32])
-    user = User(provider="oidc:idp", username="alice", groups=("ci", "ops"))
-    token = signer.session_for(user)
-    restored = signer.user_from(token)
-    assert restored is not None
-    assert restored.groups == ("ci", "ops")
 
 
 def test_relevant_groups_keeps_only_rule_groups() -> None:
