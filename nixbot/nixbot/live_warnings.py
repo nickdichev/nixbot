@@ -23,6 +23,10 @@ MAX_GROUPS = 50
 # Warning text is repo-controlled; keep single messages bounded.
 MAX_MESSAGE_LEN = 500
 
+_IGNORED_WARNINGS = (
+    "because it is a restricted setting and you are not a trusted user",
+)
+
 
 def normalize_warning(line: str) -> tuple[str, str]:
     """(level, dedupe message) for one ANSI-stripped stderr line."""
@@ -48,6 +52,8 @@ class LiveWarningAggregator:
     def add(self, line: str) -> bool:
         """Record a line; True when the snapshot changed."""
         key = normalize_warning(line)
+        if any(s in key[1] for s in _IGNORED_WARNINGS):
+            return False
         if key in self._groups:
             self._groups[key] += 1
             return True
