@@ -1,7 +1,7 @@
 # Nixbot
 
-**Development Status:** alpha (under active development: APIs, options and the
-database schema may change without notice)
+**Development Status:** beta (under active development: APIs and options may
+change without notice)
 
 Nixbot is a continuous integration (CI) service for the Nix ecosystem, shipped
 as a single NixOS service. It is a rewrite of
