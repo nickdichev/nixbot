@@ -395,10 +395,6 @@ class ForgeStatusReporter:
         self.base_url = base_url.rstrip("/")
         self.failed_build_report_limit = failed_build_report_limit
         self.context_prefix = context_prefix
-        # Forges whose poster is latched off after a permission error;
-        # without the latch a missing Checks grant would fill the
-        # report queue and hammer the API on every build.
-        self._disabled: set[str] = set()
         # build id -> highest generation posted (drop stale posts).
         # Bounded LRU: stale-post races only matter around a build's
         # final re-aggregation, so old entries are safe to evict.
@@ -420,7 +416,7 @@ class ForgeStatusReporter:
         propagate: bool = False,
     ) -> None:
         poster = self.posters.get(event.repo.forge)
-        if poster is None or event.repo.forge in self._disabled:
+        if poster is None:
             return
         try:
             await poster.post(
@@ -439,11 +435,12 @@ class ForgeStatusReporter:
                 text=text,
             )
         except CheckPermissionError:
+            # Per-org and not transient: log the hint and move on, never
+            # latch off posting for the whole forge.
             logger.exception(
-                "disabling status posting until restart",
+                "failed to post commit status",
                 extra={"forge": event.repo.forge},
             )
-            self._disabled.add(event.repo.forge)
         except (httpx.HTTPError, ForgeError, StatusPostError):
             # Transient failures must not propagate into the
             # orchestrator task and leave builds stuck — except the
