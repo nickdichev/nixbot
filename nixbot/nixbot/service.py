@@ -45,13 +45,14 @@ from .webhooks import (
 from .work_queue import WorkItem, WorkQueue
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
+    from collections.abc import Coroutine, Sequence
 
     import asyncpg
 
     from .config import Config
     from .db import BuildRecord
     from .forge import GiteaClient, GitHubAppClient, GitlabClient
+    from .models import NixEvalJobSuccess
     from .orchestrator import Orchestrator
     from .polling import PolledRepository
     from .repos import RepoStore
@@ -123,8 +124,11 @@ class RetryingReporter:
         *,
         success: bool,
         warnings: list[str],
+        jobs: Sequence[NixEvalJobSuccess] | None = None,
     ) -> None:
-        await self.inner.eval_finished(event, build, success=success, warnings=warnings)
+        await self.inner.eval_finished(
+            event, build, success=success, warnings=warnings, jobs=jobs
+        )
 
     async def eval_cancelled(self, event: ChangeEvent, build: BuildRecord) -> None:
         await self.inner.eval_cancelled(event, build)
@@ -197,6 +201,18 @@ class CIService:
         self._tasks.discard(task)
         if not task.cancelled() and task.exception() is not None:
             logger.error("background task failed", exc_info=task.exception())
+
+    async def aclose(self) -> None:
+        """Cancel in-flight work and await its cleanup before exit. A
+        cancelled build unwinds through the scheduler, which reaps its
+        nix children without writing a terminal status, so the build
+        stays resumable — shutdown behaves like a crash and recovery
+        resumes it. Needs systemd KillMode=mixed so the children outlive
+        the stop signal."""
+        for task in list(self._tasks):
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
 
     # -- change ingestion (ChangeSink for webhooks/reconciliation) -------
 

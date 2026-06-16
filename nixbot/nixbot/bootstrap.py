@@ -518,6 +518,13 @@ async def run_service(config: Config) -> None:
             await poller.stop()
         for task in tasks:
             task.cancel()
+        # Stop the dispatcher before draining builds so it spawns no new
+        # ones meanwhile.
+        await asyncio.gather(*tasks, return_exceptions=True)
+        # Drain in-flight builds (reap nix children, leave interrupted
+        # work resumable). Before pool.terminate(): the unwinding tasks
+        # still touch the database.
+        await service.aclose()
         # Drop connections without waiting: a clean close would block
         # shutdown on whatever the cancelled tasks still hold.
         service.pool.terminate()

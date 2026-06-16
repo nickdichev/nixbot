@@ -30,10 +30,10 @@ from nixbot.status import (
     GitlabStatusPoster,
     StatusState,
     _check_run_output,
-    _failure_table,
     attr_status_context,
     eval_description,
 )
+from nixbot.tests.support import mk_job
 
 
 @dataclass
@@ -209,6 +209,58 @@ async def test_phase_statuses_and_target_url() -> None:
         for p in poster.posts
     )
     assert "(1 warning)" in poster.posts[1].description
+
+
+async def test_eval_finished_build_plan_in_nix_build_body() -> None:
+    """Pending nix-build run lists the attributes to build, each
+    linking to its raw log."""
+    reporter, poster, _ = make_reporter()
+    jobs = [
+        mk_job("checks.x86_64-linux.b"),
+        mk_job("checks.x86_64-linux.a"),
+    ]
+    await reporter.eval_finished(EVENT, BUILD, success=True, warnings=[], jobs=jobs)
+
+    build_post = next(
+        i for i, p in enumerate(poster.posts) if p.context.endswith("nix-build")
+    )
+    text = poster.extras[build_post]["text"]
+    assert "Building 2 attribute(s):" in text
+    # Sorted, so `a` precedes `b`; pending plan omits the status column.
+    assert text.index("checks.x86_64-linux.a") < text.index("checks.x86_64-linux.b")
+    assert "status" not in text
+    # attribute name links to the live viewer; raw log is a separate link.
+    assert (
+        "[`checks.x86_64-linux.a`](https://ci.test/repos/github/acme/widget/builds/42/logs/checks.x86_64-linux.a)"
+        in text
+    )
+    assert "/builds/42/logs/raw/checks.x86_64-linux.a" in text
+
+
+async def test_build_finished_table_sorts_failures_first() -> None:
+    """Terminal nix-build run re-posts the table with each attribute's
+    status, failures listed first."""
+    reporter, poster, _ = make_reporter()
+    await reporter.build_finished(
+        EVENT,
+        BUILD,
+        "failed",
+        1,
+        [
+            attr_result("a", AttributeStatus.succeeded),
+            attr_result("z", AttributeStatus.failed),
+        ],
+        attr_statuses={"a": "succeeded", "z": "failed"},
+    )
+    summary_idx = next(
+        i for i, p in enumerate(poster.posts) if p.context == "nixbot/nix-build"
+    )
+    text = poster.extras[summary_idx]["text"]
+    assert "Built 2 attribute(s):" in text
+    # Failure leads even though `z` sorts after `a` alphabetically.
+    assert text.index("`z`") < text.index("`a`")
+    assert "| ❌ failed |" in text
+    assert "| ✅ succeeded |" in text
 
 
 async def test_per_attribute_failure_statuses_capped() -> None:
@@ -431,10 +483,6 @@ async def test_reporter_forwards_attr_and_text() -> None:
     )
     assert poster.extras[attr_idx]["attr"] == "flaky"
     assert poster.extras[attr_idx]["text"] == "```\nlog line 1\nline 2\n```"
-    summary_idx = next(
-        i for i, p in enumerate(poster.posts) if p.context == "nixbot/nix-build"
-    )
-    assert "`flaky`" in (poster.extras[summary_idx]["text"] or "")
 
 
 async def test_check_permission_error_does_not_disable_forge() -> None:
@@ -456,29 +504,6 @@ async def test_check_permission_error_does_not_disable_forge() -> None:
     await reporter.build_finished(EVENT, BUILD, "succeeded", 1, [])
     # Both phases still attempt to post; the forge is never latched off.
     assert calls == 2
-
-
-def test_failure_table() -> None:
-    table = _failure_table(
-        [
-            attr_result(
-                "a", AttributeStatus.failed, error="\x1b[31mboom | bang\x1b[0m"
-            ),
-            attr_result("b", AttributeStatus.succeeded),
-        ],
-        None,
-    )
-    assert table is not None
-    assert table.startswith("| attr |")
-    assert "`a`" in table
-    assert "boom \\| bang" in table
-    assert "`b`" not in table
-    # Re-report path: no results, attr_statuses only.
-    table = _failure_table([], {"a": "failed", "b": "succeeded"})
-    assert table is not None
-    assert "`a`" in table
-    assert "`b`" not in table
-    assert _failure_table([], {"a": "succeeded"}) is None
 
 
 def test_check_run_output_title_and_truncate() -> None:
