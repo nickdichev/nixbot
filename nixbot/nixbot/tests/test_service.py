@@ -138,6 +138,29 @@ async def seed_project(pool: Any, url: str) -> int:
     )
 
 
+async def test_aclose_cancels_in_flight_tasks(service: CIService) -> None:
+    """Shutdown must cancel spawned build tasks (and await their
+    cleanup), not orphan them, so an interrupted build unwinds and
+    leaves itself resumable instead of being killed mid-write."""
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def long_running() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    task = service._spawn(long_running())  # noqa: SLF001
+    await started.wait()
+    await service.aclose()
+    assert task.cancelled()
+    assert cancelled.is_set()
+    assert not service._tasks  # noqa: SLF001
+
+
 async def test_pr_close_discards_queued_changes(service: CIService) -> None:
     """A queued change event for a closed PR must not build it later."""
 

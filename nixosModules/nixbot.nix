@@ -1165,6 +1165,17 @@ in
         WorkingDirectory = "/var/lib/nixbot";
         Restart = "on-failure";
         RestartSec = 5;
+        # Signal only the main process on stop. The default
+        # control-group mode also SIGTERMs in-flight `nix build`
+        # children, which exit non-zero and get recorded as build
+        # failures before nixbot can cancel them; recovery then sees a
+        # terminal build and never resumes it. With mixed, nixbot cancels
+        # the build tasks and reaps the children itself, leaving the
+        # attributes "building" for recovery.
+        KillMode = "mixed";
+        # Headroom for nixbot to cancel builds and reap nix children
+        # before systemd SIGKILLs the cgroup.
+        TimeoutStopSec = 180;
 
         LoadCredential =
           lib.optionals cfg.github.enable [
