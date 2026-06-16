@@ -437,9 +437,9 @@ async def test_reporter_forwards_attr_and_text() -> None:
     assert "`flaky`" in (poster.extras[summary_idx]["text"] or "")
 
 
-async def test_check_permission_error_latches() -> None:
-    """A missing Checks grant must not fill the report queue or
-    hammer the API on every build."""
+async def test_check_permission_error_does_not_disable_forge() -> None:
+    """One repo's missing Checks grant must not stop posting for every
+    other repo: a 403 is logged and swallowed, never latched off."""
     calls = 0
 
     class ForbiddenPoster:
@@ -454,7 +454,8 @@ async def test_check_permission_error_latches() -> None:
     )
     await reporter.build_started(EVENT, BUILD)
     await reporter.build_finished(EVENT, BUILD, "succeeded", 1, [])
-    assert calls == 1  # latched after the first 403
+    # Both phases still attempt to post; the forge is never latched off.
+    assert calls == 2
 
 
 def test_failure_table() -> None:
