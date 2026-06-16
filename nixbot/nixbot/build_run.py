@@ -302,16 +302,13 @@ async def _run_build_inner(
         # pending rows are what crash recovery resumes from. The
         # scheduler drops unsupported systems; their pending rows
         # would never turn terminal, so don't record them.
-        await record_attributes(
-            o.pool,
-            build.id,
-            [
-                job
-                for job in eval_result.jobs
-                if isinstance(job, NixEvalJobSuccess)
-                and job.system in o.config.build_systems
-            ],
-        )
+        buildable = [
+            job
+            for job in eval_result.jobs
+            if isinstance(job, NixEvalJobSuccess)
+            and job.system in o.config.build_systems
+        ]
+        await record_attributes(o.pool, build.id, buildable)
         # The full eval result is recorded in build_attributes; a later
         # build of the same tree may reuse it instead of re-evaluating.
         await q.mark_eval_completed(o.pool, id_=build.id)
@@ -320,6 +317,7 @@ async def _run_build_inner(
             build,
             success=True,
             warnings=[str(g["message"]) for g in live_warnings.snapshot()],
+            jobs=buildable,
         )
 
         # Re-send the complete eval result: the scheduler dedupes
@@ -385,7 +383,7 @@ async def _try_reuse_eval(
     await record_attributes(o.pool, build.id, reused)
     await q.mark_eval_completed(o.pool, id_=build.id)
     await db.set_build_status(o.pool, build.id, BuildStatus.BUILDING)
-    await o.reporter.eval_finished(event, build, success=True, warnings=[])
+    await o.reporter.eval_finished(event, build, success=True, warnings=[], jobs=reused)
     # cache_failures=False: see _ReadOnlyFailedBuildCache.
     status = await build_attributes(
         o, event, build, worktree_path, reused, cache_failures=False

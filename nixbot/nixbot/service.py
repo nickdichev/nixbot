@@ -45,13 +45,14 @@ from .webhooks import (
 from .work_queue import WorkItem, WorkQueue
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
+    from collections.abc import Coroutine, Sequence
 
     import asyncpg
 
     from .config import Config
     from .db import BuildRecord
     from .forge import GiteaClient, GitHubAppClient, GitlabClient
+    from .models import NixEvalJobSuccess
     from .orchestrator import Orchestrator
     from .polling import PolledRepository
     from .repos import RepoStore
@@ -123,8 +124,11 @@ class RetryingReporter:
         *,
         success: bool,
         warnings: list[str],
+        jobs: Sequence[NixEvalJobSuccess] | None = None,
     ) -> None:
-        await self.inner.eval_finished(event, build, success=success, warnings=warnings)
+        await self.inner.eval_finished(
+            event, build, success=success, warnings=warnings, jobs=jobs
+        )
 
     async def eval_cancelled(self, event: ChangeEvent, build: BuildRecord) -> None:
         await self.inner.eval_cancelled(event, build)

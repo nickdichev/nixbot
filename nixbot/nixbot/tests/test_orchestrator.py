@@ -133,6 +133,7 @@ class RecordingReporter:
         *,
         success: bool,
         warnings: list[str],
+        jobs: object = None,
     ) -> None:
         self.events.append(("eval", build.id, success, tuple(warnings)))
 

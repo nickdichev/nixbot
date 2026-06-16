@@ -36,6 +36,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, ClassVar, Protocol
+from urllib.parse import quote
 
 import httpx
 
@@ -44,11 +45,14 @@ from .db_gen import failed as q
 from .forge import ForgeError
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import asyncpg
 
     from .db import BuildRecord
     from .events import ChangeEvent
     from .forge import GiteaClient, GitHubAppClient, GitlabClient
+    from .models import NixEvalJobSuccess
     from .scheduler import AttributeResult
 
 # GitHub caps output.text at 65535 chars.
@@ -468,6 +472,7 @@ class ForgeStatusReporter:
         *,
         success: bool,
         warnings: list[str],
+        jobs: Sequence[NixEvalJobSuccess] | None = None,
     ) -> None:
         await self._post(
             event,
@@ -484,6 +489,9 @@ class ForgeStatusReporter:
                 f"{self.context_prefix}/nix-build",
                 StatusState.pending,
                 "building attributes",
+                text=_build_plan([j.attr for j in jobs], self.build_url(event, build))
+                if jobs
+                else None,
             )
 
     async def eval_cancelled(self, event: ChangeEvent, build: BuildRecord) -> None:
@@ -521,14 +529,14 @@ class ForgeStatusReporter:
             self._posted_generations.popitem(last=False)
 
         counts = await self._post_attribute_statuses(event, build, results, attr_prefix)
-        table = _failure_table(results, attr_statuses)
         if attr_statuses is not None:
             # Reruns pass only the re-run subset as `results`: the
             # summary description must still cover the whole build.
             counts = {"failed": 0, "succeeded": 0, "cancelled": 0}
             for attr_status in attr_statuses.values():
                 counts[_count_key(attr_status)] += 1
-        await self._post_summary(event, build, status, counts, table)
+        table_statuses = attr_statuses or {r.attr: r.status.value for r in results}
+        await self._post_summary(event, build, status, counts, table_statuses)
 
     async def _post_attribute_statuses(
         self,
@@ -593,7 +601,7 @@ class ForgeStatusReporter:
         build: BuildRecord,
         status: str,
         counts: dict[str, int],
-        table: str | None,
+        statuses: dict[str, str],
     ) -> None:
         if status == "succeeded":
             state = StatusState.success
@@ -622,7 +630,7 @@ class ForgeStatusReporter:
             f"{self.context_prefix}/nix-build",
             state,
             description or "failed",
-            text=table,
+            text=_build_plan(list(statuses), self.build_url(event, build), statuses),
             propagate=True,
         )
 
@@ -631,38 +639,58 @@ def _fence(text: str) -> str:
     return f"```\n{strip_ansi(text)}\n```"
 
 
-def _failure_table(
-    results: list[AttributeResult], attr_statuses: dict[str, str] | None
+_STATUS_ICONS = {
+    "succeeded": "✅",
+    "failed": "❌",
+    "failed_eval": "❌",
+    "dependency_failed": "❌",
+    "cached_failure": "❌",
+    "cancelled": "⚪",
+    "queued": "⏳",
+    "building": "🔨",
+}
+
+
+def _status_cell(status: str) -> str:
+    icon = _STATUS_ICONS.get(status)
+    return f"{icon} {status}" if icon else status
+
+
+def _build_plan(
+    attrs: Sequence[str], build_url: str, statuses: dict[str, str] | None = None
 ) -> str | None:
-    """Markdown failure table for the nix-build check run; one place
-    to see every failure even when per-attr runs hit the report cap.
-    Reruns pass attr_statuses (full build) plus a results subset; the
-    table must match the summary count, so attr_statuses wins (no
-    error column available there)."""
-    errors = {r.attr: r.error for r in results}
-    items = (
-        sorted(attr_statuses.items())
-        if attr_statuses is not None
-        else ((r.attr, r.status.value) for r in results)
-    )
-    rows = [
-        (
-            attr,
-            status,
-            strip_ansi(errors.get(attr) or "")
-            .split("\n", 1)[0][:200]
-            .replace("|", "\\|"),
+    """Markdown table of the build's attributes, each linking to its
+    (live-tailing) raw log. Posted twice: in the pending nix-build run
+    as the build plan (statuses is None, no status column), then again
+    at build finish with each attribute's terminal status, failures
+    first. Truncated to the check-run text budget."""
+    if statuses is None:
+        attrs = sorted(set(attrs))
+        header = f"Building {len(attrs)} attribute(s):"
+        head, sep, trunc = "| attribute | raw |", "| --- | --- |", "| [all]({0}) |"
+    else:
+        # Failures first so the actionable rows lead, then by attr name.
+        attrs = sorted(
+            set(attrs),
+            key=lambda a: (statuses.get(a) not in FAILED_STATUS_STATES, a),
         )
-        for attr, status in items
-        if status in FAILED_STATUS_STATES
-    ]
-    if not rows:
+        header = f"Built {len(attrs)} attribute(s):"
+        head = "| attribute | status | raw |"
+        sep = "| --- | --- | --- |"
+        trunc = "| | [all]({0}) |"
+    if not attrs:
         return None
-    lines = ["| attr | status | error |", "| --- | --- | --- |"]
-    for attr, status, err in rows:
-        line = f"| `{attr}` | {status} | {err} |"
+    lines = [header, "", head, sep]
+    for i, attr in enumerate(attrs):
+        live = f"{build_url}/logs/{quote(attr)}"
+        raw = f"{build_url}/logs/raw/{quote(attr)}"
+        if statuses is None:
+            line = f"| [`{attr}`]({live}) | [raw]({raw}) |"
+        else:
+            cell = _status_cell(statuses.get(attr, "unknown"))
+            line = f"| [`{attr}`]({live}) | {cell} | [raw]({raw}) |"
         if sum(map(len, lines)) + len(line) > CHECK_RUN_TEXT_LIMIT:
-            lines.append(f"| … | | {len(rows) - (len(lines) - 2)} more |")
+            lines.append(f"| … {len(attrs) - i} more {trunc.format(build_url)}")
             break
         lines.append(line)
     return "\n".join(lines)

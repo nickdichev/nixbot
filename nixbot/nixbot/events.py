@@ -11,7 +11,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .db import BuildRecord
+    from .models import NixEvalJobSuccess
     from .scheduler import AttributeResult
 
 
@@ -55,6 +58,7 @@ class StatusReporter(Protocol):
         *,
         success: bool,
         warnings: list[str],
+        jobs: Sequence[NixEvalJobSuccess] | None = None,
     ) -> None: ...
 
     async def eval_cancelled(self, event: ChangeEvent, build: BuildRecord) -> None: ...
@@ -83,6 +87,7 @@ class NullStatusReporter:
         *,
         success: bool,
         warnings: list[str],
+        jobs: Sequence[NixEvalJobSuccess] | None = None,
     ) -> None:
         pass
 
