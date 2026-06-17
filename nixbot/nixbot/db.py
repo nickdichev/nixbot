@@ -28,8 +28,8 @@ from .sql_util import expect
 if TYPE_CHECKING:
     import asyncpg
 
+    from .build_scheduler import AttributeResult
     from .db_gen.models import Build as BuildRecord
-    from .scheduler import AttributeResult
 
 
 class BuildStatus:

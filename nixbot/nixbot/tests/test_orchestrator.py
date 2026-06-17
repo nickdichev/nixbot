@@ -16,6 +16,11 @@ import pytest
 from nixbot import build_run as build_run_mod
 from nixbot import db
 from nixbot import effects_run as effects_run_mod
+from nixbot.build_scheduler import (
+    AttributeResult,
+    AttributeStatus,
+    BuildOutcome,
+)
 from nixbot.config import Config
 from nixbot.db import BuildStatus
 from nixbot.db_gen import builds as builds_q
@@ -26,11 +31,6 @@ from nixbot.models import CacheStatus
 from nixbot.nix_eval import EvalError, EvalResult, EvalSettings
 from nixbot.orchestrator import AttributeExecutor, EvalRunnerLike, Orchestrator
 from nixbot.recovery import fail_interrupted_effects
-from nixbot.scheduler import (
-    AttributeResult,
-    AttributeStatus,
-    BuildOutcome,
-)
 from nixbot.work_queue import WorkQueue
 
 from .support import FakeCache, attribute_statuses, git, insert_project, mk_job

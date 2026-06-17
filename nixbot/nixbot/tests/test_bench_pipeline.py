@@ -21,9 +21,9 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from nixbot.build_scheduler import AttributeStatus, JobScheduler, ScheduleResult
 from nixbot.nix_eval import EvalRunner, EvalSettings
 from nixbot.repo_config import BranchConfig
-from nixbot.scheduler import AttributeStatus, JobScheduler, ScheduleResult
 
 from .test_pipeline import PipelineExecutor, current_system
 

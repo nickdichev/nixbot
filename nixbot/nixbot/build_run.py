@@ -17,6 +17,12 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 from . import db
+from .build_scheduler import (
+    AttributeResult,
+    AttributeStatus,
+    BuildOutcome,
+    JobScheduler,
+)
 from .db import BuildStatus
 from .db_gen import builds as q
 from .executor import failure_excerpt
@@ -26,12 +32,6 @@ from .models import CacheStatus, NixEvalJobSuccess
 from .nix_eval import EvalError, EvalSettings
 from .post_build import build_props, run_post_build_steps
 from .repo_config import BranchConfig
-from .scheduler import (
-    AttributeResult,
-    AttributeStatus,
-    BuildOutcome,
-    JobScheduler,
-)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -39,12 +39,12 @@ if TYPE_CHECKING:
 
     import asyncpg
 
+    from .build_scheduler import CachedFailure, FailedBuildCache
     from .db import BuildRecord
     from .events import ChangeEvent
     from .gitrepo import FetchCredentials
     from .models import NixEvalJob
     from .orchestrator import Orchestrator
-    from .scheduler import CachedFailure, FailedBuildCache
 
 logger = logging.getLogger(__name__)
 

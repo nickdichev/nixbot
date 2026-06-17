@@ -49,11 +49,11 @@ if TYPE_CHECKING:
 
     import asyncpg
 
+    from .build_scheduler import AttributeResult
     from .db import BuildRecord
     from .events import ChangeEvent
     from .forge import GiteaClient, GitHubAppClient, GitlabClient
     from .models import NixEvalJobSuccess
-    from .scheduler import AttributeResult
 
 # GitHub caps output.text at 65535 chars.
 CHECK_RUN_TEXT_LIMIT = 60_000

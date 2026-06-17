@@ -489,7 +489,7 @@ async def test_build_service_composition(postgres_dsn: str, tmp_path: Path) -> N
 async def test_restart_clears_failed_cache_and_guards_running(
     postgres_dsn: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("nixbot.restarts.RESTART_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr("nixbot.restart_dispatch.RESTART_RETRY_SECONDS", 0.0)
     config = Config(
         db_url=postgres_dsn,
         build_systems=["x86_64-linux"],

@@ -16,11 +16,11 @@ if TYPE_CHECKING:
 import httpx
 import pytest
 
+from nixbot.build_scheduler import AttributeResult, AttributeStatus
 from nixbot.db_gen.models import Build as BuildRecord
 from nixbot.events import ChangeEvent, RepoInfo
 from nixbot.forge import GitlabClient
 from nixbot.models import NixEvalJobError
-from nixbot.scheduler import AttributeResult, AttributeStatus
 from nixbot.status import (
     CHECK_RUN_TEXT_LIMIT,
     POSTED_GENERATIONS_MAX,

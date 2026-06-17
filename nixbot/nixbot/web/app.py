@@ -39,7 +39,7 @@ from nixbot.effects_state import TaskTokens
 from ..auth import can_control_build, is_admin  # noqa: TID252
 from ..forge_tokens import RevokedSessionStore  # noqa: TID252
 from ..recovery import check_db_health  # noqa: TID252
-from ..scheduled import ScheduledEffectsStore, schedule_overview  # noqa: TID252
+from ..schedules import ScheduledEffectsStore, schedule_overview  # noqa: TID252
 from .api_routes import create_api_router
 from .auth_routes import SESSION_COOKIE
 from .events import EventBroker, create_events_router

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import nixbot.executor as executor_mod
+from nixbot.build_scheduler import BuildOutcome
 from nixbot.executor import (
     FRAME_FLUSH_THRESHOLD,
     SUBSCRIBER_QUEUE_MAXSIZE,
@@ -30,7 +31,6 @@ from nixbot.executor import (
     read_log,
     render_log_event,
 )
-from nixbot.scheduler import BuildOutcome
 
 from .support import mk_job
 

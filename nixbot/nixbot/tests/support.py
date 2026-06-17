@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
 
     from nixbot.auth import User
-    from nixbot.scheduler import CachedFailure
+    from nixbot.build_scheduler import CachedFailure
 
 from nixbot.models import CacheStatus, NixEvalJobSuccess
 

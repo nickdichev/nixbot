@@ -35,9 +35,9 @@ from typing import TYPE_CHECKING
 import zstandard
 
 from .ansi import strip_ansi
+from .build_scheduler import BuildOutcome
 from .gcroots import safe_attr_filename
 from .proc import ProcessGroup
-from .scheduler import BuildOutcome
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator

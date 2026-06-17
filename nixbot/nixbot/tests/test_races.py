@@ -9,13 +9,13 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
+from nixbot.build_scheduler import BuildOutcome
 from nixbot.executor import (
     BuildSettings,
     FairScheduler,
     LogWriter,
     NixBuildExecutor,
 )
-from nixbot.scheduler import BuildOutcome
 
 from .support import mk_job
 
