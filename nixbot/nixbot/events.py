@@ -13,9 +13,9 @@ from typing import TYPE_CHECKING, Protocol
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from .build_scheduler import AttributeResult
     from .db import BuildRecord
     from .models import NixEvalJobSuccess
-    from .scheduler import AttributeResult
 
 
 @dataclass(frozen=True)

@@ -6,13 +6,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 
-from nixbot.models import (
-    CacheStatus,
-    NixEvalJob,
-    NixEvalJobError,
-    NixEvalJobSuccess,
-)
-from nixbot.scheduler import (
+from nixbot.build_scheduler import (
     AttributeResult,
     AttributeStatus,
     BuildOutcome,
@@ -22,6 +16,12 @@ from nixbot.scheduler import (
     compute_job_closures,
     get_failed_dependents,
     sort_jobs_by_closures,
+)
+from nixbot.models import (
+    CacheStatus,
+    NixEvalJob,
+    NixEvalJobError,
+    NixEvalJobSuccess,
 )
 
 from .support import FakeCache, mk_job

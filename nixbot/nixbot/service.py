@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from . import db, discovery, restarts, scheduled_runs
+from . import db, discovery, restart_dispatch, schedule_runner
 from .config import ScheduleWhen
 from .db import BuildStatus
 from .db_gen import builds as builds_q
@@ -34,7 +34,7 @@ from .recovery import (
     settle_already_built,
 )
 from .repos import repo_info
-from .scheduled import DueEffect
+from .schedules import DueEffect
 from .webhooks import (
     ChangeRequest,
     CheckRerequested,
@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
     import asyncpg
 
+    from .build_scheduler import AttributeResult
     from .config import Config
     from .db import BuildRecord
     from .forge import GiteaClient, GitHubAppClient, GitlabClient
@@ -56,7 +57,6 @@ if TYPE_CHECKING:
     from .orchestrator import Orchestrator
     from .polling import PolledRepository
     from .repos import RepoStore
-    from .scheduler import AttributeResult
 
 logger = logging.getLogger(__name__)
 
@@ -361,7 +361,7 @@ class CIService:
         if item.kind == "change":
             await self._process_change(ChangeRequest(**payload))
         elif item.kind == "restart":
-            retry = await restarts.restart(
+            retry = await restart_dispatch.restart(
                 self, payload["build_id"], payload.get("attr")
             )
             if retry:
@@ -372,7 +372,7 @@ class CIService:
             # Crash recovery: resume pending attributes, no reset.
             await self._rerun(payload["build_id"])
         elif item.kind == "effects":
-            await restarts.restart_effects(self, payload["build_id"])
+            await restart_dispatch.restart_effects(self, payload["build_id"])
         elif item.kind == "effect":
             await self._run_effect_item(payload["build_id"], payload["name"])
         elif item.kind == "report":
@@ -382,11 +382,11 @@ class CIService:
                 payload.get("retry_at"),
             )
         elif item.kind == "refresh-schedules":
-            await scheduled_runs.refresh_schedules(
+            await schedule_runner.refresh_schedules(
                 self, payload["project_id"], payload["rev"]
             )
         elif item.kind == "scheduled":
-            await scheduled_runs.run_scheduled(
+            await schedule_runner.run_scheduled(
                 self,
                 DueEffect(
                     project_id=payload["project_id"],
@@ -472,7 +472,7 @@ class CIService:
             raise
 
     async def _rerun(self, build_id: int) -> None:
-        await restarts.rerun(self, build_id)
+        await restart_dispatch.rerun(self, build_id)
 
     async def recover_unfinished_builds(self) -> None:
         """Crash recovery: settle already-built attributes, then queue
@@ -483,7 +483,7 @@ class CIService:
             remaining, settled = await settle_already_built(self.pool, resumable)
             if settled:
                 # Recovered results still need gcroots/outputs updates.
-                event = await restarts.change_event_for(self, resumable)
+                event = await restart_dispatch.change_event_for(self, resumable)
                 if event is not None:
                     await self.orchestrator.post_process_skipped(event, settled)
             logger.info(
@@ -591,4 +591,4 @@ class CIService:
             await asyncio.sleep(MAINTENANCE_INTERVAL)
 
     async def scheduled_effects_loop(self) -> None:
-        await scheduled_runs.scheduled_effects_loop(self)
+        await schedule_runner.scheduled_effects_loop(self)

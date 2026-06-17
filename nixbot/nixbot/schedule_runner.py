@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from .effects import EffectsContext, effects_context
 from .executor import LogWriter
 from .repos import repo_info
-from .scheduled import (
+from .schedules import (
     DueEffect,
     ScheduledEffectsStore,
     discover_schedules,

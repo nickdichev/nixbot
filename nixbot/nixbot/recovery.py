@@ -35,9 +35,9 @@ from typing import TYPE_CHECKING
 import asyncpg
 
 from . import db
+from .build_scheduler import AttributeResult, AttributeStatus
 from .db_gen import maintenance as q
 from .models import CacheStatus, NixEvalJobSuccess
-from .scheduler import AttributeResult, AttributeStatus
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable

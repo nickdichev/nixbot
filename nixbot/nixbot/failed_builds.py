@@ -1,7 +1,7 @@
 """Postgres-backed failed-build cache (opt-in via cacheFailedBuilds).
 
 Storage port of db/failed_builds.py onto the service schema; the skip
-semantics live in scheduler.py (cached failures skip the build,
+semantics live in build_scheduler.py (cached failures skip the build,
 report with a link to the first failure, and propagate to dependents;
 an explicit rebuild deletes the rows up front in service.py and
 builds again).
@@ -12,8 +12,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from .build_scheduler import CachedFailure
 from .db_gen import failed as q
-from .scheduler import CachedFailure
 
 if TYPE_CHECKING:
     import asyncpg

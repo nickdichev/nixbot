@@ -22,8 +22,8 @@ from nixbot.config import (
 )
 from nixbot.events import NullStatusReporter
 from nixbot.forge import DiscoveredRepo
-from nixbot.scheduled import DueEffect, ScheduleWhen
-from nixbot.scheduled_runs import scheduled_worktree_id
+from nixbot.schedule_runner import scheduled_worktree_id
+from nixbot.schedules import DueEffect, ScheduleWhen
 from nixbot.status import CheckRunStore
 from nixbot.webhooks import ChangeRequest, CheckRerequested, PrClosed
 from nixbot.work_queue import WorkQueue
@@ -437,7 +437,9 @@ async def test_restart_cancelled_build_reschedules_attributes(
     async def fake_check_store_paths(drvs: list[str]) -> set[str]:
         return set(drvs)
 
-    monkeypatch.setattr("nixbot.restarts.check_store_paths", fake_check_store_paths)
+    monkeypatch.setattr(
+        "nixbot.restart_dispatch.check_store_paths", fake_check_store_paths
+    )
 
     rescheduled: list[list[str]] = []
 
@@ -463,7 +465,7 @@ async def test_restart_while_running_is_requeued_not_dropped(
     after a cancel, while the old run unwinds) must stay queued and
     run once the build is gone, not be dropped silently."""
     repo, sha = git_repo
-    monkeypatch.setattr("nixbot.restarts.RESTART_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr("nixbot.restart_dispatch.RESTART_RETRY_SECONDS", 0.0)
 
     pool = service.pool
     project_id = await seed_project(pool, str(repo))
@@ -477,7 +479,9 @@ async def test_restart_while_running_is_requeued_not_dropped(
     async def fake_check_store_paths(drvs: list[str]) -> set[str]:
         return set(drvs)
 
-    monkeypatch.setattr("nixbot.restarts.check_store_paths", fake_check_store_paths)
+    monkeypatch.setattr(
+        "nixbot.restart_dispatch.check_store_paths", fake_check_store_paths
+    )
 
     rescheduled: list[int] = []
 
@@ -840,7 +844,7 @@ async def test_rerun_resumes_building_rows_and_keeps_finished(
     async def all_valid(paths: list[str]) -> set[str]:
         return set(paths)
 
-    monkeypatch.setattr("nixbot.restarts.check_store_paths", all_valid)
+    monkeypatch.setattr("nixbot.restart_dispatch.check_store_paths", all_valid)
 
     pool = service.pool
     project_id = await seed_project(pool, str(repo))

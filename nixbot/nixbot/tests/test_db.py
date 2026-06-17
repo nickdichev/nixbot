@@ -13,11 +13,11 @@ import pytest
 
 from nixbot import build_run, db
 from nixbot import migrations as migrations_mod
+from nixbot.build_scheduler import AttributeResult, AttributeStatus
 from nixbot.db_gen import builds as builds_q
 from nixbot.failed_builds import PostgresFailedBuildCache
 from nixbot.migrations import apply_migrations, load_migrations
 from nixbot.models import CacheStatus
-from nixbot.scheduler import AttributeResult, AttributeStatus
 from nixbot.status import CheckRunStore, FailedStatusStore
 
 from .support import attribute_statuses, db_pool, insert_build, insert_project, mk_job

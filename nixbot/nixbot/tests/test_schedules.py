@@ -11,7 +11,7 @@ import pytest
 
 from nixbot.config import ScheduleWhen
 from nixbot.effects import EffectsContext, EffectsError
-from nixbot.scheduled import (
+from nixbot.schedules import (
     DueEffect,
     ScheduledEffectsStore,
     due_occurrence,

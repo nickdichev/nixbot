@@ -25,11 +25,11 @@ from ..ansi import (  # noqa: TID252
     CTRL_RE,
     strip_ansi,
 )
+from ..build_scheduler import TERMINAL_FAILURES  # noqa: TID252
 from ..db_gen import maintenance as maint_gen  # noqa: TID252
 from ..db_gen import scheduled as sched_gen  # noqa: TID252
 from ..db_gen import web as gen  # noqa: TID252
 from ..executor import read_log  # noqa: TID252
-from ..scheduler import TERMINAL_FAILURES  # noqa: TID252
 from .api_routes import FailureSummary, clean_row
 
 if TYPE_CHECKING:

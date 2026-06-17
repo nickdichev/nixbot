@@ -23,11 +23,11 @@ from .gitrepo import GitError, run_git
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from .build_scheduler import AttributeResult
     from .db import BuildRecord
     from .events import ChangeEvent
     from .gitrepo import FetchCredentials
     from .orchestrator import Orchestrator
-    from .scheduler import AttributeResult
 
 logger = logging.getLogger(__name__)
 

@@ -19,11 +19,11 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from nixbot.auth import User
+from nixbot.build_scheduler import AttributeStatus
 from nixbot.db import BuildStatus
 from nixbot.effects_state import TaskTokens
 from nixbot.executor import LogWriter
 from nixbot.forge_tokens import ForgeTokenStore
-from nixbot.scheduler import AttributeStatus
 from nixbot.web import events as events_module
 from nixbot.web.auth_routes import SESSION_COOKIE, create_auth_router
 from nixbot.web.events import EventBroker

@@ -1,6 +1,6 @@
 """Scheduled Hercules effects (`onSchedule`), tasks 3.3.
 
-Ported from scheduled.py + nix_eval.py:ScheduledEffectsEvaluateCommand:
+Ported from nix_eval.py:ScheduledEffectsEvaluateCommand:
 on each successful default-branch build the orchestrator discovers
 schedules via `nixbot-effects list-schedules` and persists them; a
 periodic loop runs due effects via `nixbot-effects run-scheduled`.

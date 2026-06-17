@@ -25,7 +25,7 @@ from . import (
     gcroots,
     outputs,
     recovery,
-    reruns,
+    rerun_exec,
 )
 from .canceller import (
     CancellationManager,
@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 
     import asyncpg
 
+    from .build_scheduler import AttributeResult, BuildOutcome, FailedBuildCache
     from .config import Config
     from .db import BuildRecord
     from .gitrepo import FetchCredentials, RepoManager
@@ -59,7 +60,6 @@ if TYPE_CHECKING:
         StderrLineCallback,
     )
     from .repo_config import BranchConfig
-    from .scheduler import AttributeResult, BuildOutcome, FailedBuildCache
 
     GcrootRegistrar = Callable[[Path, str, str, str], Awaitable[None]]
     OutputWriter = Callable[[Path, str, str, str, str, str, str], Path]
@@ -312,7 +312,7 @@ class Orchestrator:
     ) -> AbstractAsyncContextManager[tuple[ChangeEvent, Path]]:
         """Event reconstruction plus a fresh worktree at the recorded
         commit; shared by the rerun paths."""
-        return reruns.rerun_worktree(self, info, build, prefix, credentials)
+        return rerun_exec.rerun_worktree(self, info, build, prefix, credentials)
 
     async def rerun_pending_attributes(
         self,
@@ -324,7 +324,7 @@ class Orchestrator:
         """Re-run only the pending attributes of an existing build using
         the stored eval results — no re-evaluation (attribute restarts
         and crash recovery)."""
-        await reruns.rerun_pending_attributes(
+        await rerun_exec.rerun_pending_attributes(
             self, info, build, pending_jobs, credentials
         )
 
@@ -336,7 +336,7 @@ class Orchestrator:
     ) -> None:
         """Effects-only restart: fresh worktree at the recorded commit,
         attributes untouched."""
-        await reruns.rerun_effects(self, info, build, credentials)
+        await rerun_exec.rerun_effects(self, info, build, credentials)
 
     async def maybe_run_effects(
         self,
