@@ -22,11 +22,12 @@ secure authentication.
 
 3. Set the required permissions:
    - **Repository Permissions:**
-     - Contents: Read-only (to clone repositories)
+     - Contents: Read-only (to clone repositories), (read and write is required
+       for effects to push to branches)
      - Checks: Read and write (to report build status as check runs)
      - Metadata: Read-only (basic repository info)
      - Pull requests: Read-only (required to subscribe to the pull_request
-       event)
+       event), (read and write is required for effects to create PRs)
    - **Organization Permissions** (if app is for an organization):
      - Members: Read-only (to verify organization membership for access control)
    - **Subscribe to events**: Push, Pull request, Check run, Check suite
