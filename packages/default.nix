@@ -6,6 +6,7 @@ let
     self:
     {
       nixbot = self.callPackage ./nixbot.nix { };
+      docs = self.callPackage ./docs.nix { };
     }
     // lib.optionalAttrs pkgs.stdenv.isLinux {
       nixbot-effects = self.callPackage ./nixbot-effects.nix { };
