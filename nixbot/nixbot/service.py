@@ -132,6 +132,24 @@ class RetryingReporter:
     async def eval_cancelled(self, event: ChangeEvent, build: BuildRecord) -> None:
         await self.inner.eval_cancelled(event, build)
 
+    async def effect_started(
+        self, event: ChangeEvent, build: BuildRecord, name: str
+    ) -> None:
+        await self.inner.effect_started(event, build, name)
+
+    async def effect_finished(
+        self,
+        event: ChangeEvent,
+        build: BuildRecord,
+        name: str,
+        *,
+        success: bool,
+        error: str | None = None,
+    ) -> None:
+        await self.inner.effect_finished(
+            event, build, name, success=success, error=error
+        )
+
     async def build_finished(
         self, event: ChangeEvent, build: BuildRecord, result: BuildResult
     ) -> None:

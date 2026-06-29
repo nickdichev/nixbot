@@ -78,6 +78,20 @@ class StatusReporter(Protocol):
         self, event: ChangeEvent, build: BuildRecord, result: BuildResult
     ) -> None: ...
 
+    async def effect_started(
+        self, event: ChangeEvent, build: BuildRecord, name: str
+    ) -> None: ...
+
+    async def effect_finished(
+        self,
+        event: ChangeEvent,
+        build: BuildRecord,
+        name: str,
+        *,
+        success: bool,
+        error: str | None = None,
+    ) -> None: ...
+
 
 class NullStatusReporter:
     async def build_started(self, event: ChangeEvent, build: BuildRecord) -> None:
@@ -99,5 +113,21 @@ class NullStatusReporter:
 
     async def build_finished(
         self, event: ChangeEvent, build: BuildRecord, result: BuildResult
+    ) -> None:
+        pass
+
+    async def effect_started(
+        self, event: ChangeEvent, build: BuildRecord, name: str
+    ) -> None:
+        pass
+
+    async def effect_finished(
+        self,
+        event: ChangeEvent,
+        build: BuildRecord,
+        name: str,
+        *,
+        success: bool,
+        error: str | None = None,
     ) -> None:
         pass

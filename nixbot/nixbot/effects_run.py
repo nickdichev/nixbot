@@ -141,17 +141,24 @@ async def run_effect_item(
                 git_token=credentials.token if credentials is not None else None,
                 task_token=task_token,
             )
-            await _run_one_effect(o, ctx, build, name)
+            await _run_one_effect(o, event, ctx, build, name)
         finally:
             o.task_tokens.revoke(task_token)
 
 
 async def _run_one_effect(
-    o: Orchestrator, ctx: EffectsContext, build: BuildRecord, name: str
+    o: Orchestrator,
+    event: ChangeEvent,
+    ctx: EffectsContext,
+    build: BuildRecord,
+    name: str,
 ) -> None:
     """One effect with its own row and log."""
     # A rerun resets the existing effect row.
     await builds_q.start_effect(o.pool, build_id=build.id, name=name, status="running")
+    # A green commit status on a failed deploy hides the failure; report
+    # per-effect status so the forge reflects the real outcome.
+    await o.reporter.effect_started(event, build, name)
     # Effect names come from untrusted flakes; percent-encode so
     # the log file cannot escape the log directory. The "effects/"
     # subdirectory keeps them apart from attribute logs (a flat
@@ -185,3 +192,4 @@ async def _run_one_effect(
         log_size=writer.bytes_seen,
         log_truncated=writer.truncated,
     )
+    await o.reporter.effect_finished(event, build, name, success=success, error=error)
