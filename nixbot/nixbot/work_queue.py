@@ -1,8 +1,8 @@
 """Work queue (migration 0010): producers enqueue intent, one
 dispatcher claims and executes. Pending items dedupe per (kind, key);
 claims serialize per key and survive restarts via requeue. Dedup
-includes the payload: same key with different payloads (e.g. restarts
-of different attributes) are distinct intents."""
+includes the payload: same key with different payloads (e.g. report
+retries with rising attempt counts) are distinct intents."""
 
 from __future__ import annotations
 

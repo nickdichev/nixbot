@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import math
 import time
 from dataclasses import dataclass, field
@@ -33,7 +32,6 @@ from nixbot.web.control_routes import (
     create_control_router,
 )
 from nixbot.web.token_routes import create_token_router
-from nixbot.work_queue import WorkQueue
 
 from .support import (
     WebHarness,
@@ -486,10 +484,9 @@ async def test_build_service_composition(postgres_dsn: str, tmp_path: Path) -> N
         await service.pool.close()
 
 
-async def test_restart_clears_failed_cache_and_guards_running(
-    postgres_dsn: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_restart_clears_failed_cache_immediately(
+    postgres_dsn: str, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr("nixbot.restart_dispatch.RESTART_RETRY_SECONDS", 0.0)
     config = Config(
         db_url=postgres_dsn,
         build_systems=["x86_64-linux"],
@@ -515,26 +512,9 @@ async def test_restart_clears_failed_cache_and_guards_running(
             project_id,
         )
 
-        # Running build: restart defers (stays queued), cache row stays.
-        service.orchestrator.cancel_events[build_id] = asyncio.Event()
+        # Reset is synchronous: cache cleared and rows pending
+        # before any worker runs.
         await service.restart_build(build_id)
-        queue = WorkQueue(pool)
-        item = await queue.claim_next()
-        assert item is not None
-        await service._execute_work(queue, item)  # noqa: SLF001
-        assert await pool.fetchval("SELECT count(*) FROM failed_builds") == 1
-        assert (
-            await pool.fetchval(
-                "SELECT status FROM build_attributes WHERE build_id = $1",
-                build_id,
-            )
-            == "failed"
-        )
-
-        # Not running: the deferred intent goes through, cache
-        # cleared, attributes reset.
-        del service.orchestrator.cancel_events[build_id]
-        await service.drain_work()
         assert await pool.fetchval("SELECT count(*) FROM failed_builds") == 0
         assert (
             await pool.fetchval(
@@ -542,6 +522,14 @@ async def test_restart_clears_failed_cache_and_guards_running(
                 build_id,
             )
             == "pending"
+        )
+        assert (
+            await pool.fetchval("SELECT status FROM builds WHERE id = $1", build_id)
+            == "pending"
+        )
+        assert (
+            await pool.fetchval("SELECT kind FROM work_queue WHERE status = 'pending'")
+            == "rerun"
         )
     finally:
         await pool.close()
