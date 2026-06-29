@@ -373,6 +373,15 @@ def attr_status_context(
     return f"{context_prefix}/nix-build {forge}:{project_name}#{prefix}.{attr}"
 
 
+def effect_status_context(
+    forge: str,
+    project_name: str,
+    name: str,
+    context_prefix: str = "nixbot",
+) -> str:
+    return f"{context_prefix}/effect {forge}:{project_name}#{name}"
+
+
 def eval_description(success: bool, warnings: list[str]) -> str:
     base = "evaluation succeeded" if success else "evaluation failed"
     if warnings:
@@ -503,6 +512,45 @@ class ForgeStatusReporter:
             f"{self.context_prefix}/nix-eval",
             StatusState.error,
             "build cancelled",
+        )
+
+    async def effect_started(
+        self, event: ChangeEvent, build: BuildRecord, name: str
+    ) -> None:
+        await self._post(
+            event,
+            build,
+            effect_status_context(
+                event.repo.forge,
+                event.repo.name,
+                name,
+                context_prefix=self.context_prefix,
+            ),
+            StatusState.pending,
+            "running effect",
+        )
+
+    async def effect_finished(
+        self,
+        event: ChangeEvent,
+        build: BuildRecord,
+        name: str,
+        *,
+        success: bool,
+        error: str | None = None,
+    ) -> None:
+        await self._post(
+            event,
+            build,
+            effect_status_context(
+                event.repo.forge,
+                event.repo.name,
+                name,
+                context_prefix=self.context_prefix,
+            ),
+            StatusState.success if success else StatusState.failure,
+            "effect succeeded" if success else (error or "effect failed"),
+            text=_fence(error) if error else None,
         )
 
     async def build_finished(

@@ -31,6 +31,7 @@ from nixbot.status import (
     StatusState,
     _check_run_output,
     attr_status_context,
+    effect_status_context,
     eval_description,
 )
 from nixbot.tests.support import mk_job
@@ -431,6 +432,25 @@ async def test_summary_counts_use_all_attribute_statuses() -> None:
     )
     combined = next(p for p in poster.posts if p.context == "nixbot/nix-build")
     assert combined.description == "100 attributes built"
+
+
+async def test_failed_effect_posts_failure_status() -> None:
+    """A failed effect must flip the commit status to failure; a green
+    status on a failed deploy hides the breakage (issue #30)."""
+    reporter, poster, _ = make_reporter()
+
+    await reporter.effect_started(EVENT, BUILD, "deploy")
+    await reporter.effect_finished(
+        EVENT, BUILD, "deploy", success=False, error="boom\nmore"
+    )
+    context = effect_status_context("github", "acme/widget", "deploy")
+    states = [(p.context, p.state) for p in poster.posts]
+    assert states == [
+        (context, StatusState.pending),
+        (context, StatusState.failure),
+    ]
+    assert poster.posts[1].description == "boom\nmore"
+    assert poster.extras[1]["text"] == "```\nboom\nmore\n```"
 
 
 async def test_attr_prefix_follows_repo_configuration() -> None:

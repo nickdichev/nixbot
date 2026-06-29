@@ -145,6 +145,22 @@ class RecordingReporter:
     ) -> None:
         self.events.append(("finished", build.id, result.status, result.generation))
 
+    async def effect_started(
+        self, event: ChangeEvent, build: BuildRecord, name: str
+    ) -> None:
+        self.events.append(("effect-started", build.id, name))
+
+    async def effect_finished(
+        self,
+        event: ChangeEvent,
+        build: BuildRecord,
+        name: str,
+        *,
+        success: bool,
+        error: str | None = None,
+    ) -> None:
+        self.events.append(("effect-finished", build.id, name, success))
+
 
 # --- helpers --------------------------------------------------------------------
 
@@ -1320,6 +1336,39 @@ async def test_effect_crash_settles_the_row(
     assert row is not None
     assert row["status"] == "failed"
     assert row["finished_at"] is not None
+
+
+async def test_failed_effect_reports_failure_status(
+    pool: asyncpg.Pool,
+    make_env: EnvFactory,
+    upstream: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed effect must post a failure commit status; otherwise a
+    failed deploy leaves the commit green (issue #30)."""
+
+    async def failing_run(ctx: object, name: str, log_write: object = None) -> bool:
+        return False
+
+    patch_effects(monkeypatch, run_effect=failing_run)
+    add_commit(upstream, "eff-fail")
+    orchestrator, reporter, project = await make_env(
+        FakeEvalRunner([mk_job("a")]),
+        FakeExecutor(),
+        name="eff-fail",
+    )
+    event = ChangeEvent(
+        repo=project,
+        branch="main",
+        commit_sha=git(upstream, "rev-parse", "HEAD"),
+    )
+    build = await orchestrator.handle_change_event(event)
+    assert build is not None
+    await drain_effect_items(orchestrator, project, pool)
+
+    effect_events = [e for e in reporter.events if e[0].startswith("effect-")]
+    assert ("effect-started", build.id, "deploy") in effect_events
+    assert ("effect-finished", build.id, "deploy", False) in effect_events
 
 
 async def test_post_process_error_does_not_wedge_build(
