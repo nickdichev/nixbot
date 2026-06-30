@@ -142,6 +142,8 @@ async def _run_scheduled_inner(
         path=log_dir / f"{run_id}.zst",
         size_limit=s.config.log_size_limit,
     )
+    # Shared registry so the web SSE route can stream this run live.
+    s.orchestrator.log_registry.register_scheduled(run_id, log)
     try:
         ctx = effects_context(
             s.config,
@@ -156,4 +158,5 @@ async def _run_scheduled_inner(
     finally:
         s.orchestrator.task_tokens.revoke(task_token)
         await log.close()
+        s.orchestrator.log_registry.unregister_scheduled(run_id)
         await s.orchestrator.repos.remove_worktree(worktree)

@@ -51,3 +51,18 @@ WHERE project_id = $1 AND schedule_name = $2 AND effect = $3;
 
 -- name: ScheduledRunExists :one
 SELECT id FROM scheduled_effect_runs WHERE id = $1 AND project_id = $2;
+
+-- name: ScheduledRunDetail :one
+SELECT id, schedule_name, effect, status, error, started_at, finished_at
+FROM scheduled_effect_runs WHERE id = $1 AND project_id = $2;
+
+-- name: ScheduledRunsForEffect :many
+-- Run history for one (schedule, effect); cursor on id for infinite
+-- scroll (id order matches started_at order for a single effect).
+SELECT id, schedule_name, effect, status, error, started_at, finished_at
+FROM scheduled_effect_runs
+WHERE project_id = sqlc.arg(project_id)
+  AND schedule_name = sqlc.arg(schedule_name)
+  AND effect = sqlc.arg(effect)
+  AND (sqlc.narg(before)::bigint IS NULL OR id < sqlc.narg(before))
+ORDER BY id DESC LIMIT sqlc.arg(limit_)::bigint;

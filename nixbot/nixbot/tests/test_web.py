@@ -1514,3 +1514,237 @@ def test_gitlab_nested_group_routes(client: WebHarness) -> None:
     assert build_page.status_code == 200
     build_api = client.get("/api/repos/gitlab/group/sub/proj/builds/1")
     assert build_api.status_code == 200
+
+
+async def _insert_scheduled_run(  # noqa: PLR0913
+    pool: asyncpg.Pool,
+    project_id: int,
+    *,
+    schedule_name: str = "nightly",
+    effect: str = "deploy",
+    status: str = "succeeded",
+    error: str | None = None,
+) -> int:
+    return await pool.fetchval(
+        "INSERT INTO scheduled_effect_runs "
+        "(project_id, schedule_name, effect, status, error, finished_at) "
+        "VALUES ($1, $2, $3, $4, $5, now()) RETURNING id",
+        project_id,
+        schedule_name,
+        effect,
+        status,
+        error,
+    )
+
+
+def _write_scheduled_log(state_dir: Path, run_id: int, data: bytes) -> None:
+    log_dir = state_dir / "logs" / "scheduled"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / f"{run_id}.zst").write_bytes(zstandard.ZstdCompressor().compress(data))
+
+
+def test_scheduled_run_viewer_renders_ansi(client: WebHarness, tmp_path: Path) -> None:
+    """The scheduled-run viewer renders the log as HTML (ANSI -> spans),
+    not as a raw text dump."""
+    ctx = client.ctx
+    ctx.state_dir = tmp_path
+
+    async def setup() -> int:
+        project_id = await ctx.pool.fetchval(
+            "SELECT id FROM projects WHERE forge_repo_id = 'web-1'"
+        )
+        run_id = await _insert_scheduled_run(ctx.pool, project_id)
+        _write_scheduled_log(tmp_path, run_id, b"\x1b[31;1merror:\x1b[0m boom\n")
+        return run_id
+
+    run_id = client.run(setup())
+    resp = client.get(f"/repos/github/acme/widget/schedules/runs/{run_id}")
+    assert resp.status_code == 200
+    assert "ansi-red" in resp.text
+    assert f"runs/{run_id}.txt" in resp.text  # raw link present
+    # Raw route still works and is not shadowed by the HTML viewer.
+    raw = client.get(f"/repos/github/acme/widget/schedules/runs/{run_id}.txt")
+    assert raw.status_code == 200
+    assert "error: boom" in raw.text
+    assert "\x1b[" not in raw.text
+
+
+def test_scheduled_run_viewer_cross_project_404(client: WebHarness) -> None:
+    """A run belonging to another project must not be reachable through
+    this project's URL."""
+    ctx = client.ctx
+
+    async def setup() -> int:
+        other = await insert_project(
+            ctx.pool, "other", forge_repo_id="sched-other", url="u"
+        )
+        return await _insert_scheduled_run(ctx.pool, other)
+
+    run_id = client.run(setup())
+    assert (
+        client.get(f"/repos/github/acme/widget/schedules/runs/{run_id}").status_code
+        == 404
+    )
+
+
+def test_scheduled_run_log_unavailable_placeholder(
+    client: WebHarness, tmp_path: Path
+) -> None:
+    """A run row that outlives its pruned .zst renders a placeholder
+    (HTTP 200), not a 404 that would break the history link."""
+    ctx = client.ctx
+    ctx.state_dir = tmp_path
+
+    async def setup() -> int:
+        project_id = await ctx.pool.fetchval(
+            "SELECT id FROM projects WHERE forge_repo_id = 'web-1'"
+        )
+        return await _insert_scheduled_run(ctx.pool, project_id, effect="pruned")
+
+    run_id = client.run(setup())
+    resp = client.get(f"/repos/github/acme/widget/schedules/runs/{run_id}")
+    assert resp.status_code == 200
+    assert "log unavailable" in resp.text
+
+
+def test_scheduled_run_viewer_waiting_before_log(client: WebHarness) -> None:
+    """A running run whose writer is not registered yet shows a waiting
+    state, not the pruned-log placeholder."""
+    ctx = client.ctx
+
+    async def setup() -> int:
+        project_id = await ctx.pool.fetchval(
+            "SELECT id FROM projects WHERE forge_repo_id = 'web-1'"
+        )
+        return await _insert_scheduled_run(
+            ctx.pool, project_id, effect="starting", status="running"
+        )
+
+    run_id = client.run(setup())
+    resp = client.get(f"/repos/github/acme/widget/schedules/runs/{run_id}")
+    assert resp.status_code == 200
+    assert "waiting for the run to start" in resp.text
+    assert "log unavailable" not in resp.text
+
+
+def test_scheduled_run_history_lists_runs(client: WebHarness) -> None:
+    """The history page lists previous runs of one (schedule, effect),
+    newest first."""
+    ctx = client.ctx
+
+    async def setup() -> tuple[int, int]:
+        project_id = await ctx.pool.fetchval(
+            "SELECT id FROM projects WHERE forge_repo_id = 'web-1'"
+        )
+        first = await _insert_scheduled_run(
+            ctx.pool, project_id, schedule_name="hist", effect="run"
+        )
+        second = await _insert_scheduled_run(
+            ctx.pool, project_id, schedule_name="hist", effect="run", status="failed"
+        )
+        return first, second
+
+    first, second = client.run(setup())
+    resp = client.get(
+        "/repos/github/acme/widget/schedules/runs?schedule=hist&effect=run"
+    )
+    assert resp.status_code == 200
+    assert f"#{first}" in resp.text
+    assert f"#{second}" in resp.text
+    # Newest first: the later id appears before the earlier one.
+    assert resp.text.index(f"#{second}") < resp.text.index(f"#{first}")
+
+
+def test_scheduled_run_history_special_chars(client: WebHarness) -> None:
+    """schedule/effect names are repo-controlled and may contain
+    slashes; query params route them safely."""
+    ctx = client.ctx
+
+    async def setup() -> int:
+        project_id = await ctx.pool.fetchval(
+            "SELECT id FROM projects WHERE forge_repo_id = 'web-1'"
+        )
+        return await _insert_scheduled_run(
+            ctx.pool, project_id, schedule_name="a/b c", effect="x/y"
+        )
+
+    run_id = client.run(setup())
+    resp = client.run(
+        client.http.get(
+            "/repos/github/acme/widget/schedules/runs",
+            params={"schedule": "a/b c", "effect": "x/y"},
+        )
+    )
+    assert resp.status_code == 200
+    assert f"#{run_id}" in resp.text
+
+
+def test_scheduled_run_stream_replays_history(
+    client: WebHarness, tmp_path: Path
+) -> None:
+    """The scheduled-run stream replays the running writer's history."""
+    ctx = client.ctx
+    ctx.state_dir = tmp_path
+    registry = client.app.state.log_registry
+
+    async def run() -> str:
+        project_id = await ctx.pool.fetchval(
+            "SELECT id FROM projects WHERE forge_repo_id = 'web-1'"
+        )
+        run_id = await _insert_scheduled_run(
+            ctx.pool, project_id, effect="streamed", status="running"
+        )
+        writer = LogWriter(path=tmp_path / "logs" / "scheduled" / f"{run_id}.zst")
+        await writer.write(b"scheduled early\n")
+        registry.register_scheduled(run_id, writer)
+        try:
+            url = f"/repos/github/acme/widget/schedules/runs/{run_id}/stream"
+            task = asyncio.ensure_future(client.http.get(url))
+            await asyncio.sleep(0.1)
+            await writer.write(b"scheduled late\n")
+            await writer.close()
+            return (await task).text
+        finally:
+            registry.unregister_scheduled(run_id)
+
+    stream = client.loop.run_until_complete(run())
+    assert "scheduled early" in stream
+    assert "scheduled late" in stream
+    assert "event: done" in stream
+
+
+def test_scheduled_run_notify_build_events(client: WebHarness) -> None:
+    """Run INSERT (running) and terminal UPDATE both NOTIFY on
+    build_events; an unchanged status does not."""
+
+    async def run() -> list[dict]:
+        ctx = client.ctx
+        project_id = await ctx.pool.fetchval(
+            "SELECT id FROM projects WHERE forge_repo_id = 'web-1'"
+        )
+        received: list[str] = []
+        conn = await ctx.pool.acquire()
+        listener = lambda *args: received.append(args[3])  # noqa: E731
+        try:
+            await conn.add_listener("build_events", listener)
+            run_id = await ctx.pool.fetchval(
+                "INSERT INTO scheduled_effect_runs "
+                "(project_id, schedule_name, effect) VALUES ($1, 'n', 'd') "
+                "RETURNING id",
+                project_id,
+            )
+            await ctx.pool.execute(
+                "UPDATE scheduled_effect_runs SET status = 'succeeded', "
+                "finished_at = now() WHERE id = $1",
+                run_id,
+            )
+            await asyncio.sleep(0.2)
+        finally:
+            await conn.remove_listener("build_events", listener)
+            await ctx.pool.release(conn)
+        return [json.loads(r) for r in received], run_id  # type: ignore[return-value]
+
+    payloads, run_id = client.loop.run_until_complete(run())  # type: ignore[misc]
+    assert [p["status"] for p in payloads] == ["running", "succeeded"]
+    assert all(p["run_id"] == run_id for p in payloads)
+    assert all("build_id" not in p for p in payloads)
