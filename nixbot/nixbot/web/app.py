@@ -106,15 +106,19 @@ class WebContext:
         self.revoked_sessions: SessionRevocations | None = RevokedSessionStore(pool)
 
     async def can_control(self, request: Request, build: dict[str, Any]) -> bool:
-        """Whether to render restart/cancel buttons; the control
-        routes re-check server-side."""
+        """Whether the requester may restart/cancel this build (drives
+        both the buttons and the control routes): instance admin, PR
+        author, or forge write access to the repo."""
         if self.authz is None:
             return False
-        return can_control_build(
+        if can_control_build(
             await self.request_user(request),
             self.authz,
             build_pr_author=build.get("pr_author"),
-        )
+        ):
+            return True
+        controllable = await self.controllable_repo_ids(request)
+        return controllable is None or build["project_id"] in controllable
 
     async def current_user(self, request: Request) -> User | None:
         if self.signer is None:
@@ -181,6 +185,16 @@ class WebContext:
         if self.visibility is None:
             return []
         return await self.visibility.toggleable_repo_ids(
+            await self.request_user(request), await self._forge_token(request)
+        )
+
+    async def controllable_repo_ids(self, request: Request) -> list[int] | None:
+        """Projects whose builds the requester may restart/cancel; None =
+        all. No visibility service means no forge integration, so no
+        repo-based control."""
+        if self.visibility is None:
+            return []
+        return await self.visibility.controllable_repo_ids(
             await self.request_user(request), await self._forge_token(request)
         )
 

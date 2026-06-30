@@ -42,9 +42,11 @@ class FakeFetcher:
         self,
         grants: dict[str, frozenset[str]],
         admin_grants: dict[str, frozenset[str]] | None = None,
+        writable_grants: dict[str, frozenset[str]] | None = None,
     ) -> None:
         self.grants = grants
         self.admin_grants = admin_grants or {}
+        self.writable_grants = writable_grants or {}
         self.calls = 0
 
     async def repo_access(self, user: User, token: str) -> RepoAccess:
@@ -53,6 +55,7 @@ class FakeFetcher:
         return RepoAccess(
             accessible=self.grants.get(key, frozenset()),
             admin=self.admin_grants.get(key, frozenset()),
+            writable=self.writable_grants.get(key, frozenset()),
         )
 
 
@@ -195,6 +198,36 @@ def test_forge_repo_admins_can_toggle_their_repos(harness: WebHarness) -> None:
         assert await service.toggleable_repo_ids(MALLORY, "tok-mallory") == []
         # Anonymous: nothing.
         assert await service.toggleable_repo_ids(None) == []
+
+    harness.run(run())
+
+
+def test_forge_repo_writers_can_control_their_repos(harness: WebHarness) -> None:
+    """Repo write access (push/maintain/admin) grants restart/cancel even
+    without instance-admin or PR-author rights (issue #52)."""
+    ctx = harness.ctx
+    fetcher = FakeFetcher(
+        grants={"github:carol:tok-carol": frozenset({"github:priv-1"})},
+        writable_grants={"github:carol:tok-carol": frozenset({"github:priv-1"})},
+    )
+    service = VisibilityService(
+        ctx.pool,
+        AuthzConfig(admins=["github:root"]),
+        fetcher=fetcher,
+        cache=AccessCache(ttl=3600),
+    )
+
+    async def run() -> None:
+        # Instance admin: everything (None).
+        assert await service.controllable_repo_ids(ROOT) is None
+        # Repo writer: exactly their repo.
+        ids = await service.controllable_repo_ids(CAROL, "tok-carol")
+        assert ids is not None
+        assert len(ids) == 1
+        # Read-only access (no write grant): nothing.
+        assert await service.controllable_repo_ids(MALLORY, "tok-mallory") == []
+        # Anonymous: nothing.
+        assert await service.controllable_repo_ids(None) == []
 
     harness.run(run())
 
@@ -369,7 +402,14 @@ async def test_gitlab_repo_access_fetcher() -> None:
                     "id": 32,
                     "permissions": {
                         "project_access": None,
-                        "group_access": {"access_level": 20},
+                        "group_access": {"access_level": 30},
+                    },
+                },
+                {
+                    "id": 33,
+                    "permissions": {
+                        "project_access": {"access_level": 20},
+                        "group_access": None,
                     },
                 },
             ],
@@ -381,8 +421,10 @@ async def test_gitlab_repo_access_fetcher() -> None:
     )
     user = User(provider="gitlab", username="dora")
     access = await fetcher.repo_access(user, "tok-gl")
-    assert access.accessible == frozenset({"gitlab:31", "gitlab:32"})
+    assert access.accessible == frozenset({"gitlab:31", "gitlab:32", "gitlab:33"})
     assert access.admin == frozenset({"gitlab:31"})
+    # Developer (30) can write but not administer; Reporter (20) neither.
+    assert access.writable == frozenset({"gitlab:31", "gitlab:32"})
 
 
 async def test_github_repo_access_fetcher_enterprise_api_url() -> None:
@@ -392,7 +434,14 @@ async def test_github_repo_access_fetcher_enterprise_api_url() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.host == "ghe.example.com"
         assert request.url.path == "/api/v3/user/repos"
-        return httpx.Response(200, json=[{"id": 5, "permissions": {"admin": True}}])
+        return httpx.Response(
+            200,
+            json=[
+                {"id": 5, "permissions": {"admin": True, "push": True}},
+                {"id": 6, "permissions": {"admin": False, "push": True}},
+                {"id": 7, "permissions": {"admin": False, "push": False}},
+            ],
+        )
 
     fetcher = ForgeRepoAccessFetcher(
         httpx.AsyncClient(transport=httpx.MockTransport(handler)),
@@ -400,5 +449,7 @@ async def test_github_repo_access_fetcher_enterprise_api_url() -> None:
     )
     user = User(provider="github", username="erik")
     access = await fetcher.repo_access(user, "tok")
-    assert access.accessible == frozenset({"github:5"})
+    assert access.accessible == frozenset({"github:5", "github:6", "github:7"})
     assert access.admin == frozenset({"github:5"})
+    # write/maintain/admin all set the push flag; read-only does not.
+    assert access.writable == frozenset({"github:5", "github:6"})

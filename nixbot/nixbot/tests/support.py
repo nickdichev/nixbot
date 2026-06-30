@@ -406,17 +406,18 @@ class WebHarness:
         request_headers = cookie_header(self._cookies(user, token)) | (headers or {})
         return self.run(self.http.get(url, headers=request_headers))
 
-    def post(
+    def post(  # noqa: PLR0913
         self,
         url: str,
         user: User | None = None,
         origin: str = "http://test",
         data: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
+        token: str = "",
     ) -> httpx.Response:
         request_headers = (
             ({"Origin": origin} if origin else {})
-            | cookie_header(self._cookies(user, ""))
+            | cookie_header(self._cookies(user, token))
             | (headers or {})
         )
         return self.run(self.http.post(url, headers=request_headers, data=data))

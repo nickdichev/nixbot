@@ -1,8 +1,9 @@
 """Build control endpoints: restart build, restart a single
 attribute without re-eval, cancel build or a
 single attribute — gated by authz
-(admins, PR authors for their own PR, allowUnauthenticatedControl) and
-CSRF same-origin checks. Admin-only project enable/disable toggle.
+(admins, PR authors for their own PR, forge-side repo writers,
+allowUnauthenticatedControl) and CSRF same-origin checks. Admin-only
+project enable/disable toggle.
 
 The actual restart/cancel work happens behind the ControlBackend
 protocol, implemented by the service service composition
@@ -18,7 +19,7 @@ from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
-from ..auth import can_control_build, is_admin, same_origin  # noqa: TID252
+from ..auth import is_admin, same_origin  # noqa: TID252
 from ..db_gen import maintenance as maint_gen  # noqa: TID252
 from ..db_gen import projects as proj_gen  # noqa: TID252
 from ..hook_secrets import WebhookSecrets  # noqa: TID252
@@ -99,10 +100,7 @@ class _ControlRoutes:
         build = await self.ctx.queries.build_by_number(project["id"], number)
         if build is None:
             raise HTTPException(status_code=404)
-        user = await self.ctx.request_user(request)
-        if not can_control_build(
-            user, self.authz, build_pr_author=build.get("pr_author")
-        ):
+        if not await self.ctx.can_control(request, build):
             raise HTTPException(status_code=403, detail="not authorized")
         return build
 
@@ -184,7 +182,8 @@ class _ControlRoutes:
     async def api_restart(
         self, request: Request, forge: str, owner: str, name: str, number: int
     ) -> dict:
-        """Re-run the whole build. Authz: admins or the PR author."""
+        """Re-run the whole build. Authz: admins, the PR author, or repo
+        writers."""
         build = await self._authorize(request, forge, owner, name, number)
         await self.backend.restart_build(build["id"])
         return {"number": number, "action": "restart"}
@@ -192,7 +191,8 @@ class _ControlRoutes:
     async def api_cancel(
         self, request: Request, forge: str, owner: str, name: str, number: int
     ) -> dict:
-        """Cancel a pending/running build. Authz: admins or the PR author."""
+        """Cancel a pending/running build. Authz: admins, the PR author,
+        or repo writers."""
         build = await self._authorize(request, forge, owner, name, number)
         await self.backend.cancel_build(build["id"])
         return {"number": number, "action": "cancel"}

@@ -35,11 +35,13 @@ DEFAULT_TTL = 60 * 60
 
 @dataclass(frozen=True)
 class RepoAccess:
-    """Repo keys ("forge:forge_repo_id") a user can see, and the subset
-    where the forge grants them admin permission."""
+    """Repo keys ("forge:forge_repo_id") a user can see, the subset they
+    can write to (restart/cancel builds), and the subset they administer
+    (enable/disable the project)."""
 
     accessible: frozenset[str]
     admin: frozenset[str]
+    writable: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -82,6 +84,9 @@ class RepoAccessFetcher(Protocol):
 # GitLab access_level for Maintainer; the lowest level allowed to
 # manage CI settings, mapped to our per-repo "admin" permission.
 _GITLAB_MAINTAINER = 40
+# GitLab Developer; the lowest level that can push, mapped to our
+# per-repo "writable" permission (restart/cancel builds).
+_GITLAB_DEVELOPER = 30
 
 
 class ForgeRepoAccessFetcher:
@@ -129,6 +134,7 @@ class ForgeRepoAccessFetcher:
                 f"{self.github_api_url}/user/repos?per_page=100", token
             ),
             _flag_admin,
+            _flag_push,
         )
 
     async def _gitea(self, token: str) -> RepoAccess:
@@ -142,7 +148,7 @@ class ForgeRepoAccessFetcher:
             response.raise_for_status()
             data = response.json()
             if not data:
-                return _collect("gitea", repos, _flag_admin)
+                return _collect("gitea", repos, _flag_admin, _flag_push)
             repos += data
             page += 1
 
@@ -154,6 +160,7 @@ class ForgeRepoAccessFetcher:
                 token,
             ),
             _gitlab_admin,
+            _gitlab_writable,
         )
 
 
@@ -162,22 +169,38 @@ def _flag_admin(repo: dict) -> bool:
     return bool((repo.get("permissions") or {}).get("admin"))
 
 
-def _gitlab_admin(repo: dict) -> bool:
+def _flag_push(repo: dict) -> bool:
+    """GitHub and Gitea report a push flag, set for write/maintain/admin."""
+    return bool((repo.get("permissions") or {}).get("push"))
+
+
+def _gitlab_access_level(repo: dict) -> int:
     permissions = repo.get("permissions") or {}
-    levels = (
+    return max(
         (permissions.get("project_access") or {}).get("access_level", 0),
         (permissions.get("group_access") or {}).get("access_level", 0),
     )
-    return max(levels) >= _GITLAB_MAINTAINER
+
+
+def _gitlab_admin(repo: dict) -> bool:
+    return _gitlab_access_level(repo) >= _GITLAB_MAINTAINER
+
+
+def _gitlab_writable(repo: dict) -> bool:
+    return _gitlab_access_level(repo) >= _GITLAB_DEVELOPER
 
 
 def _collect(
-    forge: str, repos: list[dict], is_admin: Callable[[dict], bool]
+    forge: str,
+    repos: list[dict],
+    is_admin: Callable[[dict], bool],
+    is_writable: Callable[[dict], bool],
 ) -> RepoAccess:
     keys = [(f"{forge}:{repo['id']}", repo) for repo in repos]
     return RepoAccess(
         accessible=frozenset(key for key, _ in keys),
         admin=frozenset(key for key, repo in keys if is_admin(repo)),
+        writable=frozenset(key for key, repo in keys if is_writable(repo)),
     )
 
 
@@ -238,15 +261,29 @@ class VisibilityService:
     ) -> list[int] | None:
         """Projects the requester may enable/disable. None = all
         (instance admins); forge-side repo admins get their own."""
+        return await self._repo_ids_for(user, token, lambda a: a.admin)
+
+    async def controllable_repo_ids(
+        self, user: User | None, token: str | None = None
+    ) -> list[int] | None:
+        """Projects whose builds the requester may restart/cancel. None =
+        all (instance admins); forge-side repo writers get their own."""
+        return await self._repo_ids_for(user, token, lambda a: a.writable)
+
+    async def _repo_ids_for(
+        self,
+        user: User | None,
+        token: str | None,
+        select: Callable[[RepoAccess], frozenset[str]],
+    ) -> list[int] | None:
         if is_admin(user, self.authz):
             return None
         access = await self._repo_access(user, token)
         if access is None:
             return []
+        granted = select(access)
         rows = await q.project_forge_ids(self.pool)
-        return [
-            row.id for row in rows if f"{row.forge}:{row.forge_repo_id}" in access.admin
-        ]
+        return [row.id for row in rows if f"{row.forge}:{row.forge_repo_id}" in granted]
 
     async def _repo_access(
         self, user: User | None, token: str | None
