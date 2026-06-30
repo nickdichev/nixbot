@@ -94,6 +94,7 @@
               <th scope="col">when</th>
               <th scope="col">next run</th>
               <th scope="col">last run</th>
+              <th scope="col">actions</th>
             </tr>
           </thead>
           {% for s in schedules %}
@@ -121,6 +122,16 @@
                         title="{{ s.run.started_at }}">{{ s.run.started_at | timeago }}</time>
                 {% else %}
                   never
+                {% endif %}
+              </td>
+              <td class="attr-status">
+                {# UX only; the run route enforces authz server-side. #}
+                {% if can_run_schedules %}
+                  <form method="post" action="{{ repo_path(project) }}/schedules/run">
+                    <input type="hidden" name="schedule" value="{{ s.schedule }}">
+                    <input type="hidden" name="effect" value="{{ s.effect }}">
+                    <button>run now</button>
+                  </form>
                 {% endif %}
               </td>
             </tr>

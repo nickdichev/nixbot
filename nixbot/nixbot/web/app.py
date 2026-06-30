@@ -356,7 +356,18 @@ class _PageRoutes:
                 await store.schedules_for_project(project["id"]),
                 await store.latest_runs_for_project(project["id"]),
             ),
+            can_run_schedules=await self._can_run_schedules(request, project["id"]),
         )
+
+    async def _can_run_schedules(self, request: Request, project_id: int) -> bool:
+        """UX only; the run-schedule route re-checks server-side."""
+        ctx = self.ctx
+        if ctx.authz is None:
+            return False
+        if is_admin(await ctx.request_user(request), ctx.authz):
+            return True
+        toggleable = await ctx.toggleable_repo_ids(request) or []
+        return project_id in toggleable
 
     async def _webhook_url(
         self, request: Request, project: dict[str, Any]

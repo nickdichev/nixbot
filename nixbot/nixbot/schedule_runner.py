@@ -98,13 +98,21 @@ async def refresh_schedules(s: CIService, project_id: int, rev: str) -> None:
         await s.orchestrator.repos.remove_worktree(worktree)
 
 
-async def run_scheduled(s: CIService, due: DueEffect) -> None:
+async def run_scheduled(
+    s: CIService, due: DueEffect, run_id: int | None = None
+) -> None:
+    store = ScheduledEffectsStore(s.pool)
     project = await s.repo_store.by_id(due.project_id)
     if project is None or not project.enabled:
+        # Manual runs pass a pre-created row; close it instead of
+        # leaving it stuck running.
+        if run_id is not None:
+            await store.finish_run(run_id, success=False, error="project disabled")
         return
     info = repo_info(project)
-    store = ScheduledEffectsStore(s.pool)
-    run_id = await store.start_run(due)
+    # Manual runs pre-create the row; the sweep loop does not.
+    if run_id is None:
+        run_id = await store.start_run(due)
     try:
         success = await _run_scheduled_inner(s, due, info, run_id)
         await store.finish_run(run_id, success=success)
