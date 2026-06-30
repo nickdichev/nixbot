@@ -223,8 +223,11 @@ def _instantiate(expr: str, opts: EffectsOptions, gcroot: Path) -> str:
         expr,
     ]
     proc = run(cmd, stdout=subprocess.PIPE, debug=opts.debug)
+    output = proc.stdout.rstrip()
+    if output == "":
+        return ""
     # --add-root prints the symlink path; resolve to the actual store path
-    return str(Path(proc.stdout.rstrip()).resolve())
+    return str(Path(output).resolve())
 
 
 def instantiate_effects(effect: str, opts: EffectsOptions, gcroot: Path) -> str:
