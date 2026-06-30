@@ -8,6 +8,7 @@ executor's LogWriter fans out to any number of SSE subscribers.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import html
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -45,6 +46,9 @@ class LogRegistry:
 
     def __init__(self) -> None:
         self._writers: dict[tuple[int, str], LogWriter] = {}
+        # Scheduled-effect runs have no build_id; key them by run id in
+        # a separate map so the namespaces cannot collide.
+        self._scheduled: dict[int, LogWriter] = {}
 
     def register(self, build_id: int, attr: str, writer: LogWriter) -> None:
         self._writers[(build_id, attr)] = writer
@@ -54,6 +58,15 @@ class LogRegistry:
 
     def get(self, build_id: int, attr: str) -> LogWriter | None:
         return self._writers.get((build_id, attr))
+
+    def register_scheduled(self, run_id: int, writer: LogWriter) -> None:
+        self._scheduled[run_id] = writer
+
+    def unregister_scheduled(self, run_id: int) -> None:
+        self._scheduled.pop(run_id, None)
+
+    def get_scheduled(self, run_id: int) -> LogWriter | None:
+        return self._scheduled.get(run_id)
 
 
 _COLOR_CLASSES = {}
@@ -273,6 +286,8 @@ async def _failure_summary(
 # downloads and in the static viewer.
 HISTORY_MAX_LINES = 2000
 
+_HISTORY_PAGE = 50
+
 _FAILURE_STATUSES = {s.value for s in TERMINAL_FAILURES} | {"cancelled"}
 
 
@@ -345,6 +360,22 @@ class _LogRoutes:
             return await self.log_viewer(request, forge, owner, name, number, shadowed)
         return await self.log_raw_text(request, forge, owner, name, number, attr, tail)
 
+    def _scheduled_log_path(self, run_id: int) -> Path:
+        return self.ctx.state_dir / "logs" / "scheduled" / f"{run_id}.zst"
+
+    async def _scheduled_run_text(self, run_id: int) -> str | None:
+        """Decoded log of a scheduled run: live writer snapshot while it
+        runs, otherwise the on-disk file. None when no log exists."""
+        writer = self.registry.get_scheduled(run_id)
+        if writer is not None:
+            data = await writer.snapshot()
+        else:
+            path = self._scheduled_log_path(run_id)
+            if not await asyncio.to_thread(path.exists):
+                return None
+            data = await asyncio.to_thread(read_log, path)
+        return data.decode(errors="replace")
+
     async def scheduled_run_log(
         self,
         request: Request,
@@ -358,12 +389,114 @@ class _LogRoutes:
         row = await sched_gen.scheduled_run_exists(
             self.ctx.pool, id_=run_id, project_id=project["id"]
         )
-        path = self.ctx.state_dir / "logs" / "scheduled" / f"{run_id}.zst"
-        if row is None or not await asyncio.to_thread(path.exists):
+        if row is None:
             raise HTTPException(status_code=404)
-        data = await asyncio.to_thread(read_log, path)
-        return PlainTextResponse(
-            await asyncio.to_thread(strip_ansi, data.decode(errors="replace"))
+        text = await self._scheduled_run_text(run_id)
+        if text is None:
+            raise HTTPException(status_code=404)
+        return PlainTextResponse(await asyncio.to_thread(strip_ansi, text))
+
+    async def scheduled_run_viewer(
+        self,
+        request: Request,
+        forge: str,
+        owner: str,
+        name: str,
+        run_id: int,
+    ) -> HTMLResponse:
+        """ANSI-rendered HTML log of one scheduled-effect run."""
+        project = await self.ctx.repo_or_404(forge, owner, name, request)
+        run = await sched_gen.scheduled_run_detail(
+            self.ctx.pool, id_=run_id, project_id=project["id"]
+        )
+        if run is None:
+            raise HTTPException(status_code=404)
+        # Live page renders no snapshot: the stream replays full history
+        # on connect (mirrors log_viewer).
+        live = self.registry.get_scheduled(run_id) is not None
+        content = ""
+        waiting = False
+        unavailable = False
+        if not live:
+            text = await self._scheduled_run_text(run_id)
+            if text is not None:
+                content = await asyncio.to_thread(render_log_lines, text)
+            elif run.status == "running":
+                # Started but the writer is not registered yet (fetch /
+                # checkout runs before the first log byte); poll until it
+                # appears instead of claiming the log is gone.
+                waiting = True
+            else:
+                # Terminal run whose log was pruned: placeholder, not a
+                # 404, so the history link still resolves.
+                unavailable = True
+        return await self.ctx.render(
+            "scheduled_log.html",
+            request=request,
+            project=project,
+            run=dataclasses.asdict(run),
+            content=content,
+            live=live,
+            waiting=waiting,
+            unavailable=unavailable,
+        )
+
+    async def scheduled_run_stream(
+        self,
+        request: Request,
+        forge: str,
+        owner: str,
+        name: str,
+        run_id: int,
+    ) -> StreamingResponse:
+        """SSE: history from disk, then live chunks until completion."""
+        project = await self.ctx.repo_or_404(forge, owner, name, request)
+        row = await sched_gen.scheduled_run_exists(
+            self.ctx.pool, id_=run_id, project_id=project["id"]
+        )
+        if row is None:
+            raise HTTPException(status_code=404)
+        writer = self.registry.get_scheduled(run_id)
+        path = self._scheduled_log_path(run_id)
+        return StreamingResponse(
+            _stream_events(writer, path), media_type="text/event-stream"
+        )
+
+    async def scheduled_runs_history(  # noqa: PLR0913
+        self,
+        request: Request,
+        forge: str,
+        owner: str,
+        name: str,
+        schedule: str,
+        effect: str,
+        before: int | None = Query(None, ge=1),
+    ) -> HTMLResponse:
+        """Paginated run history for one (schedule, effect). schedule and
+        effect arrive as query params, never path segments, so the
+        repo-controlled names cannot affect routing or filesystem paths;
+        runs are looked up by id only."""
+        project = await self.ctx.repo_or_404(forge, owner, name, request)
+        rows = await sched_gen.scheduled_runs_for_effect(
+            self.ctx.pool,
+            project_id=project["id"],
+            schedule_name=schedule,
+            effect=effect,
+            before=before,
+            limit_=_HISTORY_PAGE + 1,
+        )
+        runs = [dataclasses.asdict(r) for r in rows]
+        has_more = len(runs) > _HISTORY_PAGE
+        runs = runs[:_HISTORY_PAGE]
+        template = "_schedule_run_rows.html" if before else "schedule_runs.html"
+        return await self.ctx.render(
+            template,
+            request=request,
+            project=project,
+            schedule=schedule,
+            effect=effect,
+            runs=runs,
+            has_more=has_more,
         )
 
     async def build_failures(  # noqa: PLR0913
@@ -468,9 +601,18 @@ def create_log_router(ctx: WebContext, registry: LogRegistry) -> APIRouter:
     router.get(f"{_BASE}/logs/{{attr:path}}", response_class=HTMLResponse)(
         routes.log_viewer
     )
-    router.get(
-        "/repos/{forge}/{owner:owner}/{name:segment}/schedules/runs/{run_id}.txt"
-    )(routes.scheduled_run_log)
+    # Same ordering discipline as the attribute routes above: the .txt
+    # and /stream suffixes and the runs list precede the int {run_id}
+    # viewer so it cannot swallow them.
+    sched_base = "/repos/{forge}/{owner:owner}/{name:segment}/schedules"
+    router.get(f"{sched_base}/runs", response_class=HTMLResponse)(
+        routes.scheduled_runs_history
+    )
+    router.get(f"{sched_base}/runs/{{run_id:int}}.txt")(routes.scheduled_run_log)
+    router.get(f"{sched_base}/runs/{{run_id:int}}/stream")(routes.scheduled_run_stream)
+    router.get(f"{sched_base}/runs/{{run_id:int}}", response_class=HTMLResponse)(
+        routes.scheduled_run_viewer
+    )
     return router
 
 

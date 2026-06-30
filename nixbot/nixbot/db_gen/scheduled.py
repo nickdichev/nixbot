@@ -8,6 +8,8 @@ __all__: collections.abc.Sequence[str] = (
     "LatestScheduledRunsRow",
     "ProjectSchedulesRow",
     "QueryResults",
+    "ScheduledRunDetailRow",
+    "ScheduledRunsForEffectRow",
     "SchedulesForUpdateRow",
     "delete_project_schedules",
     "due_schedule_rows",
@@ -16,7 +18,9 @@ __all__: collections.abc.Sequence[str] = (
     "latest_scheduled_runs",
     "mark_schedule_run",
     "project_schedules",
+    "scheduled_run_detail",
     "scheduled_run_exists",
+    "scheduled_runs_for_effect",
     "schedules_for_update",
     "start_scheduled_run",
 )
@@ -55,6 +59,28 @@ class ProjectSchedulesRow:
     effect: str
     when_spec: str
     last_run: datetime.datetime | None
+
+
+@dataclasses.dataclass()
+class ScheduledRunDetailRow:
+    id: int
+    schedule_name: str
+    effect: str
+    status: str
+    error: str | None
+    started_at: datetime.datetime
+    finished_at: datetime.datetime | None
+
+
+@dataclasses.dataclass()
+class ScheduledRunsForEffectRow:
+    id: int
+    schedule_name: str
+    effect: str
+    status: str
+    error: str | None
+    started_at: datetime.datetime
+    finished_at: datetime.datetime | None
 
 
 @dataclasses.dataclass()
@@ -111,8 +137,23 @@ FROM scheduled_effects WHERE project_id = $1
 ORDER BY schedule_name, effect
 """
 
+SCHEDULED_RUN_DETAIL: typing.Final[str] = """-- name: ScheduledRunDetail :one
+SELECT id, schedule_name, effect, status, error, started_at, finished_at
+FROM scheduled_effect_runs WHERE id = $1 AND project_id = $2
+"""
+
 SCHEDULED_RUN_EXISTS: typing.Final[str] = """-- name: ScheduledRunExists :one
 SELECT id FROM scheduled_effect_runs WHERE id = $1 AND project_id = $2
+"""
+
+SCHEDULED_RUNS_FOR_EFFECT: typing.Final[str] = """-- name: ScheduledRunsForEffect :many
+SELECT id, schedule_name, effect, status, error, started_at, finished_at
+FROM scheduled_effect_runs
+WHERE project_id = $1
+  AND schedule_name = $2
+  AND effect = $3
+  AND ($4::bigint IS NULL OR id < $4)
+ORDER BY id DESC LIMIT $5::bigint
 """
 
 SCHEDULES_FOR_UPDATE: typing.Final[str] = """-- name: SchedulesForUpdate :many
@@ -205,11 +246,24 @@ def project_schedules(conn: ConnectionLike, *, project_id: int) -> QueryResults[
     return QueryResults[ProjectSchedulesRow](conn, PROJECT_SCHEDULES, _decode_hook, project_id)
 
 
+async def scheduled_run_detail(conn: ConnectionLike, *, id_: int, project_id: int) -> ScheduledRunDetailRow | None:
+    row = await conn.fetchrow(SCHEDULED_RUN_DETAIL, id_, project_id)
+    if row is None:
+        return None
+    return ScheduledRunDetailRow(id=row[0], schedule_name=row[1], effect=row[2], status=row[3], error=row[4], started_at=row[5], finished_at=row[6])
+
+
 async def scheduled_run_exists(conn: ConnectionLike, *, id_: int, project_id: int) -> int | None:
     row = await conn.fetchrow(SCHEDULED_RUN_EXISTS, id_, project_id)
     if row is None:
         return None
     return row[0]
+
+
+def scheduled_runs_for_effect(conn: ConnectionLike, *, project_id: int, schedule_name: str, effect: str, before: int | None, limit_: int) -> QueryResults[ScheduledRunsForEffectRow]:
+    def _decode_hook(row: asyncpg.Record) -> ScheduledRunsForEffectRow:
+        return ScheduledRunsForEffectRow(id=row[0], schedule_name=row[1], effect=row[2], status=row[3], error=row[4], started_at=row[5], finished_at=row[6])
+    return QueryResults[ScheduledRunsForEffectRow](conn, SCHEDULED_RUNS_FOR_EFFECT, _decode_hook, project_id, schedule_name, effect, before, limit_)
 
 
 def schedules_for_update(conn: ConnectionLike, *, project_id: int) -> QueryResults[SchedulesForUpdateRow]:

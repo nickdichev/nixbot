@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status_icon %}
+{% set label = run.schedule_name if run.schedule_name == run.effect else run.schedule_name ~ " · " ~ run.effect %}
+{% set history_url = repo_path(project) ~ "/schedules/runs?schedule=" ~ (run.schedule_name | urlencode) ~ "&effect=" ~ (run.effect | urlencode) %}
+{% block title %}
+  {{ label }} run
+{% endblock title %}
+{% block body %}
+  <main id="main">
+    <section class="content">
+      <div class="build-header">
+        <h2>
+          {{ status_icon(run.status) }}
+          <code>{{ label }}</code>
+          <small>
+            run #{{ run.id }}
+            · <a href="{{ repo_path(project) }}/schedules/runs/{{ run.id }}.txt">raw</a>
+            · <a href="{{ history_url }}">history</a>
+            · <a href="{{ repo_path(project) }}">{{ project.owner }}/{{ project.name }}</a>
+          </small>
+        </h2>
+      </div>
+      {% if live %}
+        <label>
+          <input type="checkbox" id="follow" checked>
+          follow tail
+        </label>
+      {% endif %}
+      {% if waiting %}
+        <p class="muted">waiting for the run to start…</p>
+      {% elif unavailable %}
+        <p class="muted">log unavailable — it was pruned or never written</p>
+      {% elif not content and not live %}
+        <p class="muted">no output</p>
+      {% else %}
+        <pre class="log" id="log">{{ content | safe }}</pre>
+      {% endif %}
+    </section>
+  </main>
+  <script>
+    const LIVE = {{ live | tojson }};
+    const WAITING = {{ waiting | tojson }};
+    const RUN_ID = {{ run.id | tojson }};
+    const log = document.getElementById("log");
+    if (log && !location.hash) log.scrollTop = log.scrollHeight;
+    /* Started but no writer/log yet: reload until it appears, since the
+       running->running INSERT raised no further event to react to. */
+    if (WAITING) setTimeout(() => location.reload(), 2000);
+    /* Status changes for this run (INSERT running / terminal UPDATE)
+       arrive on the shared events channel; reload to re-render the
+       header dot and, once finished, the server-side static log. */
+    const events = new EventSource("/events?project={{ project.id }}");
+    events.onmessage = (ev) => {
+      let e;
+      try { e = JSON.parse(ev.data); } catch { return; }
+      if (e.run_id !== RUN_ID) return;
+      if (!LIVE || !["running"].includes(e.status)) location.reload();
+    };
+    if (LIVE) {
+      const follow = document.getElementById("follow");
+      const atBottom = () =>
+        log.scrollHeight - log.scrollTop - log.clientHeight < 4;
+      log.addEventListener("scroll", () => { follow.checked = atBottom(); });
+      const source = new EventSource(
+        "{{ repo_path(project) }}/schedules/runs/{{ run.id }}/stream");
+      let errors = 0;
+      source.onopen = () => { errors = 0; log.textContent = ""; };
+      source.onerror = () => {
+        if (++errors >= 5) {
+          source.close();
+          setTimeout(() => location.reload(), 3000);
+        }
+      };
+      source.onmessage = (event) => {
+        log.insertAdjacentHTML("beforeend", event.data);
+        if (follow.checked) log.scrollTop = log.scrollHeight;
+      };
+      source.addEventListener("done", () => source.close());
+    }
+  </script>
+{% endblock body %}

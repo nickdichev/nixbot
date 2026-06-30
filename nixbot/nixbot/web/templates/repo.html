@@ -99,14 +99,11 @@
           </thead>
           {% for s in schedules %}
             {% set label = s.schedule if s.schedule == s.effect else s.schedule ~ " · " ~ s.effect %}
+            {% set history_url = repo_path(project) ~ "/schedules/runs?schedule=" ~ (s.schedule | urlencode) ~ "&effect=" ~ (s.effect | urlencode) %}
             <tr>
               <td class="status">{{ status_icon(s.run.status if s.run else "pending") }}</td>
               <td class="attr-name">
-                {% if s.run %}
-                  <a href="{{ repo_path(project) }}/schedules/runs/{{ s.run.id }}.txt">{{ label }}</a>
-                {% else %}
-                  {{ label }}
-                {% endif %}
+                <a href="{{ history_url }}">{{ label }}</a>
               </td>
               <td class="muted attr-status">{{ s.when }}</td>
               <td class="muted attr-status">
@@ -118,8 +115,10 @@
               </td>
               <td class="muted attr-status">
                 {% if s.run %}
-                  <time datetime="{{ s.run.started_at.isoformat() }}"
-                        title="{{ s.run.started_at }}">{{ s.run.started_at | timeago }}</time>
+                  <a href="{{ repo_path(project) }}/schedules/runs/{{ s.run.id }}">
+                    <time datetime="{{ s.run.started_at.isoformat() }}"
+                          title="{{ s.run.started_at }}">{{ s.run.started_at | timeago }}</time>
+                  </a>
                 {% else %}
                   never
                 {% endif %}
