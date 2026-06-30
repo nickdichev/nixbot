@@ -22,6 +22,7 @@ from ..auth import can_control_build, is_admin, same_origin  # noqa: TID252
 from ..db_gen import maintenance as maint_gen  # noqa: TID252
 from ..db_gen import projects as proj_gen  # noqa: TID252
 from ..hook_secrets import WebhookSecrets  # noqa: TID252
+from ..schedules import ScheduledEffectsStore  # noqa: TID252
 
 if TYPE_CHECKING:
     from ..auth import AuthzConfig  # noqa: TID252
@@ -40,6 +41,10 @@ class ControlBackend(Protocol):
     async def cancel_attribute(self, build_id: int, attr: str) -> None: ...
 
     async def refresh_projects(self) -> None: ...
+
+    async def run_scheduled_now(
+        self, project_id: int, schedule_name: str, effect: str, when_spec: str
+    ) -> None: ...
 
 
 class ControlAction(BaseModel):
@@ -227,6 +232,36 @@ class _ControlRoutes:
         # Back to the dashboard with the project filter intact.
         return RedirectResponse(f"/?q={quote(q)}" if q else "/", status_code=303)
 
+    async def run_schedule(  # noqa: PLR0913
+        self,
+        request: Request,
+        forge: str,
+        owner: str,
+        name: str,
+        schedule: Annotated[str, Form()],
+        effect: Annotated[str, Form()],
+    ) -> RedirectResponse:
+        """Trigger an onSchedule effect on demand. Repo admins only; the
+        schedule must already exist so form input cannot run arbitrary
+        effects."""
+        project = await self.ctx.repo_or_404(forge, owner, name, request)
+        await self._require_repo_admin(request, project["id"])
+        store = ScheduledEffectsStore(self.ctx.pool)
+        match = next(
+            (
+                row
+                for row in await store.schedules_for_project(project["id"])
+                if row["schedule_name"] == schedule and row["effect"] == effect
+            ),
+            None,
+        )
+        if match is None:
+            raise HTTPException(status_code=404, detail="unknown schedule")
+        await self.backend.run_scheduled_now(
+            project["id"], schedule, effect, match["when_spec"]
+        )
+        return RedirectResponse(f"/repos/{forge}/{owner}/{name}", status_code=303)
+
     async def regenerate_webhook_secret(
         self, request: Request, project_id: int
     ) -> HTMLResponse:
@@ -259,6 +294,9 @@ def create_control_router(
     router.post("/admin/repos/{project_id}/toggle")(routes.toggle_repo)
     router.post("/admin/repos/{project_id}/webhook-secret")(
         routes.regenerate_webhook_secret
+    )
+    router.post("/repos/{forge}/{owner:owner}/{name:segment}/schedules/run")(
+        routes.run_schedule
     )
     return router
 

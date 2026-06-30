@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -34,7 +35,7 @@ from .recovery import (
     settle_already_built,
 )
 from .repos import repo_info
-from .schedules import DueEffect
+from .schedules import DueEffect, ScheduledEffectsStore
 from .webhooks import (
     ChangeRequest,
     CheckRerequested,
@@ -346,6 +347,35 @@ class CIService:
     async def restart_effects(self, build_id: int) -> None:
         await self.enqueue_work("effects", f"build-{build_id}", {"build_id": build_id})
 
+    async def run_scheduled_now(
+        self, project_id: int, schedule_name: str, effect: str, when_spec: str
+    ) -> None:
+        """Manually trigger an onSchedule effect from the UI.
+
+        The run row is created synchronously so the UI shows it running
+        before the dispatcher claims the work. The dedup key carries
+        run_id to stay distinct from a sweep-loop due item, and this
+        path never touches last_run, so the regular schedule is
+        unaffected."""
+        due = DueEffect(
+            project_id=project_id,
+            schedule_name=schedule_name,
+            effect=effect,
+            when=ScheduleWhen.model_validate(json.loads(when_spec)),
+        )
+        run_id = await ScheduledEffectsStore(self.pool).start_run(due)
+        await self.enqueue_work(
+            "scheduled",
+            f"manual-{project_id}-{schedule_name}-{effect}-{run_id}",
+            {
+                "project_id": project_id,
+                "schedule_name": schedule_name,
+                "effect": effect,
+                "when": due.when.model_dump(exclude_none=True),
+                "run_id": run_id,
+            },
+        )
+
     async def enqueue_work(
         self, kind: str, dedup_key: str, payload: dict[str, Any]
     ) -> None:
@@ -418,6 +448,7 @@ class CIService:
                     effect=payload["effect"],
                     when=ScheduleWhen.model_validate(payload["when"]),
                 ),
+                run_id=payload.get("run_id"),
             )
         else:
             msg = f"unknown work kind {item.kind!r}"

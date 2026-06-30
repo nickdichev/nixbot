@@ -64,6 +64,7 @@ class FakeBackend:
     effect_restarts: list[int] = field(default_factory=list)
     cancelled: list[int] = field(default_factory=list)
     attr_cancels: list[tuple[int, str]] = field(default_factory=list)
+    scheduled_runs: list[tuple[int, str, str, str]] = field(default_factory=list)
     refreshes: int = 0
 
     async def restart_build(self, build_id: int) -> None:
@@ -84,6 +85,11 @@ class FakeBackend:
     async def refresh_projects(self) -> None:
         self.refreshes += 1
 
+    async def run_scheduled_now(
+        self, project_id: int, schedule_name: str, effect: str, when_spec: str
+    ) -> None:
+        self.scheduled_runs.append((project_id, schedule_name, effect, when_spec))
+
 
 @pytest.fixture(scope="module")
 async def postgres_dsn(postgres_dsn: str) -> str:
@@ -100,6 +106,14 @@ async def seed(dsn: str) -> None:
             status="failed",
             pr_number=7,
             pr_author="github:alice",
+        )
+        await pool.execute(
+            """
+            INSERT INTO scheduled_effects
+                (project_id, schedule_name, effect, when_spec) VALUES
+              ($1, 'nightly', 'deploy', '{}')
+            """,
+            project_id,
         )
         await pool.execute(
             """
@@ -274,6 +288,29 @@ def test_admin_project_toggle(harness: WebHarness) -> None:
     response = harness.post("/admin/repos/1/toggle", ROOT, data={"q": "wid get"})
     assert response.status_code == 303
     assert response.headers["location"] == "/?q=wid%20get"
+
+
+def test_run_schedule(harness: WebHarness) -> None:
+    url = "/repos/github/acme/widget/schedules/run"
+    data = {"schedule": "nightly", "effect": "deploy"}
+    # Non-admin rejected.
+    assert harness.post(url, ALICE, data=data).status_code == 403
+    assert BACKEND.scheduled_runs == []
+
+    response = harness.post(url, ROOT, data=data)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/repos/github/acme/widget"
+    assert BACKEND.scheduled_runs == [(1, "nightly", "deploy", "{}")]
+
+    # Unknown schedule is a 404, not an enqueue.
+    assert (
+        harness.post(url, ROOT, data={"schedule": "nope", "effect": "x"}).status_code
+        == 404
+    )
+    assert len(BACKEND.scheduled_runs) == 1
+
+    # Cross-origin rejected.
+    assert harness.post(url, ROOT, data=data, origin="http://evil").status_code == 403
 
 
 def test_repo_refresh(harness: WebHarness) -> None:
