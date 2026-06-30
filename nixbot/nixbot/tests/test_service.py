@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import pytest
 
+from nixbot import restart_dispatch
 from nixbot.bootstrap import _startup, build_service, run_service
 from nixbot.config import (
     PullBasedConfig,
@@ -279,10 +280,11 @@ async def test_restart_eval_failed_build_reevaluates(
 
     service.orchestrator.run_build = fake_run_build  # type: ignore[method-assign]
     await service.restart_build(build_id)
-    await service.drain_work()
-    # A restart only queues; the rerun sets the real status.
+    # The reset is synchronous: the build row is the source of
+    # truth before any worker runs (issue #28).
     status = await pool.fetchval("SELECT status FROM builds WHERE id = $1", build_id)
     assert status == "pending"
+    await service.drain_work()
     await asyncio.gather(*service._tasks)  # noqa: SLF001
 
     assert reevals == [build_id]
@@ -399,10 +401,9 @@ async def test_restart_failed_eval_attribute_reevaluates(
 
     service.orchestrator.run_build = fake_run_build  # type: ignore[method-assign]
     await service.restart_build(build_id)
-    await service.drain_work()
-    # A restart only queues; the rerun sets the real status.
     status = await pool.fetchval("SELECT status FROM builds WHERE id = $1", build_id)
     assert status == "pending"
+    await service.drain_work()
     await asyncio.gather(*service._tasks)  # noqa: SLF001
 
     assert reevals == [build_id]
@@ -456,16 +457,16 @@ async def test_restart_cancelled_build_reschedules_attributes(
     assert rescheduled == [["a", "b"]]
 
 
-async def test_restart_while_running_is_requeued_not_dropped(
+async def test_restart_while_unwinding_waits_then_runs(
     service: CIService,
     git_repo: tuple[Path, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Restart clicked while the build is still in flight (e.g. right
-    after a cancel, while the old run unwinds) must stay queued and
-    run once the build is gone, not be dropped silently."""
+    """Restart clicked while the old run is still unwinding (e.g.
+    right after a cancel) resets state immediately; the rerun must
+    requeue until the slot clears, not be dropped silently."""
     repo, sha = git_repo
-    monkeypatch.setattr("nixbot.restart_dispatch.RESTART_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr("nixbot.restart_dispatch.UNWIND_RETRY_SECONDS", 0.0)
 
     pool = service.pool
     project_id = await seed_project(pool, str(repo))
@@ -495,17 +496,24 @@ async def test_restart_while_running_is_requeued_not_dropped(
     # Simulate the cancelled run still unwinding.
     service.orchestrator.cancel_events[build_id] = asyncio.Event()
     await service.restart_build(build_id)
+    # Reset already applied; the UI sees pending without a worker.
+    assert (
+        await pool.fetchval("SELECT status FROM builds WHERE id = $1", build_id)
+        == "pending"
+    )
+
     queue = WorkQueue(pool)
     item = await queue.claim_next()
     assert item is not None
+    assert item.kind == "rerun"
     await service._execute_work(queue, item)  # noqa: SLF001
     assert rescheduled == []  # deferred, not executed
     pending = await pool.fetchval(
-        "SELECT count(*) FROM work_queue WHERE kind = 'restart' AND status = 'pending'"
+        "SELECT count(*) FROM work_queue WHERE kind = 'rerun' AND status = 'pending'"
     )
     assert pending == 1  # the intent survived
 
-    # Old run finished; the queued restart now goes through.
+    # Old run finished; the queued rerun now goes through.
     del service.orchestrator.cancel_events[build_id]
     await service.drain_work()
     await asyncio.gather(*service._tasks)  # noqa: SLF001
@@ -556,16 +564,21 @@ async def test_check_rerequested_dispatch(service: CIService) -> None:
         "SELECT forge_repo_id FROM projects WHERE id = $1", project_id
     )
     build_id = await insert_build(pool, project_id, commit_sha="deadbeef")
+    await pool.execute(
+        "INSERT INTO build_attributes (build_id, attr, system, status) "
+        "VALUES ($1, 'flaky', 'x86_64-linux', 'failed')",
+        build_id,
+    )
     store = CheckRunStore(pool)
     await store.set(project_id, "deadbeef", "nixbot/nix-build", None, 1)
     await store.set(project_id, "deadbeef", "nixbot/nix-build a", "flaky", 2)
 
-    enqueued: list[tuple[str, dict]] = []
+    calls: list[tuple[int, str | None]] = []
 
-    async def fake_enqueue(kind: str, key: str, payload: dict) -> None:
-        enqueued.append((kind, payload))
+    async def fake_restart(build_id: int, *, attr: str | None) -> None:
+        calls.append((build_id, attr))
 
-    service.enqueue_work = fake_enqueue  # type: ignore[method-assign,assignment]
+    service._restart = fake_restart  # type: ignore[method-assign,assignment]  # noqa: SLF001
 
     base = {"forge": "github", "forge_repo_id": forge_repo_id, "head_sha": "deadbeef"}
     await service.submit(
@@ -578,11 +591,11 @@ async def test_check_rerequested_dispatch(service: CIService) -> None:
     await service.submit(CheckRerequested(**base))
     # external_id from another project's app must not be honoured.
     await service.submit(CheckRerequested(**base, build_id=99999999))
-    assert enqueued == [
-        ("restart", {"build_id": build_id, "attr": "flaky"}),
-        ("restart", {"build_id": build_id}),
-        ("restart", {"build_id": build_id}),
-        ("restart", {"build_id": build_id}),
+    assert calls == [
+        (build_id, "flaky"),
+        (build_id, None),
+        (build_id, None),
+        (build_id, None),
     ]
 
 
@@ -820,7 +833,7 @@ async def test_rerun_of_interrupted_eval_reevaluates(
 
     service.orchestrator.run_build = fake_run_build  # type: ignore[method-assign]
     service.orchestrator.rerun_pending_attributes = fake_resume  # type: ignore[method-assign, assignment]
-    await service._rerun(build_id)  # noqa: SLF001
+    await restart_dispatch.rerun(service, build_id)
 
     assert resumes == []
     assert reevals == [build_id]
@@ -867,7 +880,7 @@ async def test_rerun_resumes_building_rows_and_keeps_finished(
 
     service.orchestrator.run_build = fake_run_build  # type: ignore[method-assign]
     service.orchestrator.rerun_pending_attributes = fake_resume  # type: ignore[method-assign, assignment]
-    await service._rerun(build_id)  # noqa: SLF001
+    await restart_dispatch.rerun(service, build_id)
 
     assert reevals == []
     assert resumed_attrs == ["mid"]
@@ -915,7 +928,7 @@ async def test_rerun_reevaluates_when_drv_paths_were_garbage_collected(
     service.orchestrator.run_build = fake_run_build  # type: ignore[method-assign]
     service.orchestrator.rerun_pending_attributes = fake_resume  # type: ignore[method-assign, assignment]
     # The real path checker: /nix/store/gcd.drv does not exist.
-    await service._rerun(build_id)  # noqa: SLF001
+    await restart_dispatch.rerun(service, build_id)
 
     assert resumes == []
     assert reevals == [build_id]

@@ -324,12 +324,24 @@ class CIService:
             self._last_discovery = time.monotonic()
 
     async def restart_build(self, build_id: int) -> None:
-        await self.enqueue_work("restart", f"build-{build_id}", {"build_id": build_id})
+        await self._restart(build_id, attr=None)
 
     async def restart_attribute(self, build_id: int, attr: str) -> None:
-        await self.enqueue_work(
-            "restart", f"build-{build_id}", {"build_id": build_id, "attr": attr}
-        )
+        # A stale attr (e.g. after a re-eval renamed it) must not
+        # reset the build row and spawn an empty rerun.
+        if await q.attribute_known(self.pool, build_id=build_id, attr=attr) is None:
+            logger.warning(
+                "restart of unknown attribute ignored",
+                extra={"build_id": build_id, "attr": attr},
+            )
+            return
+        await self._restart(build_id, attr=attr)
+
+    async def _restart(self, build_id: int, *, attr: str | None) -> None:
+        # Reset synchronously so the build row is the source of truth
+        # for the UI/recovery; the queue item is only a wake-up.
+        await q.reset_build_for_restart(self.pool, build_id=build_id, attr=attr)
+        await self.enqueue_work("rerun", f"build-{build_id}", {"build_id": build_id})
 
     async def restart_effects(self, build_id: int) -> None:
         await self.enqueue_work("effects", f"build-{build_id}", {"build_id": build_id})
@@ -378,17 +390,11 @@ class CIService:
         payload = item.payload
         if item.kind == "change":
             await self._process_change(ChangeRequest(**payload))
-        elif item.kind == "restart":
-            retry = await restart_dispatch.restart(
-                self, payload["build_id"], payload.get("attr")
-            )
-            if retry:
-                # Still running (e.g. restart right after a cancel,
-                # while the old run unwinds): retry, don't drop.
-                await self.enqueue_work("restart", item.dedup_key, payload)
         elif item.kind == "rerun":
-            # Crash recovery: resume pending attributes, no reset.
-            await self._rerun(payload["build_id"])
+            # Resume pending attributes (restart and crash recovery).
+            if await restart_dispatch.rerun(self, payload["build_id"]):
+                # Previous run still unwinding; retry, don't drop.
+                await self.enqueue_work("rerun", item.dedup_key, payload)
         elif item.kind == "effects":
             await restart_dispatch.restart_effects(self, payload["build_id"])
         elif item.kind == "effect":
@@ -490,9 +496,6 @@ class CIService:
                 log_truncated=False,
             )
             raise
-
-    async def _rerun(self, build_id: int) -> None:
-        await restart_dispatch.rerun(self, build_id)
 
     async def recover_unfinished_builds(self) -> None:
         """Crash recovery: settle already-built attributes, then queue

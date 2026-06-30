@@ -1,6 +1,7 @@
-"""Build restart and rerun paths driven from the work queue: attribute
-resets, resuming pending attributes from stored eval results, falling
-back to re-evaluation, and effects-only restarts.
+"""Build rerun paths driven from the work queue: resuming pending
+attributes from stored eval results, falling back to re-evaluation,
+and effects-only restarts. State resets happen synchronously in the
+service; this module only re-executes.
 """
 
 from __future__ import annotations
@@ -26,10 +27,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Pause before handing a restart of a still-running build back to the
-# work queue; bounds the retry cadence without holding the dedup key
-# for the whole build.
-RESTART_RETRY_SECONDS = 10.0
+# Pause before handing a rerun of a still-unwinding build back to
+# the work queue; bounds the retry cadence without holding the
+# dedup key indefinitely.
+UNWIND_RETRY_SECONDS = 0.5
 
 
 async def restart_effects(s: CIService, build_id: int) -> None:
@@ -46,49 +47,28 @@ async def restart_effects(s: CIService, build_id: int) -> None:
     await s.orchestrator.rerun_effects(info, build, credentials)
 
 
-async def restart(s: CIService, build_id: int, attr: str | None) -> bool:
-    """Reset attributes (one or all) and re-run only the pending jobs
-    from the stored eval results — no re-eval.
-
-    Returns True when the build is still running and the restart
-    must be retried later (restarting now would double-build)."""
+async def rerun(s: CIService, build_id: int) -> bool:
+    """Resume the pending attributes of a build from stored eval
+    results, falling back to a re-evaluation. Returns True when the
+    previous run is still unwinding and the rerun must be retried
+    (rerun_pending_attributes would drop it on the floor)."""
+    # Serialized by the work queue's per-build dedup key.
     if build_id in s.orchestrator.cancel_events:
-        await asyncio.sleep(RESTART_RETRY_SECONDS)
+        await asyncio.sleep(UNWIND_RETRY_SECONDS)
         if build_id in s.orchestrator.cancel_events:
             return True
-    if await builds_q.get_build(s.orchestrator.pool, id_=build_id) is None:
-        return False
-    if attr is not None:
-        # A stale attr (e.g. after a re-eval renamed it) must not
-        # reset the build row and spawn an empty rerun.
-        known = await q.attribute_known(s.pool, build_id=build_id, attr=attr)
-        if known is None:
-            logger.warning(
-                "restart of unknown attribute ignored",
-                extra={"build_id": build_id, "attr": attr},
-            )
-            return False
-    # An explicit rebuild clears cached failures so the attributes
-    # actually build again instead of re-skipping.
-    await q.reset_build_for_restart(s.pool, build_id=build_id, attr=attr)
-    await rerun(s, build_id)
-    return False
-
-
-async def rerun(s: CIService, build_id: int) -> None:
-    # Serialized by the work queue's per-build dedup key.
     build = await builds_q.get_build(s.orchestrator.pool, id_=build_id)
     if build is None:
-        return
+        return False
     project = await s.repo_store.by_id(build.project_id)
     if project is None:
-        return
+        return False
     info = repo_info(project)
     credentials = await s.credentials_provider(info.forge).get(info.clone_url)
     results = await find_unfinished_builds(s.pool, build_id=build_id)
     resumable = results[0] if results else None
     if resumable is None:
-        return
+        return False
     unfinished_count = await q.count_unfinished_attributes(s.pool, build_id=build_id)
     if (
         # A crash mid-eval leaves a partial attribute set; resuming
@@ -106,7 +86,7 @@ async def rerun(s: CIService, build_id: int) -> None:
             await s.orchestrator.rerun_pending_attributes(
                 info, build, resumable.pending_jobs, credentials
             )
-            return
+            return False
         logger.info(
             "stored derivations missing from the store; re-evaluating",
             extra={"build_id": build_id},
@@ -125,6 +105,7 @@ async def rerun(s: CIService, build_id: int) -> None:
             error="re-evaluation failed; see service logs",
         )
         await _report_interrupted(s, resumable)
+    return False
 
 
 async def _reeval(

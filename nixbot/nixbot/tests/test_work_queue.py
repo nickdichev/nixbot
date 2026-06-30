@@ -12,23 +12,23 @@ pytestmark = pytest.mark.usefixtures("fresh_work_queue")
 
 async def test_enqueue_dedupes_pending(pool: asyncpg.Pool) -> None:
     queue = WorkQueue(pool)
-    assert await queue.enqueue("restart", "build-1", {"build_id": 1})
+    assert await queue.enqueue("rerun", "build-1", {"build_id": 1})
     # Double click: identical pending intent collapses.
-    assert not await queue.enqueue("restart", "build-1", {"build_id": 1})
+    assert not await queue.enqueue("rerun", "build-1", {"build_id": 1})
     # A different payload is a distinct intent.
-    assert await queue.enqueue("restart", "build-1", {"attr": "a"})
+    assert await queue.enqueue("report", "build-1", {"attempt": 2})
     item = await queue.claim_next()
     assert item is not None
-    assert item.kind == "restart"
+    assert item.kind == "rerun"
     assert item.payload == {"build_id": 1}
     # Claimed (running) no longer blocks new intent.
-    assert await queue.enqueue("restart", "build-1", {"build_id": 1})
+    assert await queue.enqueue("rerun", "build-1", {"build_id": 1})
     await queue.finish(item.id)
 
 
 async def test_claim_serializes_per_key(pool: asyncpg.Pool) -> None:
     queue = WorkQueue(pool)
-    await queue.enqueue("restart", "build-2")
+    await queue.enqueue("rerun", "build-2")
     first = await queue.claim_next()
     assert first is not None
     await queue.enqueue("effects", "build-2")
@@ -41,7 +41,7 @@ async def test_claim_serializes_per_key(pool: asyncpg.Pool) -> None:
             "WHERE kind = 'effects' AND dedup_key = 'build-2'"
         )
     # A different key is unaffected.
-    await queue.enqueue("restart", "build-3")
+    await queue.enqueue("rerun", "build-3")
     other = await queue.claim_next()
     assert other is not None
     assert other.dedup_key == "build-3"
