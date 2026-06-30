@@ -739,6 +739,12 @@ _STATUS_ICONS = {
 }
 
 
+def _status_rank(status: str | None) -> int:
+    """Failures sort before non-failures; within each group statuses are
+    ordered by name (see _build_plan)."""
+    return 0 if status in FAILED_STATUS_STATES else 1
+
+
 def _status_cell(status: str) -> str:
     icon = _STATUS_ICONS.get(status)
     return f"{icon} {status}" if icon else status
@@ -757,10 +763,11 @@ def _build_plan(
         header = f"Building {len(attrs)} attribute(s):"
         head, sep, trunc = "| attribute | raw |", "| --- | --- |", "| [all]({0}) |"
     else:
-        # Failures first so the actionable rows lead, then by attr name.
+        # Group by status (failures first so the actionable rows lead),
+        # then alphabetically within each status.
         attrs = sorted(
             set(attrs),
-            key=lambda a: (statuses.get(a) not in FAILED_STATUS_STATES, a),
+            key=lambda a: (_status_rank(statuses.get(a)), statuses.get(a) or "", a),
         )
         header = f"Built {len(attrs)} attribute(s):"
         head = "| attribute | status | raw |"

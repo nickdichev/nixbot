@@ -269,6 +269,40 @@ async def test_build_finished_table_sorts_failures_first() -> None:
     assert "| ✅ succeeded |" in text
 
 
+async def test_build_finished_table_groups_by_status_then_alpha() -> None:
+    """Rows are grouped by status (failures first) and sorted
+    alphabetically within each status."""
+    reporter, poster, _ = make_reporter()
+    await reporter.build_finished(
+        EVENT,
+        BUILD,
+        BuildResult(
+            "failed",
+            1,
+            [
+                attr_result("b", AttributeStatus.failed),
+                attr_result("a", AttributeStatus.failed),
+                attr_result("y", AttributeStatus.succeeded),
+                attr_result("x", AttributeStatus.succeeded),
+            ],
+            attr_statuses={
+                "b": "failed",
+                "a": "failed",
+                "y": "succeeded",
+                "x": "succeeded",
+            },
+        ),
+    )
+    summary_idx = next(
+        i for i, p in enumerate(poster.posts) if p.context == "nixbot/nix-build"
+    )
+    text = poster.extras[summary_idx]["text"]
+    # Failures grouped first, alphabetical within; successes follow,
+    # alphabetical within.
+    assert text.index("`a`") < text.index("`b`") < text.index("`x`")
+    assert text.index("`x`") < text.index("`y`")
+
+
 async def test_build_finished_table_omits_links_for_logless_statuses() -> None:
     """failed_eval and skipped_local attributes never produce a log, so
     their viewer/raw links would 404; render them without links."""
