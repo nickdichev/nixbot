@@ -739,10 +739,26 @@ _STATUS_ICONS = {
 }
 
 
+# Row ordering for the finished build table: failures first, then succeeded,
+# then remaining states. Unknown statuses sort last.
+_STATUS_ORDER = (
+    "failed",
+    "failed_eval",
+    "dependency_failed",
+    "cached_failure",
+    "cancelled",
+    "succeeded",
+    "skipped_local",
+    "building",
+    "queued",
+)
+
+
 def _status_rank(status: str | None) -> int:
-    """Failures sort before non-failures; within each group statuses are
-    ordered by name (see _build_plan)."""
-    return 0 if status in FAILED_STATUS_STATES else 1
+    try:
+        return _STATUS_ORDER.index(status)  # type: ignore[arg-type]
+    except ValueError:
+        return len(_STATUS_ORDER)
 
 
 def _status_cell(status: str) -> str:
@@ -763,11 +779,11 @@ def _build_plan(
         header = f"Building {len(attrs)} attribute(s):"
         head, sep, trunc = "| attribute | raw |", "| --- | --- |", "| [all]({0}) |"
     else:
-        # Group by status (failures first so the actionable rows lead),
-        # then alphabetically within each status.
+        # Group by status (see _STATUS_ORDER), then alphabetically within
+        # each status.
         attrs = sorted(
             set(attrs),
-            key=lambda a: (_status_rank(statuses.get(a)), statuses.get(a) or "", a),
+            key=lambda a: (_status_rank(statuses.get(a)), a),
         )
         header = f"Built {len(attrs)} attribute(s):"
         head = "| attribute | status | raw |"
