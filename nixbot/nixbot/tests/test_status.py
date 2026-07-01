@@ -284,12 +284,14 @@ async def test_build_finished_table_groups_by_status_then_alpha() -> None:
                 attr_result("a", AttributeStatus.failed),
                 attr_result("y", AttributeStatus.succeeded),
                 attr_result("x", AttributeStatus.succeeded),
+                attr_result("s", AttributeStatus.succeeded),
             ],
             attr_statuses={
                 "b": "failed",
                 "a": "failed",
                 "y": "succeeded",
                 "x": "succeeded",
+                "s": "skipped_local",
             },
         ),
     )
@@ -297,10 +299,10 @@ async def test_build_finished_table_groups_by_status_then_alpha() -> None:
         i for i, p in enumerate(poster.posts) if p.context == "nixbot/nix-build"
     )
     text = poster.extras[summary_idx]["text"]
-    # Failures grouped first, alphabetical within; successes follow,
-    # alphabetical within.
     assert text.index("`a`") < text.index("`b`") < text.index("`x`")
     assert text.index("`x`") < text.index("`y`")
+    # succeeded ranks above skipped_local despite alphabetical order.
+    assert text.index("`y`") < text.index("`s`")
 
 
 async def test_build_finished_table_omits_links_for_logless_statuses() -> None:
