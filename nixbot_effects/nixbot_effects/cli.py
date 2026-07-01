@@ -11,6 +11,7 @@ from typing import Any
 
 from . import (
     NixbotEffectsError,
+    build_derivation,
     instantiate_effects,
     instantiate_scheduled_effect,
     list_effects,
@@ -141,13 +142,21 @@ def run_command(args: argparse.Namespace) -> None:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         gcroot = Path(tmpdir) / "result"
-        drv_path = instantiate_effects(effect, options, gcroot)
+        drv_path, should_run = instantiate_effects(effect, options, gcroot)
         if drv_path == "":
             print(
                 f"Effect {effect} not found or not runnable for {options}",
                 file=sys.stderr,
             )
             sys.exit(1)
+        if not should_run:
+            print(
+                f"Effect {effect} is gated off for {options}; building"
+                " dependencies only",
+                file=sys.stderr,
+            )
+            build_derivation(drv_path, options)
+            return
         _run_effect_derivation(drv_path, options)
 
 
@@ -171,7 +180,9 @@ def run_scheduled_command(args: argparse.Namespace) -> None:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         gcroot = Path(tmpdir) / "result"
-        drv_path = instantiate_scheduled_effect(schedule_name, effect, options, gcroot)
+        drv_path, should_run = instantiate_scheduled_effect(
+            schedule_name, effect, options, gcroot
+        )
         if drv_path == "":
             print(
                 f"Scheduled effect {schedule_name}/{effect} not found or not runnable"
@@ -179,6 +190,14 @@ def run_scheduled_command(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        if not should_run:
+            print(
+                f"Scheduled effect {schedule_name}/{effect} is gated off for"
+                f" {options}; building dependencies only",
+                file=sys.stderr,
+            )
+            build_derivation(drv_path, options)
+            return
         _run_effect_derivation(drv_path, options)
 
 
