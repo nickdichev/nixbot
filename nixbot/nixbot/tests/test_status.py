@@ -269,6 +269,77 @@ async def test_build_finished_table_sorts_failures_first() -> None:
     assert "| ✅ succeeded |" in text
 
 
+async def test_build_finished_table_groups_by_status_then_alpha() -> None:
+    """Rows are grouped by status (failures first) and sorted
+    alphabetically within each status."""
+    reporter, poster, _ = make_reporter()
+    await reporter.build_finished(
+        EVENT,
+        BUILD,
+        BuildResult(
+            "failed",
+            1,
+            [
+                attr_result("b", AttributeStatus.failed),
+                attr_result("a", AttributeStatus.failed),
+                attr_result("y", AttributeStatus.succeeded),
+                attr_result("x", AttributeStatus.succeeded),
+            ],
+            attr_statuses={
+                "b": "failed",
+                "a": "failed",
+                "y": "succeeded",
+                "x": "succeeded",
+            },
+        ),
+    )
+    summary_idx = next(
+        i for i, p in enumerate(poster.posts) if p.context == "nixbot/nix-build"
+    )
+    text = poster.extras[summary_idx]["text"]
+    # Failures grouped first, alphabetical within; successes follow,
+    # alphabetical within.
+    assert text.index("`a`") < text.index("`b`") < text.index("`x`")
+    assert text.index("`x`") < text.index("`y`")
+
+
+async def test_build_finished_table_omits_links_for_logless_statuses() -> None:
+    """failed_eval and skipped_local attributes never produce a log, so
+    their viewer/raw links would 404; render them without links."""
+    reporter, poster, _ = make_reporter()
+    await reporter.build_finished(
+        EVENT,
+        BUILD,
+        BuildResult(
+            "failed",
+            1,
+            [
+                attr_result("e", AttributeStatus.failed_eval),
+                attr_result("s", AttributeStatus.skipped_local),
+                attr_result("ok", AttributeStatus.succeeded),
+            ],
+            attr_statuses={
+                "e": "failed_eval",
+                "s": "skipped_local",
+                "ok": "succeeded",
+            },
+        ),
+    )
+    summary_idx = next(
+        i for i, p in enumerate(poster.posts) if p.context == "nixbot/nix-build"
+    )
+    text = poster.extras[summary_idx]["text"]
+    assert "/builds/42/logs/e" not in text
+    assert "/builds/42/logs/raw/e" not in text
+    assert "/builds/42/logs/s" not in text
+    assert "/builds/42/logs/raw/s" not in text
+    # Attributes still listed, just without links.
+    assert "`e`" in text
+    assert "`s`" in text
+    # Successful attribute keeps its links.
+    assert "/builds/42/logs/ok" in text
+
+
 async def test_per_attribute_failure_statuses_capped() -> None:
     reporter, poster, store = make_reporter(limit=2)
     results = [

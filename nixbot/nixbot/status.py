@@ -68,6 +68,11 @@ FAILED_STATUS_STATES = frozenset(
     {"failed", "failed_eval", "dependency_failed", "cached_failure", "cancelled"}
 )
 
+# Statuses for which no per-attribute log is ever written: eval failed
+# before a build started, or the build was skipped because the output is
+# already present locally. Linking to /logs/{attr} for these would 404.
+NO_LOG_STATUSES = frozenset({"failed_eval", "skipped_local"})
+
 
 class StatusState(StrEnum):
     pending = "pending"
@@ -734,6 +739,12 @@ _STATUS_ICONS = {
 }
 
 
+def _status_rank(status: str | None) -> int:
+    """Failures sort before non-failures; within each group statuses are
+    ordered by name (see _build_plan)."""
+    return 0 if status in FAILED_STATUS_STATES else 1
+
+
 def _status_cell(status: str) -> str:
     icon = _STATUS_ICONS.get(status)
     return f"{icon} {status}" if icon else status
@@ -752,10 +763,11 @@ def _build_plan(
         header = f"Building {len(attrs)} attribute(s):"
         head, sep, trunc = "| attribute | raw |", "| --- | --- |", "| [all]({0}) |"
     else:
-        # Failures first so the actionable rows lead, then by attr name.
+        # Group by status (failures first so the actionable rows lead),
+        # then alphabetically within each status.
         attrs = sorted(
             set(attrs),
-            key=lambda a: (statuses.get(a) not in FAILED_STATUS_STATES, a),
+            key=lambda a: (_status_rank(statuses.get(a)), statuses.get(a) or "", a),
         )
         header = f"Built {len(attrs)} attribute(s):"
         head = "| attribute | status | raw |"
@@ -767,11 +779,15 @@ def _build_plan(
     for i, attr in enumerate(attrs):
         live = f"{build_url}/logs/{quote(attr)}"
         raw = f"{build_url}/logs/raw/{quote(attr)}"
+        status = statuses.get(attr) if statuses is not None else None
+        has_log = status not in NO_LOG_STATUSES
+        attr_cell = f"[`{attr}`]({live})" if has_log else f"`{attr}`"
+        raw_cell = f"[raw]({raw})" if has_log else ""
         if statuses is None:
-            line = f"| [`{attr}`]({live}) | [raw]({raw}) |"
+            line = f"| {attr_cell} | {raw_cell} |"
         else:
-            cell = _status_cell(statuses.get(attr, "unknown"))
-            line = f"| [`{attr}`]({live}) | {cell} | [raw]({raw}) |"
+            cell = _status_cell(status or "unknown")
+            line = f"| {attr_cell} | {cell} | {raw_cell} |"
         if sum(map(len, lines)) + len(line) > CHECK_RUN_TEXT_LIMIT:
             lines.append(f"| … {len(attrs) - i} more {trunc.format(build_url)}")
             break

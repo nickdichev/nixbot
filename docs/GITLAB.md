@@ -64,3 +64,6 @@ maintainer permission to manage webhooks" warning):
   merge request approval rules / merged results pipelines.
 - GitLab does not sign webhook payloads; the secret is compared against the
   `X-Gitlab-Token` header. Use HTTPS for the webhook URL.
+- Access control (with OAuth login): admins manage everything; Developer access
+  or higher to a project allows restart/cancel of its builds; MR authors can
+  restart/cancel their own MR's builds.

@@ -81,14 +81,12 @@ actions (restart, cancel) a login is required. Every enabled forge with OAuth
 credentials configured offers a login, OIDC via `services.nixbot.oidc.enable`;
 several providers can be active at once.
 
-We have the following two roles:
+We have the following roles:
 
-- Admins:
-  - The list of admin usernames is hard-coded in the NixOS configuration.
-  - admins can reload the project list
-- Organisation member:
-  - All member of the organisation where this repository is located
-  - They can restart builds
+- Admins (hard-coded in the NixOS configuration): reload the project list,
+  enable/disable projects, restart/cancel any build.
+- Repo writers (forge write access): restart/cancel that repository's builds.
+- PR authors: restart/cancel their own pull request's builds.
 
 ##### GitHub Integration
 

@@ -31,6 +31,7 @@ from ..db_gen import maintenance as maint_gen  # noqa: TID252
 from ..db_gen import scheduled as sched_gen  # noqa: TID252
 from ..db_gen import web as gen  # noqa: TID252
 from ..executor import read_log  # noqa: TID252
+from ..status import NO_LOG_STATUSES  # noqa: TID252
 from .api_routes import FailureSummary, clean_row
 
 if TYPE_CHECKING:
@@ -554,6 +555,7 @@ class _LogRoutes:
         live = self.registry.get(build["id"], attr) is not None
         content = ""
         waiting = False
+        unavailable = False
         if not live:
             if path is not None and path.exists():
                 data = await asyncio.to_thread(read_log, path)
@@ -564,6 +566,8 @@ class _LogRoutes:
                 # The build page links queued attributes before any
                 # log exists; show a waiting page instead of a 404.
                 waiting = True
+            elif attr_status in NO_LOG_STATUSES:
+                unavailable = True
             else:
                 raise HTTPException(status_code=404)
         prev_number, next_number = await self.ctx.queries.attribute_neighbors(
@@ -579,6 +583,7 @@ class _LogRoutes:
             content=content,
             live=live,
             waiting=waiting,
+            unavailable=unavailable,
             prev_number=prev_number,
             next_number=next_number,
             can_control=await self.ctx.can_control(request, build),

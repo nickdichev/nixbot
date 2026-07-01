@@ -27,6 +27,7 @@ from nixbot.service import (
     repo_info,
 )
 from nixbot.status import StatusPostError, _raise_for_status
+from nixbot.visibility import AccessCache, VisibilityService
 from nixbot.web.control_routes import (
     create_control_api_router,
     create_control_router,
@@ -40,6 +41,7 @@ from .support import (
     insert_project,
     web_harness,
 )
+from .test_visibility import FakeFetcher
 
 pytestmark = pytest.mark.usefixtures("fresh_work_queue")
 
@@ -194,6 +196,57 @@ def test_pr_author_can_control_own_pr(harness: WebHarness) -> None:
         harness.post("/repos/github/acme/widget/builds/1/restart", MALLORY).status_code
         == 403
     )
+
+
+def test_repo_writer_can_control_without_admin_or_authorship(
+    harness: WebHarness,
+) -> None:
+    """A user with forge write access to the repo may restart/cancel even
+    when they are neither an instance admin nor the PR author (issue
+    #52)."""
+    frank = User(provider="github", username="frank")
+    ctx = harness.ctx
+    saved_visibility = ctx.visibility
+    saved_tokens = ctx.forge_tokens
+    ctx.forge_tokens = ForgeTokenStore(ctx.pool)
+    ctx.visibility = VisibilityService(
+        ctx.pool,
+        AUTHZ,
+        fetcher=FakeFetcher(
+            grants={"github:frank:tok-frank": frozenset({"github:ctl-1"})},
+            writable_grants={"github:frank:tok-frank": frozenset({"github:ctl-1"})},
+        ),
+        cache=AccessCache(ttl=3600),
+    )
+    try:
+        BACKEND.restarted.clear()
+        # Buttons show for the writer on the build page.
+        page = harness.get(
+            "/repos/github/acme/widget/builds/1", frank, "tok-frank"
+        ).text
+        assert ">restart</button>" in page
+        # And the control endpoint accepts the request.
+        assert (
+            harness.post(
+                "/repos/github/acme/widget/builds/1/restart",
+                frank,
+                token="tok-frank",  # noqa: S106 (test forge token)
+            ).status_code
+            == 303
+        )
+        assert len(BACKEND.restarted) == 1
+        # A user without write access is still rejected.
+        assert (
+            harness.post(
+                "/repos/github/acme/widget/builds/1/restart",
+                frank,
+                token="",
+            ).status_code
+            == 403
+        )
+    finally:
+        ctx.visibility = saved_visibility
+        ctx.forge_tokens = saved_tokens
 
 
 def test_cancel_all_requires_admin(harness: WebHarness) -> None:

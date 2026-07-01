@@ -870,6 +870,38 @@ def test_log_viewer_waits_for_queued_attribute(client: WebHarness) -> None:
         client.loop.run_until_complete(restore())
 
 
+def test_log_viewer_unavailable_for_logless_status(client: WebHarness) -> None:
+    # failed_eval / skipped_local never produce a log; the viewer shows
+    # a placeholder instead of a 404 so build-page links resolve.
+    async def make_failed_eval() -> None:
+        await client.ctx.pool.execute(
+            """
+            UPDATE build_attributes a SET status = 'failed_eval'
+            FROM builds b
+            WHERE b.id = a.build_id AND b.number = 3
+              AND a.attr = 'x86_64-linux.ok'
+            """
+        )
+
+    async def restore() -> None:
+        await client.ctx.pool.execute(
+            """
+            UPDATE build_attributes a SET status = 'succeeded'
+            FROM builds b
+            WHERE b.id = a.build_id AND b.number = 3
+              AND a.attr = 'x86_64-linux.ok'
+            """
+        )
+
+    client.loop.run_until_complete(make_failed_eval())
+    try:
+        response = client.get("/repos/github/acme/widget/builds/3/logs/x86_64-linux.ok")
+        assert response.status_code == 200
+        assert "no log available" in response.text
+    finally:
+        client.loop.run_until_complete(restore())
+
+
 def test_log_sse_stream_finished(client: WebHarness, tmp_path: Path) -> None:
     seed_log(client, tmp_path)
     response = client.get(

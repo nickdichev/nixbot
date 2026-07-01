@@ -111,7 +111,9 @@ For each repository you want to build:
   excerpts and a working Re-run button) on commits and pull requests
 - **Access Control**:
   - Admins: Configured users can reload projects and manage builds
-  - Organization members: Can restart their own builds
+  - Repo writers: Users with write access to the repo can restart/cancel its
+    builds
+  - PR authors: Can restart/cancel the builds of their own pull request
 
 ## Troubleshooting
 

@@ -45,6 +45,8 @@
       {% endif %}
       {% if waiting %}
         <p class="muted">waiting for the build to start…</p>
+      {% elif unavailable %}
+        <p class="muted">no log available for this attribute ({{ attr_status }})</p>
       {% elif not content and not live %}
         <p class="muted">no output — everything was already built</p>
       {% else %}

@@ -119,8 +119,9 @@ For each repository you want to build:
   requests
 - **Access Control**:
   - Admins: Configured users can reload projects and manage builds
-  - Organization members: Can restart their own builds (when OAuth is
-    configured)
+  - Repo writers: Users with write access to the repo can restart/cancel its
+    builds (when OAuth is configured)
+  - PR authors: Can restart/cancel the builds of their own pull request
 - **Repository Access**: Can use either HTTPS (with token) or SSH authentication
   for cloning private repositories
 
