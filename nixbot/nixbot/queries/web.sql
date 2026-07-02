@@ -109,7 +109,7 @@ ORDER BY CASE
 END, a.attr;
 
 -- name: WebEffects :many
-SELECT * FROM build_effects WHERE build_id = $1 ORDER BY name;
+SELECT * FROM build_effects WHERE build_id = $1 ORDER BY id, name;
 
 -- name: WebAttributeCounts :many
 SELECT status, count(*) AS count FROM build_attributes
@@ -158,7 +158,8 @@ ORDER BY b.status = 'pending', b.id;
 
 -- name: EffectLogPath :one
 SELECT log_path AS path FROM build_effects
-WHERE build_id = $1 AND name = $2 AND log_path IS NOT NULL;
+WHERE build_id = $1 AND name = $2 AND log_path IS NOT NULL
+ORDER BY id DESC LIMIT 1;
 
 -- name: AttributeLogPath :one
 SELECT l.path FROM logs l

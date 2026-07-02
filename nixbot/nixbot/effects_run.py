@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from .db import BuildRecord
+    from .db_gen.models import BuildEffectRun
     from .events import ChangeEvent, RepoInfo
     from .gitrepo import FetchCredentials
     from .orchestrator import Orchestrator
@@ -67,20 +68,18 @@ async def maybe_run_effects(
         is_pull_request=event.pr_number is not None,
     ):
         return
-    # The started-flag guards against auto-re-running effects on crash
-    # recovery (deploys are not idempotent). Record the triggering ref:
-    # effect items carry only build_id and must report on this commit,
-    # not the build's stored commit_sha (a reused PR head).
-    if (
-        await builds_q.mark_effects_started(
-            o.pool,
-            id_=build.id,
-            commit_sha=event.commit_sha,
-            branch=event.branch,
-            pr_number=event.pr_number,
-        )
-        is None
-    ):
+    # The run row guards against auto-re-running effects for the same
+    # triggering ref. A reused build may still need another run for a
+    # different branch, e.g. production after main.
+    run_id = await builds_q.start_effect_run(
+        o.pool,
+        build_id=build.id,
+        commit_sha=event.commit_sha,
+        branch=event.branch,
+        pr_number=event.pr_number,
+    )
+    if run_id is None:
+        await _replay_effect_statuses(o, event, build)
         return
     task_token = o.task_tokens.issue(build.project_id)
     ctx = effects_context(
@@ -103,26 +102,33 @@ async def maybe_run_effects(
         o.task_tokens.revoke(task_token)
     # Effects removed from the flake since the last run would
     # otherwise linger as stale pending rows.
-    await q.drop_removed_effects(o.pool, build_id=build.id, names=names)
-    await _enqueue_effects(o, event, build, names)
+    await q.drop_removed_effects(o.pool, run_id=run_id, names=names)
+    await _enqueue_effects(o, event, build, run_id, names)
 
 
 async def _enqueue_effects(
-    o: Orchestrator, event: ChangeEvent, build: BuildRecord, names: list[str]
+    o: Orchestrator,
+    event: ChangeEvent,
+    build: BuildRecord,
+    run_id: int,
+    names: list[str],
 ) -> None:
-    """One queue item per effect, on the build's dedup key."""
+    """One queue item per effect, on the effect run's dedup key."""
     # Effect names are repo-controlled; a duplicate inside one batch
     # would make ON CONFLICT DO UPDATE fail with "cannot affect row a
     # second time".
     names = list(dict.fromkeys(names))
     if not names:
         return
-    await builds_q.start_pending_effects(o.pool, build_id=build.id, names=names)
+    await builds_q.start_pending_effects(
+        o.pool, build_id=build.id, run_id=run_id, names=names
+    )
     await o.reporter.effects_started(event, build, len(names))
     await wq.enqueue_effect_items(
         o.pool,
-        dedup_key=f"build-{build.id}",
+        dedup_key=f"effect-run-{run_id}",
         build_id=build.id,
+        run_id=run_id,
         names=names,
     )
 
@@ -132,10 +138,11 @@ async def run_effect_item(
     info: RepoInfo,
     build: BuildRecord,
     name: str,
+    run_id: int | None = None,
     credentials: FetchCredentials | None = None,
 ) -> None:
     """Dispatcher entry for one queued effect."""
-    row = await q.effect_status(o.pool, build_id=build.id, name=name)
+    row = await q.effect_status(o.pool, build_id=build.id, run_id=run_id, name=name)
     if row != "pending":
         # Swept after a crash mid-run, or already terminal; started
         # effects never auto-re-run (deploys are not idempotent).
@@ -144,11 +151,14 @@ async def run_effect_item(
         worktree_event,
         worktree_path,
     ):
-        # rerun_worktree rebuilds the event from the build's stored
-        # commit (the right tree to check out), but effects report on
-        # the commit that triggered them (e.g. the default-branch merge
-        # that reused a PR build), recorded at mark_effects_started.
-        event = _effects_event(build, worktree_event)
+        effect_run = (
+            await builds_q.get_effect_run(o.pool, id_=run_id)
+            if run_id is not None
+            else None
+        )
+        if run_id is not None and effect_run is None:
+            return
+        event = _effects_event(effect_run, build, worktree_event)
         task_token = o.task_tokens.issue(build.project_id)
         try:
             ctx = effects_context(
@@ -160,15 +170,24 @@ async def run_effect_item(
                 git_token=credentials.token if credentials is not None else None,
                 task_token=task_token,
             )
-            await _run_one_effect(o, event, ctx, build, name)
-            await _maybe_post_effects_summary(o, event, build)
+            await _run_one_effect(o, event, ctx, build, run_id, name)
+            await _maybe_post_effects_summary(o, event, build, run_id)
         finally:
             o.task_tokens.revoke(task_token)
 
 
-def _effects_event(build: BuildRecord, fallback: ChangeEvent) -> ChangeEvent:
+def _effects_event(
+    effect_run: BuildEffectRun | None, build: BuildRecord, fallback: ChangeEvent
+) -> ChangeEvent:
     """The ref that triggered the effects run, recorded on the build;
     pre-0018 builds have no record and fall back to the build commit."""
+    if effect_run is not None:
+        return replace(
+            fallback,
+            commit_sha=effect_run.commit_sha,
+            branch=effect_run.branch,
+            pr_number=effect_run.pr_number or None,
+        )
     if build.effects_commit_sha is None:
         return fallback
     return replace(
@@ -180,11 +199,16 @@ def _effects_event(build: BuildRecord, fallback: ChangeEvent) -> ChangeEvent:
 
 
 async def _maybe_post_effects_summary(
-    o: Orchestrator, event: ChangeEvent, build: BuildRecord
+    o: Orchestrator, event: ChangeEvent, build: BuildRecord, run_id: int | None
 ) -> None:
     """Post the aggregate status once all effects settle; the items run
     independently, so the last to finish reports it."""
-    statuses = [e.status for e in await web_q.web_effects(o.pool, build_id=build.id)]
+    rows = (
+        await builds_q.effects_for_run(o.pool, run_id=run_id)
+        if run_id is not None
+        else await web_q.web_effects(o.pool, build_id=build.id)
+    )
+    statuses = [e.status for e in rows]
     if any(s in ("pending", "running") for s in statuses):
         return
     await o.reporter.effects_finished(
@@ -195,16 +219,55 @@ async def _maybe_post_effects_summary(
     )
 
 
+async def _replay_effect_statuses(
+    o: Orchestrator, event: ChangeEvent, build: BuildRecord
+) -> None:
+    """Re-post finished effect statuses for a duplicate delivery of a
+    context that already ran effects."""
+    run_id = await builds_q.effect_run_by_context(
+        o.pool,
+        build_id=build.id,
+        branch=event.branch,
+        pr_number=event.pr_number,
+    )
+    if run_id is None:
+        return
+    effects = [
+        e
+        for e in await builds_q.effects_for_run(o.pool, run_id=run_id)
+        if e.status in ("succeeded", "failed")
+    ]
+    if not effects:
+        return
+    for effect in effects:
+        await o.reporter.effect_finished(
+            event,
+            build,
+            effect.name,
+            success=effect.status == "succeeded",
+            error=effect.error,
+        )
+    await o.reporter.effects_finished(
+        event,
+        build,
+        failed=sum(1 for e in effects if e.status != "succeeded"),
+        succeeded=sum(1 for e in effects if e.status == "succeeded"),
+    )
+
+
 async def _run_one_effect(
     o: Orchestrator,
     event: ChangeEvent,
     ctx: EffectsContext,
     build: BuildRecord,
+    run_id: int | None,
     name: str,
 ) -> None:
     """One effect with its own row and log."""
     # A rerun resets the existing effect row.
-    await builds_q.start_effect(o.pool, build_id=build.id, name=name, status="running")
+    await builds_q.start_effect(
+        o.pool, build_id=build.id, run_id=run_id, name=name, status="running"
+    )
     # A green commit status on a failed deploy hides the failure; report
     # per-effect status so the forge reflects the real outcome.
     await o.reporter.effect_started(event, build, name)
@@ -212,9 +275,13 @@ async def _run_one_effect(
     # the log file cannot escape the log directory. The "effects/"
     # subdirectory keeps them apart from attribute logs (a flat
     # prefix would collide with an attribute named "effect-X").
-    async with o.open_log(
-        build.id, f"effect:{name}", f"effects/{quote(name, safe='')}.zst"
-    ) as writer:
+    log_key = f"effect:{name}" if run_id is None else f"effect:{run_id}:{name}"
+    log_file = (
+        f"effects/{quote(name, safe='')}.zst"
+        if run_id is None
+        else f"effects/{run_id}/{quote(name, safe='')}.zst"
+    )
+    async with o.open_log(build.id, log_key, log_file) as writer:
         try:
             success = await run_effect(ctx, name, writer.write)
         except Exception as e:
@@ -234,6 +301,7 @@ async def _run_one_effect(
     await builds_q.finish_effect(
         o.pool,
         build_id=build.id,
+        run_id=run_id,
         name=name,
         status="succeeded" if success else "failed",
         error=error,

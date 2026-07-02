@@ -129,9 +129,33 @@ following table illustrates the supported options.
 | :----------------------- | :------------------------- | :---------- | :-------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | lock file                | `lock_file`                | `str`       | dictates which lock file `nixbot` will use when evaluating your flake | `flake.lock` | have multiple lockfiles, one for `nixpkgs-stable`, one for `nixpkgs-unstable` or by default pin an input to a private repo, but have a lockfile with that private repo replaced by a public repo for CI |
 | attribute                | `attribute`                | `str`       | which attribute in the flake to evaluate and build                    | `checks`     | using a different attribute, like `hydraJobs`                                                                                                                                                           |
+| attribute branches       | `attribute_branches`       | `list`      | branch/event-specific overrides for the evaluated attribute           | `[]`         | evaluate `packages` for `main` or `release-*` push events                                                                                                                                               |
 | flake_dir                | `flake_dir`                | `str`       | which directory the flake is located                                  | `.`          | using a different flake, like `./tests`                                                                                                                                                                 |
 | effects on pull requests | `effects_on_pull_requests` | `bool`      | run hercules-ci effects on pull requests                              | `false`      | set to `true` to run effects on PRs                                                                                                                                                                     |
 | effects branches         | `effects_branches`         | `list[str]` | glob patterns for additional branches that run effects                | `[]`         | `["staging", "release/*"]`                                                                                                                                                                              |
+
+`attribute_branches` entries are applied in order and override only the
+top-level flake attribute:
+
+```toml
+attribute = "checks"
+
+[[attribute_branches]]
+match = "main"
+attribute = "packages"
+events = ["push"]
+
+[[attribute_branches]]
+match = "release-*"
+attribute = "packages"
+events = ["push"]
+```
+
+Each entry has `match` (a branch glob), `attribute`, and optional `events`
+(`"push"` and/or `"pull_request"`, defaulting to both). Pull request events
+currently match against the target/base branch stored on the event, not the PR
+source branch. Use `events = ["push"]` for main/release package builds unless
+you intentionally want PRs targeting those branches to evaluate that attribute.
 
 By default, effects only run on the default branch. The `effects_branches` and
 `effects_on_pull_requests` settings are always read from the **default

@@ -9,12 +9,13 @@ DO NOTHING
 RETURNING id;
 
 -- name: EnqueueEffectItems :exec
--- One queue item per effect, all on the build's dedup key; the
+-- One queue item per effect, all on the effect-run dedup key; the
 -- jsonb payloads are built server-side so their canonical text form
 -- matches what the dedup index hashes.
 INSERT INTO work_queue (kind, dedup_key, payload)
 SELECT 'effect', sqlc.arg(dedup_key)::text,
        jsonb_build_object('build_id', sqlc.arg(build_id)::bigint,
+                          'run_id', sqlc.arg(run_id)::bigint,
                           'name', u.name)
 FROM unnest(sqlc.arg(names)::text[]) AS u(name)
 ON CONFLICT (kind, dedup_key, md5(payload::text))

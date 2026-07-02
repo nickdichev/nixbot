@@ -44,6 +44,7 @@ from .events import (
 )
 from .executor import LogWriter
 from .gitrepo import MergeConflictError, pr_refspec
+from .repo_config import BranchConfig
 from .web.logs import LogRegistry
 from .work_queue import WorkQueue
 
@@ -65,7 +66,6 @@ if TYPE_CHECKING:
         JobBatchCallback,
         StderrLineCallback,
     )
-    from .repo_config import BranchConfig
 
     GcrootRegistrar = Callable[[Path, str, str, str], Awaitable[None]]
     OutputWriter = Callable[[Path, str, str, str, str, str, str], Path]
@@ -187,12 +187,16 @@ class Orchestrator:
 
         try:
             tree_hash = await worktree.tree_hash()
+            branch_config = BranchConfig.load(worktree.path).resolve_for_event(
+                event.branch, event.pr_number is not None
+            )
             build, created = await db.get_or_create_build(
                 self.pool,
                 repo.id,
                 tree_hash,
                 event.commit_sha,
                 event.branch,
+                eval_key=branch_config.eval_key,
                 pr_number=event.pr_number,
                 pr_author=event.pr_author,
             )
@@ -201,6 +205,7 @@ class Orchestrator:
                 build,
                 created=created,
                 tree_hash=tree_hash,
+                branch_config=branch_config,
                 worktree_path=worktree.path,
                 credentials=credentials,
             )
@@ -215,6 +220,7 @@ class Orchestrator:
         *,
         created: bool,
         tree_hash: str,
+        branch_config: BranchConfig,
         worktree_path: Path,
         credentials: FetchCredentials | None,
     ) -> None:
@@ -264,7 +270,7 @@ class Orchestrator:
             repo.id,
             key,
             build.id,
-            tree_hash,
+            f"{tree_hash}:{build.eval_key}",
             event.commit_sha,
             cancel_event,
             incoming_is_ancestor_of_running=incoming_stale,
@@ -277,14 +283,21 @@ class Orchestrator:
                 await self.reporter.build_finished(
                     event,
                     build,
-                    BuildResult(BuildStatus.CANCELLED, build.status_generation, []),
+                    BuildResult(
+                        BuildStatus.CANCELLED,
+                        build.status_generation,
+                        [],
+                        attr_prefix=branch_config.attribute,
+                    ),
                 )
             return
         if not rebuild:
             await build_reuse.attach_linked_event(self, event, build)
             return
         try:
-            await self.run_build(event, build, worktree_path, credentials)
+            await self.run_build(
+                event, build, worktree_path, credentials, branch_config=branch_config
+            )
         finally:
             self.canceller.complete(build.id)
             self.cancel_events.pop(build.id, None)
@@ -296,10 +309,17 @@ class Orchestrator:
         build: BuildRecord,
         worktree_path: Path,
         credentials: FetchCredentials | None = None,
+        branch_config: BranchConfig | None = None,
     ) -> None:
         """Evaluate and build; every attribute completion is one
         transactional DB write, then the result is re-aggregated."""
-        await build_run.run_build(self, event, build, worktree_path, credentials)
+        if branch_config is None:
+            branch_config = BranchConfig.load(worktree_path).resolve_for_event(
+                event.branch, event.pr_number is not None
+            )
+        await build_run.run_build(
+            self, event, build, worktree_path, branch_config, credentials
+        )
 
     async def refresh_schedules(self, event: ChangeEvent) -> None:
         """Queue `onSchedule` re-discovery after a successful
@@ -364,10 +384,11 @@ class Orchestrator:
         info: RepoInfo,
         build: BuildRecord,
         name: str,
+        run_id: int | None = None,
         credentials: FetchCredentials | None = None,
     ) -> None:
         """Dispatcher entry for one queued effect."""
-        await effects_run.run_effect_item(self, info, build, name, credentials)
+        await effects_run.run_effect_item(self, info, build, name, run_id, credentials)
 
     @asynccontextmanager
     async def open_log(

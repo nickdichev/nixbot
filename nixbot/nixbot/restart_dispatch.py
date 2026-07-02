@@ -16,6 +16,7 @@ from .db_gen import builds as builds_q
 from .db_gen import maintenance as q
 from .events import BuildResult, ChangeEvent
 from .recovery import check_store_paths, find_unfinished_builds
+from .repo_config import eval_attribute_from_key
 from .repos import repo_info
 
 if TYPE_CHECKING:
@@ -171,5 +172,12 @@ async def _report_interrupted(s: CIService, resumable: ResumableBuild) -> None:
         event, build, success=False, warnings=[]
     )
     await s.orchestrator.reporter.build_finished(
-        event, build, BuildResult(BuildStatus.FAILED, build.status_generation, [])
+        event,
+        build,
+        BuildResult(
+            BuildStatus.FAILED,
+            build.status_generation,
+            [],
+            attr_prefix=eval_attribute_from_key(build.eval_key),
+        ),
     )

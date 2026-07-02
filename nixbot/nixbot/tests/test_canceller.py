@@ -69,6 +69,15 @@ def test_duplicate_same_tree_not_cancelled() -> None:
     assert not old_event.is_set()
 
 
+def test_same_tree_different_eval_identity_supersedes() -> None:
+    mgr = CancellationManager()
+    _, old_event = reg(mgr, 1, "tree1:checks", "sha1")
+    outcome, new_event = reg(mgr, 2, "tree1:packages", "sha2")
+    assert outcome == RegisterOutcome.NEW
+    assert old_event.is_set()
+    assert not new_event.is_set()
+
+
 def test_same_commit_different_tree_supersedes() -> None:
     # Same PR head merged against an advanced base yields a new tree:
     # a new build that must be tracked, not a duplicate.

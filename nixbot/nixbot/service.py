@@ -34,6 +34,7 @@ from .recovery import (
     find_unfinished_builds,
     settle_already_built,
 )
+from .repo_config import eval_attribute_from_key
 from .repos import repo_info
 from .schedules import DueEffect, ScheduledEffectsStore
 from .webhooks import (
@@ -428,7 +429,9 @@ class CIService:
         elif item.kind == "effects":
             await restart_dispatch.restart_effects(self, payload["build_id"])
         elif item.kind == "effect":
-            await self._run_effect_item(payload["build_id"], payload["name"])
+            await self._run_effect_item(
+                payload["build_id"], payload["name"], payload.get("run_id")
+            )
         elif item.kind == "report":
             await self._re_report(
                 payload["build_id"],
@@ -491,6 +494,7 @@ class CIService:
                     build.status_generation,
                     [],
                     attr_statuses={row.attr: row.status for row in rows},
+                    attr_prefix=eval_attribute_from_key(build.eval_key),
                 ),
             )
         except Exception as e:
@@ -502,7 +506,9 @@ class CIService:
                 )
             raise
 
-    async def _run_effect_item(self, build_id: int, name: str) -> None:
+    async def _run_effect_item(
+        self, build_id: int, name: str, run_id: int | None = None
+    ) -> None:
         build = await builds_q.get_build(self.orchestrator.pool, id_=build_id)
         if build is None:
             return
@@ -512,13 +518,16 @@ class CIService:
         info = repo_info(project)
         credentials = await self.credentials_provider(info.forge).get(info.clone_url)
         try:
-            await self.orchestrator.run_effect_item(info, build, name, credentials)
+            await self.orchestrator.run_effect_item(
+                info, build, name, run_id, credentials
+            )
         except Exception as e:
             # Setup failures (fetch/checkout) happen before the
             # runner settles the row.
             await builds_q.finish_effect(
                 self.pool,
                 build_id=build_id,
+                run_id=run_id,
                 name=name,
                 status="failed",
                 error=str(e) or type(e).__name__,
@@ -598,7 +607,14 @@ class CIService:
             pr_number=build.pr_number,
         )
         await self.orchestrator.reporter.build_finished(
-            change, build, BuildResult(status, generation, [])
+            change,
+            build,
+            BuildResult(
+                status,
+                generation,
+                [],
+                attr_prefix=eval_attribute_from_key(build.eval_key),
+            ),
         )
 
     # -- background loops ---------------------------------------------------

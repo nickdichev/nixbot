@@ -178,6 +178,7 @@ class WebQueueRow:
     effects_commit_sha: str | None
     effects_branch: str | None
     effects_pr_number: int | None
+    eval_key: str
     owner: str
     project_name: str
     forge: str
@@ -207,6 +208,7 @@ class WebRecentBuildsRow:
     effects_commit_sha: str | None
     effects_branch: str | None
     effects_pr_number: int | None
+    eval_key: str
     owner: str
     project_name: str
     forge: str
@@ -252,6 +254,7 @@ SELECT status FROM build_attributes WHERE build_id = $1 AND attr = $2
 EFFECT_LOG_PATH: typing.Final[str] = """-- name: EffectLogPath :one
 SELECT log_path AS path FROM build_effects
 WHERE build_id = $1 AND name = $2 AND log_path IS NOT NULL
+ORDER BY id DESC LIMIT 1
 """
 
 METRICS_ATTRIBUTE_COUNTS: typing.Final[str] = """-- name: MetricsAttributeCounts :many
@@ -328,11 +331,11 @@ END, a.attr
 """
 
 WEB_BUILD_BY_NUMBER: typing.Final[str] = """-- name: WebBuildByNumber :one
-SELECT id, project_id, number, tree_hash, commit_sha, branch, pr_number, pr_author, status, status_generation, effects_started, error, created_at, started_at, finished_at, eval_warnings, eval_completed, effects_commit_sha, effects_branch, effects_pr_number FROM builds WHERE project_id = $1 AND number = $2
+SELECT id, project_id, number, tree_hash, commit_sha, branch, pr_number, pr_author, status, status_generation, effects_started, error, created_at, started_at, finished_at, eval_warnings, eval_completed, effects_commit_sha, effects_branch, effects_pr_number, eval_key FROM builds WHERE project_id = $1 AND number = $2
 """
 
 WEB_BUILDS_FOR_REPO: typing.Final[str] = """-- name: WebBuildsForRepo :many
-SELECT id, project_id, number, tree_hash, commit_sha, branch, pr_number, pr_author, status, status_generation, effects_started, error, created_at, started_at, finished_at, eval_warnings, eval_completed, effects_commit_sha, effects_branch, effects_pr_number FROM builds
+SELECT id, project_id, number, tree_hash, commit_sha, branch, pr_number, pr_author, status, status_generation, effects_started, error, created_at, started_at, finished_at, eval_warnings, eval_completed, effects_commit_sha, effects_branch, effects_pr_number, eval_key FROM builds
 WHERE project_id = $1
   AND ($2::text IS NULL OR status = $2)
   AND ($3::text IS NULL OR branch = $3)
@@ -344,7 +347,7 @@ ORDER BY number DESC LIMIT $8 OFFSET $7
 """
 
 WEB_EFFECTS: typing.Final[str] = """-- name: WebEffects :many
-SELECT id, build_id, name, status, error, log_path, log_size, log_truncated, started_at, finished_at FROM build_effects WHERE build_id = $1 ORDER BY name
+SELECT id, build_id, name, status, error, log_path, log_size, log_truncated, started_at, finished_at, run_id FROM build_effects WHERE build_id = $1 ORDER BY id, name
 """
 
 WEB_NEIGHBOR_NUMBERS: typing.Final[str] = """-- name: WebNeighborNumbers :one
@@ -362,7 +365,7 @@ ORDER BY owner, name
 """
 
 WEB_QUEUE: typing.Final[str] = """-- name: WebQueue :many
-SELECT b.id, b.project_id, b.number, b.tree_hash, b.commit_sha, b.branch, b.pr_number, b.pr_author, b.status, b.status_generation, b.effects_started, b.error, b.created_at, b.started_at, b.finished_at, b.eval_warnings, b.eval_completed, b.effects_commit_sha, b.effects_branch, b.effects_pr_number, p.owner, p.name AS project_name, p.forge, p.url,
+SELECT b.id, b.project_id, b.number, b.tree_hash, b.commit_sha, b.branch, b.pr_number, b.pr_author, b.status, b.status_generation, b.effects_started, b.error, b.created_at, b.started_at, b.finished_at, b.eval_warnings, b.eval_completed, b.effects_commit_sha, b.effects_branch, b.effects_pr_number, b.eval_key, p.owner, p.name AS project_name, p.forge, p.url,
        q.queue_position
 FROM builds b
 JOIN projects p ON p.id = b.project_id
@@ -376,7 +379,7 @@ ORDER BY b.status = 'pending', b.id
 """
 
 WEB_RECENT_BUILDS: typing.Final[str] = """-- name: WebRecentBuilds :many
-SELECT b.id, b.project_id, b.number, b.tree_hash, b.commit_sha, b.branch, b.pr_number, b.pr_author, b.status, b.status_generation, b.effects_started, b.error, b.created_at, b.started_at, b.finished_at, b.eval_warnings, b.eval_completed, b.effects_commit_sha, b.effects_branch, b.effects_pr_number, p.owner, p.name AS project_name, p.forge, p.url
+SELECT b.id, b.project_id, b.number, b.tree_hash, b.commit_sha, b.branch, b.pr_number, b.pr_author, b.status, b.status_generation, b.effects_started, b.error, b.created_at, b.started_at, b.finished_at, b.eval_warnings, b.eval_completed, b.effects_commit_sha, b.effects_branch, b.effects_pr_number, b.eval_key, p.owner, p.name AS project_name, p.forge, p.url
 FROM builds b JOIN projects p ON p.id = b.project_id
 WHERE ($1::bigint[] IS NULL OR b.project_id = ANY($1))
   AND ($2::bigint IS NULL OR b.id < $2)
@@ -400,7 +403,7 @@ SELECT p.id, p.forge, p.forge_repo_id, p.owner, p.name, p.default_branch, p.url,
        h.history, m.median_secs, m.pass_rate
 FROM projects p
 LEFT JOIN LATERAL (
-    SELECT id, project_id, number, tree_hash, commit_sha, branch, pr_number, pr_author, status, status_generation, effects_started, error, created_at, started_at, finished_at, eval_warnings, eval_completed, effects_commit_sha, effects_branch, effects_pr_number FROM builds b WHERE b.project_id = p.id
+    SELECT id, project_id, number, tree_hash, commit_sha, branch, pr_number, pr_author, status, status_generation, effects_started, error, created_at, started_at, finished_at, eval_warnings, eval_completed, effects_commit_sha, effects_branch, effects_pr_number, eval_key FROM builds b WHERE b.project_id = p.id
     ORDER BY b.number DESC LIMIT 1
 ) lb ON true
 LEFT JOIN LATERAL (
@@ -578,18 +581,18 @@ async def web_build_by_number(conn: ConnectionLike, *, project_id: int, number: 
     row = await conn.fetchrow(WEB_BUILD_BY_NUMBER, project_id, number)
     if row is None:
         return None
-    return models.Build(id=row[0], project_id=row[1], number=row[2], tree_hash=row[3], commit_sha=row[4], branch=row[5], pr_number=row[6], pr_author=row[7], status=row[8], status_generation=row[9], effects_started=row[10], error=row[11], created_at=row[12], started_at=row[13], finished_at=row[14], eval_warnings=row[15], eval_completed=row[16], effects_commit_sha=row[17], effects_branch=row[18], effects_pr_number=row[19])
+    return models.Build(id=row[0], project_id=row[1], number=row[2], tree_hash=row[3], commit_sha=row[4], branch=row[5], pr_number=row[6], pr_author=row[7], status=row[8], status_generation=row[9], effects_started=row[10], error=row[11], created_at=row[12], started_at=row[13], finished_at=row[14], eval_warnings=row[15], eval_completed=row[16], effects_commit_sha=row[17], effects_branch=row[18], effects_pr_number=row[19], eval_key=row[20])
 
 
 def web_builds_for_repo(conn: ConnectionLike, *, project_id: int, status: str | None, branch: str | None, pr_number: int | None, commit_prefix: str | None, before: int | None, offset: int, limit: int) -> QueryResults[models.Build]:
     def _decode_hook(row: asyncpg.Record) -> models.Build:
-        return models.Build(id=row[0], project_id=row[1], number=row[2], tree_hash=row[3], commit_sha=row[4], branch=row[5], pr_number=row[6], pr_author=row[7], status=row[8], status_generation=row[9], effects_started=row[10], error=row[11], created_at=row[12], started_at=row[13], finished_at=row[14], eval_warnings=row[15], eval_completed=row[16], effects_commit_sha=row[17], effects_branch=row[18], effects_pr_number=row[19])
+        return models.Build(id=row[0], project_id=row[1], number=row[2], tree_hash=row[3], commit_sha=row[4], branch=row[5], pr_number=row[6], pr_author=row[7], status=row[8], status_generation=row[9], effects_started=row[10], error=row[11], created_at=row[12], started_at=row[13], finished_at=row[14], eval_warnings=row[15], eval_completed=row[16], effects_commit_sha=row[17], effects_branch=row[18], effects_pr_number=row[19], eval_key=row[20])
     return QueryResults[models.Build](conn, WEB_BUILDS_FOR_REPO, _decode_hook, project_id, status, branch, pr_number, commit_prefix, before, offset, limit)
 
 
 def web_effects(conn: ConnectionLike, *, build_id: int) -> QueryResults[models.BuildEffect]:
     def _decode_hook(row: asyncpg.Record) -> models.BuildEffect:
-        return models.BuildEffect(id=row[0], build_id=row[1], name=row[2], status=row[3], error=row[4], log_path=row[5], log_size=row[6], log_truncated=row[7], started_at=row[8], finished_at=row[9])
+        return models.BuildEffect(id=row[0], build_id=row[1], name=row[2], status=row[3], error=row[4], log_path=row[5], log_size=row[6], log_truncated=row[7], started_at=row[8], finished_at=row[9], run_id=row[10])
     return QueryResults[models.BuildEffect](conn, WEB_EFFECTS, _decode_hook, build_id)
 
 
@@ -608,13 +611,13 @@ def web_projects(conn: ConnectionLike, *, enabled: bool | None, pattern: str | N
 
 def web_queue(conn: ConnectionLike, *, project_ids: collections.abc.Sequence[int] | None) -> QueryResults[WebQueueRow]:
     def _decode_hook(row: asyncpg.Record) -> WebQueueRow:
-        return WebQueueRow(id=row[0], project_id=row[1], number=row[2], tree_hash=row[3], commit_sha=row[4], branch=row[5], pr_number=row[6], pr_author=row[7], status=row[8], status_generation=row[9], effects_started=row[10], error=row[11], created_at=row[12], started_at=row[13], finished_at=row[14], eval_warnings=row[15], eval_completed=row[16], effects_commit_sha=row[17], effects_branch=row[18], effects_pr_number=row[19], owner=row[20], project_name=row[21], forge=row[22], url=row[23], queue_position=row[24])
+        return WebQueueRow(id=row[0], project_id=row[1], number=row[2], tree_hash=row[3], commit_sha=row[4], branch=row[5], pr_number=row[6], pr_author=row[7], status=row[8], status_generation=row[9], effects_started=row[10], error=row[11], created_at=row[12], started_at=row[13], finished_at=row[14], eval_warnings=row[15], eval_completed=row[16], effects_commit_sha=row[17], effects_branch=row[18], effects_pr_number=row[19], eval_key=row[20], owner=row[21], project_name=row[22], forge=row[23], url=row[24], queue_position=row[25])
     return QueryResults[WebQueueRow](conn, WEB_QUEUE, _decode_hook, project_ids)
 
 
 def web_recent_builds(conn: ConnectionLike, *, project_ids: collections.abc.Sequence[int] | None, before: int | None, limit_: int) -> QueryResults[WebRecentBuildsRow]:
     def _decode_hook(row: asyncpg.Record) -> WebRecentBuildsRow:
-        return WebRecentBuildsRow(id=row[0], project_id=row[1], number=row[2], tree_hash=row[3], commit_sha=row[4], branch=row[5], pr_number=row[6], pr_author=row[7], status=row[8], status_generation=row[9], effects_started=row[10], error=row[11], created_at=row[12], started_at=row[13], finished_at=row[14], eval_warnings=row[15], eval_completed=row[16], effects_commit_sha=row[17], effects_branch=row[18], effects_pr_number=row[19], owner=row[20], project_name=row[21], forge=row[22], url=row[23])
+        return WebRecentBuildsRow(id=row[0], project_id=row[1], number=row[2], tree_hash=row[3], commit_sha=row[4], branch=row[5], pr_number=row[6], pr_author=row[7], status=row[8], status_generation=row[9], effects_started=row[10], error=row[11], created_at=row[12], started_at=row[13], finished_at=row[14], eval_warnings=row[15], eval_completed=row[16], effects_commit_sha=row[17], effects_branch=row[18], effects_pr_number=row[19], eval_key=row[20], owner=row[21], project_name=row[22], forge=row[23], url=row[24])
     return QueryResults[WebRecentBuildsRow](conn, WEB_RECENT_BUILDS, _decode_hook, project_ids, before, limit_)
 
 

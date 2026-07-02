@@ -18,9 +18,9 @@ from .canceller import RegisterOutcome
 from .db import BuildStatus
 from .db_gen import builds as builds_q
 from .db_gen import maintenance as q
-from .db_gen import web as web_q
 from .events import BuildResult
 from .gitrepo import GitError, run_git
+from .repo_config import eval_attribute_from_key
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -66,35 +66,14 @@ async def replay_terminal_status(
         )
         await o.reporter.eval_finished(event, build, success=eval_success, warnings=[])
     await o.reporter.build_finished(
-        event, build, BuildResult(build.status, build.status_generation, [])
-    )
-
-
-async def replay_effect_statuses(
-    o: Orchestrator, event: ChangeEvent, build: BuildRecord
-) -> None:
-    """Re-post each finished effect's status and the aggregate summary
-    onto the reusing commit's SHA, so a failed deploy is not green."""
-    effects = [
-        e
-        for e in await web_q.web_effects(o.pool, build_id=build.id)
-        if e.status in ("succeeded", "failed")
-    ]
-    if not effects:
-        return
-    for effect in effects:
-        await o.reporter.effect_finished(
-            event,
-            build,
-            effect.name,
-            success=effect.status == "succeeded",
-            error=effect.error,
-        )
-    await o.reporter.effects_finished(
         event,
         build,
-        failed=sum(1 for e in effects if e.status != "succeeded"),
-        succeeded=sum(1 for e in effects if e.status == "succeeded"),
+        BuildResult(
+            build.status,
+            build.status_generation,
+            [],
+            attr_prefix=eval_attribute_from_key(build.eval_key),
+        ),
     )
 
 
@@ -116,7 +95,17 @@ async def finish_linked(
             # Cancel during eval: the linked contexts' nix-eval
             # status would otherwise stay pending forever.
             await o.reporter.eval_cancelled(linked, build)
-        await o.reporter.build_finished(linked, build, result)
+        await o.reporter.build_finished(
+            linked,
+            build,
+            BuildResult(
+                result.status,
+                result.generation,
+                result.results,
+                attr_statuses=result.attr_statuses,
+                attr_prefix=eval_attribute_from_key(build.eval_key),
+            ),
+        )
 
 
 async def is_ancestor(
@@ -156,7 +145,7 @@ async def reuse_terminal_build(  # noqa: PLR0913
         event.repo.id,
         key,
         build.id,
-        tree_hash,
+        f"{tree_hash}:{build.eval_key}",
         event.commit_sha,
         asyncio.Event(),
         incoming_is_ancestor_of_running=incoming_stale,
@@ -171,14 +160,7 @@ async def reuse_terminal_build(  # noqa: PLR0913
         # failure must not strand this context without a status.
         try:
             await _post_process_existing(o, event, build)
-            if build.effects_started:
-                # Effects already ran and will not re-run; replay their
-                # statuses so the reusing commit is not left blank.
-                await replay_effect_statuses(o, event, build)
-            else:
-                # A build that never started effects (e.g. a PR build)
-                # must still deploy when a default-branch push reuses it.
-                await o.maybe_run_effects(event, build, worktree_path, credentials)
+            await o.maybe_run_effects(event, build, worktree_path, credentials)
             await o.refresh_schedules(event)
         except Exception:
             logger.exception(

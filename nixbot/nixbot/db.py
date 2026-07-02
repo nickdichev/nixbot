@@ -7,8 +7,10 @@ queries/builds.sql; `sqlc generate` produces db_gen/builds.py.
 Key invariants:
 
 - build identity is the post-merge tree hash: a second change event
-  producing the same tree for the same project reuses the existing
-  build instead of creating a new one,
+  plus the selected evaluation key: a second change event producing
+  the same tree and evaluating the same flake attribute selection for
+  the same project reuses the existing build instead of creating a new
+  one,
 - attribute completion is one transactional write (status + log
   metadata together),
 - re-aggregation of a build's result is serialized per build via a row
@@ -23,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from .db_gen import builds as q
 from .models import CacheStatus, NixEvalJobSuccess
+from .repo_config import DEFAULT_EVAL_KEY
 from .sql_util import expect
 
 if TYPE_CHECKING:
@@ -58,14 +61,15 @@ async def get_or_create_build(  # noqa: PLR0913
     tree_hash: str,
     commit_sha: str,
     branch: str,
+    eval_key: str = DEFAULT_EVAL_KEY,
     pr_number: int | None = None,
     pr_author: str | None = None,
 ) -> tuple[BuildRecord, bool]:
-    """Reuse keyed on post-merge tree hash across contexts."""
+    """Reuse keyed on post-merge tree hash plus eval selection."""
     async with pool.acquire() as conn, conn.transaction():
-        await q.lock_build_identity(conn, key=f"{project_id}:{tree_hash}")
+        await q.lock_build_identity(conn, key=f"{project_id}:{tree_hash}:{eval_key}")
         row = await q.find_reusable_build(
-            conn, project_id=project_id, tree_hash=tree_hash
+            conn, project_id=project_id, tree_hash=tree_hash, eval_key=eval_key
         )
         if row is not None:
             if pr_number != row.pr_number:
@@ -94,6 +98,7 @@ async def get_or_create_build(  # noqa: PLR0913
             conn,
             project_id=project_id,
             tree_hash=tree_hash,
+            eval_key=eval_key,
             commit_sha=commit_sha,
             branch=branch,
             pr_number=pr_number,

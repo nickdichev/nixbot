@@ -31,6 +31,7 @@ from nixbot.models import CacheStatus
 from nixbot.nix_eval import EvalError, EvalResult, EvalSettings
 from nixbot.orchestrator import AttributeExecutor, EvalRunnerLike, Orchestrator
 from nixbot.recovery import fail_interrupted_effects
+from nixbot.repo_config import BranchConfig
 from nixbot.work_queue import WorkQueue
 
 from .support import FakeCache, attribute_statuses, git, insert_project, mk_job
@@ -61,6 +62,7 @@ class FakeEvalRunner:
     warnings: list[str] = field(default_factory=list)
     calls: int = 0
     last_settings: EvalSettings | None = None
+    branch_configs: list[object] = field(default_factory=list)
     block: asyncio.Event | None = None
     started: asyncio.Event = field(default_factory=asyncio.Event)
     # Raised after blocking (and optional streaming): simulates eval
@@ -79,6 +81,7 @@ class FakeEvalRunner:
         on_stderr_line: object = None,
     ) -> EvalResult:
         self.calls += 1
+        self.branch_configs.append(branch_config)
         self.started.set()
         self.last_settings = settings
         settings.gc_roots_dir.mkdir(parents=True, exist_ok=True)
@@ -143,7 +146,9 @@ class RecordingReporter:
     async def build_finished(
         self, event: ChangeEvent, build: BuildRecord, result: BuildResult
     ) -> None:
-        self.events.append(("finished", build.id, result.status, result.generation))
+        self.events.append(
+            ("finished", build.id, result.status, result.generation, result.attr_prefix)
+        )
 
     async def effect_started(
         self, event: ChangeEvent, build: BuildRecord, name: str
@@ -338,7 +343,9 @@ async def drain_effect_items(
                 orchestrator.pool, id_=item.payload["build_id"]
             )
             assert build is not None
-            await orchestrator.run_effect_item(info, build, item.payload["name"])
+            await orchestrator.run_effect_item(
+                info, build, item.payload["name"], item.payload.get("run_id")
+            )
         await queue.finish(item.id)
 
 
@@ -346,6 +353,27 @@ def add_commit(upstream: Path, name: str) -> str:
     (upstream / name).write_text("x")
     git(upstream, "add", ".")
     git(upstream, "commit", "-m", name)
+    return git(upstream, "rev-parse", "HEAD")
+
+
+def add_attribute_branch_config(upstream: Path) -> str:
+    (upstream / "nixbot.toml").write_text(
+        """
+        attribute = "checks"
+
+        [[attribute_branches]]
+        match = "main"
+        attribute = "packages"
+        events = ["push"]
+
+        [[attribute_branches]]
+        match = "release-*"
+        attribute = "packages"
+        events = ["push"]
+        """
+    )
+    git(upstream, "add", ".")
+    git(upstream, "commit", "-m", "attribute branch config")
     return git(upstream, "rev-parse", "HEAD")
 
 
@@ -418,6 +446,63 @@ async def test_tree_hash_reuse(run_event: EventRunner, upstream: Path) -> None:
     assert eval_runner.calls == 1
     # The eval context must not stay pending on the second commit.
     assert [e[0] for e in reporter2.events] == ["eval", "finished"]
+
+
+async def test_attribute_branch_selection_separates_pr_and_push(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    sha = add_attribute_branch_config(upstream)
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    orchestrator, reporter, project = await make_env(
+        eval_runner, FakeExecutor(), "attr-select"
+    )
+
+    pr_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=7)
+    )
+    main_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+
+    assert pr_build is not None
+    assert main_build is not None
+    assert pr_build.id != main_build.id
+    assert [c.attribute for c in eval_runner.branch_configs] == [
+        "checks",
+        "packages",
+    ]
+    rows = await pool.fetch(
+        "SELECT id, eval_key FROM builds WHERE id = ANY($1::bigint[]) ORDER BY id",
+        [pr_build.id, main_build.id],
+    )
+    assert rows[0]["eval_key"] != rows[1]["eval_key"]
+    finished = [e for e in reporter.events if e[0] == "finished"]
+    assert [e[4] for e in finished] == ["checks", "packages"]
+
+
+async def test_terminal_reuse_preserves_packages_status_prefix(
+    make_env: EnvFactory, upstream: Path
+) -> None:
+    sha = add_attribute_branch_config(upstream)
+    eval_runner = FakeEvalRunner([mk_job("pkg")])
+    orchestrator, reporter, project = await make_env(
+        eval_runner, FakeExecutor(), "pkg-replay"
+    )
+
+    build1 = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+    reporter.events.clear()
+    build2 = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+
+    assert build1 is not None
+    assert build2 is not None
+    assert build2.id == build1.id
+    assert eval_runner.calls == 1
+    finished = [e for e in reporter.events if e[0] == "finished"]
+    assert finished[-1][4] == "packages"
 
 
 type TreeRebuildRunner = Callable[..., Awaitable[BuildRecord]]
@@ -493,6 +578,65 @@ async def test_eval_reuse_skipped_when_drvs_gone(
     )
     assert eval_runner.calls == 2  # re-evaluated
     assert await build_status(pool, build2.id) == BuildStatus.SUCCEEDED
+
+
+async def test_eval_reuse_does_not_cross_selected_attribute(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    sha = add_attribute_branch_config(upstream)
+    eval_runner = FakeEvalRunner([mk_job("check-job")])
+    orchestrator, _, project = await make_env(
+        eval_runner, FakeExecutor(), "eval-key-cross"
+    )
+    check_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=7)
+    )
+    assert check_build is not None
+    assert eval_runner.calls == 1
+    await pool.execute(
+        "UPDATE builds SET status = 'cancelled' WHERE id = $1", check_build.id
+    )
+
+    eval_runner.jobs = [mk_job("package-job")]
+    package_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+
+    assert package_build is not None
+    assert package_build.id != check_build.id
+    assert eval_runner.calls == 2
+    assert await attribute_statuses(pool, package_build.id) == {
+        "package-job": "succeeded"
+    }
+
+
+async def test_eval_reuse_keeps_same_packages_eval_key(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    sha = add_attribute_branch_config(upstream)
+    eval_runner = FakeEvalRunner([mk_job("package-job")])
+    orchestrator, _, project = await make_env(
+        eval_runner, FakeExecutor(), "eval-key-same"
+    )
+
+    async def check(paths: list[str]) -> set[str]:
+        return set(paths)
+
+    orchestrator.check_store_paths = check
+    first = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+    assert first is not None
+    await pool.execute("UPDATE builds SET status = 'cancelled' WHERE id = $1", first.id)
+
+    second = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+
+    assert second is not None
+    assert second.id != first.id
+    assert eval_runner.calls == 1
+    assert await attribute_statuses(pool, second.id) == {"package-job": "succeeded"}
 
 
 async def test_main_push_promotes_reused_pr_build(
@@ -596,24 +740,39 @@ async def test_build_reuse_clears_pr_author_in_other_context(
     assert author is None
 
 
-async def test_effects_started_flag(pool: asyncpg.Pool, tmp_path: Path) -> None:
+async def test_effect_run_guard_is_per_branch_ref(
+    pool: asyncpg.Pool, tmp_path: Path
+) -> None:
     project = await make_project(pool, name="flag")
     build, _ = await db.get_or_create_build(
         pool, project.id, "tree-flag", "sha", "main"
     )
-    assert (
-        await builds_q.mark_effects_started(
-            pool, id_=build.id, commit_sha="sha", branch="main", pr_number=None
-        )
-        is not None
+    main_run = await builds_q.start_effect_run(
+        pool, build_id=build.id, commit_sha="sha", branch="main", pr_number=None
     )
-    # Second attempt (e.g. crash recovery) must not re-run.
+    assert main_run is not None
+    # Another commit with the same tree on the same ref replays statuses
+    # rather than re-deploying.
     assert (
-        await builds_q.mark_effects_started(
-            pool, id_=build.id, commit_sha="sha", branch="main", pr_number=None
+        await builds_q.start_effect_run(
+            pool,
+            build_id=build.id,
+            commit_sha="sha2",
+            branch="main",
+            pr_number=None,
         )
         is None
     )
+    # A different branch reusing the build still gets its own deploy.
+    production_run = await builds_q.start_effect_run(
+        pool,
+        build_id=build.id,
+        commit_sha="sha",
+        branch="production",
+        pr_number=None,
+    )
+    assert production_run is not None
+    assert production_run != main_run
 
 
 async def test_aggregation_generation_monotonic(
@@ -947,6 +1106,36 @@ async def test_inflight_share_fans_out_final_status(
     assert len(finished) == 2  # one final status per context
 
 
+async def test_inflight_linked_status_uses_build_eval_prefix(
+    make_env: EnvFactory, upstream: Path
+) -> None:
+    sha = add_attribute_branch_config(upstream)
+    executor = FakeExecutor(gate=asyncio.Event())
+    orchestrator, reporter, project = await make_env(
+        FakeEvalRunner([mk_job("pkg")]),
+        executor,
+        "pkg-linked",
+    )
+    task = asyncio.create_task(
+        orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha)
+        )
+    )
+    await asyncio.wait_for(executor.started.wait(), timeout=10)
+    build2 = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+    assert executor.gate is not None
+    executor.gate.set()
+    build1 = await task
+
+    assert build1 is not None
+    assert build2 is not None
+    assert build1.id == build2.id
+    finished = [e for e in reporter.events if e[0] == "finished"]
+    assert [e[4] for e in finished] == ["packages", "packages"]
+
+
 async def test_stale_event_does_not_supersede_newer_build(
     pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
 ) -> None:
@@ -1181,6 +1370,7 @@ async def test_recovery_rerun_runs_effects(
     await pool.execute(
         "UPDATE builds SET effects_started = FALSE WHERE id = $1", build.id
     )
+    await pool.execute("DELETE FROM build_effect_runs WHERE build_id = $1", build.id)
     await pool.execute(
         "UPDATE build_attributes SET status = 'pending' WHERE build_id = $1",
         build.id,
@@ -1269,13 +1459,18 @@ async def test_effect_rows_roundtrip(pool: asyncpg.Pool, tmp_path: Path) -> None
 
     project = await make_project(pool, name="fx")
     build, _ = await db.get_or_create_build(pool, project.id, "tree-fx", "sha", "main")
+    run_id = await builds_q.start_effect_run(
+        pool, build_id=build.id, commit_sha="sha", branch="main", pr_number=None
+    )
+    assert run_id is not None
 
     await builds_q.start_effect(
-        pool, build_id=build.id, name="deploy", status="running"
+        pool, build_id=build.id, run_id=run_id, name="deploy", status="running"
     )
     await builds_q.finish_effect(
         pool,
         build_id=build.id,
+        run_id=run_id,
         name="deploy",
         status="failed",
         error="ssh: connection refused",
@@ -1291,7 +1486,7 @@ async def test_effect_rows_roundtrip(pool: asyncpg.Pool, tmp_path: Path) -> None
 
     # A rerun resets the row to running with fresh timestamps.
     await builds_q.start_effect(
-        pool, build_id=build.id, name="deploy", status="running"
+        pool, build_id=build.id, run_id=run_id, name="deploy", status="running"
     )
     effects = await builds_q.effects_for_build(pool, build_id=build.id)
     assert effects[0].status == "running"
@@ -1316,14 +1511,18 @@ async def test_effect_items_resume_only_pending(
         build.id,
     )
     await fail_interrupted_effects(pool, datetime.now(UTC) + timedelta(minutes=1))
-    await orchestrator.run_effect_item(project, build, "deploy")
+    run_id = await pool.fetchval(
+        "SELECT id FROM build_effect_runs WHERE build_id = $1", build.id
+    )
+    assert run_id is not None
+    await orchestrator.run_effect_item(project, build, "deploy", run_id)
     assert ran == ["deploy"]
     # Crash before the run: the pending row resumes.
     await pool.execute(
         "UPDATE build_effects SET status = 'pending' WHERE build_id = $1",
         build.id,
     )
-    await orchestrator.run_effect_item(project, build, "deploy")
+    await orchestrator.run_effect_item(project, build, "deploy", run_id)
     assert ran == ["deploy", "deploy"]
 
 
@@ -1583,6 +1782,65 @@ async def test_reuse_for_default_branch_push_runs_effects(
     assert effect_shas == {main_sha}
 
 
+async def test_reused_build_runs_effects_for_production_branch(
+    pool: asyncpg.Pool,
+    make_env: EnvFactory,
+    upstream: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A production push that reuses main's build must still run effects
+    for the production branch."""
+
+    (upstream / "nixbot.toml").write_text('effects_branches = ["production"]\n')
+    git(upstream, "add", ".")
+    git(upstream, "commit", "-m", "enable production effects")
+    sha = add_commit(upstream, "prod-reuse")
+    git(upstream, "branch", "-f", "production", sha)
+    ran: list[tuple[str, str]] = []
+
+    async def record_run(ctx: object, name: str, log_write: object = None) -> bool:
+        ran.append((getattr(ctx, "branch"), getattr(ctx, "rev")))
+        return True
+
+    patch_effects(monkeypatch, run_effect=record_run)
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("a")]),
+        FakeExecutor(),
+        name="prod-reuse",
+    )
+    main_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+    assert main_build is not None
+    await drain_effect_items(orchestrator, project, pool)
+    assert ran == [("main", sha)]
+
+    production_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="production", commit_sha=sha)
+    )
+    assert production_build is not None
+    assert production_build.id == main_build.id
+    await drain_effect_items(orchestrator, project, pool)
+    assert ran == [("main", sha), ("production", sha)]
+
+    duplicate = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="production", commit_sha=sha)
+    )
+    assert duplicate is not None
+    assert duplicate.id == main_build.id
+    await drain_effect_items(orchestrator, project, pool)
+    assert ran == [("main", sha), ("production", sha)]
+    rows = await pool.fetch(
+        "SELECT branch, commit_sha FROM build_effect_runs "
+        "WHERE build_id = $1 ORDER BY branch",
+        main_build.id,
+    )
+    assert [(r["branch"], r["commit_sha"]) for r in rows] == [
+        ("main", sha),
+        ("production", sha),
+    ]
+
+
 async def test_reuse_replays_effect_statuses_to_new_commit(
     pool: asyncpg.Pool,
     make_env: EnvFactory,
@@ -1655,6 +1913,7 @@ async def test_attach_to_already_terminal_build_replays_status(
             stale_record,
             created=False,
             tree_hash=build.tree_hash or "",
+            branch_config=BranchConfig(),
             worktree_path=tmp_path,
             credentials=None,
         )

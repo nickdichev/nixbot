@@ -901,17 +901,15 @@ async def test_restart_resets_effects(postgres_dsn: str, tmp_path: Path) -> None
         assert not await pool.fetchval(
             "SELECT effects_started FROM builds WHERE id = $1", build_id
         )
-        # Stale log cleared by the reset; the failed rerun
-        # (unfetchable URL) settled the row.
-        row = await pool.fetchrow(
-            "SELECT status, error, log_path FROM build_effects WHERE build_id = $1",
-            build_id,
+        # Stale rows are removed by the reset; the failed rerun
+        # (unfetchable URL) must not leave the old deploy log visible.
+        assert (
+            await pool.fetchval(
+                "SELECT count(*) FROM build_effects WHERE build_id = $1",
+                build_id,
+            )
+            == 0
         )
-        assert dict(row) == {
-            "status": "failed",
-            "error": "build did not succeed",
-            "log_path": None,
-        }
 
         # Single-attribute restart keeps the guard: a partial
         # rebuild must not re-deploy.

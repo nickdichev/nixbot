@@ -151,12 +151,16 @@ AND attr = ANY($2::text[])
 """
 
 DROP_REMOVED_EFFECTS: typing.Final[str] = """-- name: DropRemovedEffects :exec
-DELETE FROM build_effects WHERE build_id = $1
+DELETE FROM build_effects WHERE run_id = $1::bigint
 AND NOT (name = ANY($2::text[]))
 """
 
 EFFECT_STATUS: typing.Final[str] = """-- name: EffectStatus :one
 SELECT status FROM build_effects WHERE build_id = $1 AND name = $2
+  AND (
+      run_id = $3::bigint
+      OR (run_id IS NULL AND $3::bigint IS NULL)
+  )
 """
 
 FAIL_INTERRUPTED_EFFECTS: typing.Final[str] = """-- name: FailInterruptedEffects :exec
@@ -172,7 +176,7 @@ WHERE status = 'running' AND started_at < $1
 """
 
 FIND_UNFINISHED_BUILDS: typing.Final[str] = """-- name: FindUnfinishedBuilds :many
-SELECT id, project_id, number, tree_hash, commit_sha, branch, pr_number, pr_author, status, status_generation, effects_started, error, created_at, started_at, finished_at, eval_warnings, eval_completed, effects_commit_sha, effects_branch, effects_pr_number FROM builds WHERE status = ANY($1::text[])
+SELECT id, project_id, number, tree_hash, commit_sha, branch, pr_number, pr_author, status, status_generation, effects_started, error, created_at, started_at, finished_at, eval_warnings, eval_completed, effects_commit_sha, effects_branch, effects_pr_number, eval_key FROM builds WHERE status = ANY($1::text[])
 AND ($2::bigint IS NULL OR id = $2)
 ORDER BY id
 """
@@ -196,11 +200,14 @@ WITH cleared_failures AS (
         started_at = NULL, finished_at = NULL
     WHERE build_id = $2::bigint
       AND ($1::text IS NULL OR attr = $1)
-), reset_effect_rows AS (
-    UPDATE build_effects SET status = 'pending', error = NULL,
-        finished_at = NULL, log_path = NULL, log_size = 0,
-        log_truncated = FALSE
+), delete_effect_runs AS (
+    DELETE FROM build_effect_runs
     WHERE build_id = $2::bigint
+      AND $1::text IS NULL
+), delete_legacy_effect_rows AS (
+    DELETE FROM build_effects
+    WHERE build_id = $2::bigint
+      AND run_id IS NULL
       AND $1::text IS NULL
 )
 UPDATE builds SET status = 'pending', error = NULL,
@@ -211,12 +218,13 @@ WHERE builds.id = $2::bigint
 """
 
 RESET_EFFECTS_STATE: typing.Final[str] = """-- name: ResetEffectsState :exec
-WITH flag AS (
+WITH reset_flag AS (
     UPDATE builds SET effects_started = FALSE WHERE id = $1
+), delete_effect_runs AS (
+    DELETE FROM build_effect_runs WHERE build_id = $1
 )
-UPDATE build_effects SET status = 'pending', error = NULL,
-    finished_at = NULL, log_path = NULL, log_size = 0,
-    log_truncated = FALSE WHERE build_id = $1
+DELETE FROM build_effects
+WHERE build_effects.build_id = $1::bigint AND run_id IS NULL
 """
 
 RESET_EVAL_FOR_REEVAL: typing.Final[str] = """-- name: ResetEvalForReeval :exec
@@ -342,12 +350,12 @@ async def delete_attributes_by_name(conn: ConnectionLike, *, build_id: int, attr
     await conn.execute(DELETE_ATTRIBUTES_BY_NAME, build_id, attrs)
 
 
-async def drop_removed_effects(conn: ConnectionLike, *, build_id: int, names: collections.abc.Sequence[str]) -> None:
-    await conn.execute(DROP_REMOVED_EFFECTS, build_id, names)
+async def drop_removed_effects(conn: ConnectionLike, *, run_id: int, names: collections.abc.Sequence[str]) -> None:
+    await conn.execute(DROP_REMOVED_EFFECTS, run_id, names)
 
 
-async def effect_status(conn: ConnectionLike, *, build_id: int, name: str) -> str | None:
-    row = await conn.fetchrow(EFFECT_STATUS, build_id, name)
+async def effect_status(conn: ConnectionLike, *, build_id: int, name: str, run_id: int | None) -> str | None:
+    row = await conn.fetchrow(EFFECT_STATUS, build_id, name, run_id)
     if row is None:
         return None
     return row[0]
@@ -363,7 +371,7 @@ async def fail_interrupted_scheduled_runs(conn: ConnectionLike, *, started_befor
 
 def find_unfinished_builds(conn: ConnectionLike, *, statuses: collections.abc.Sequence[str], build_id: int | None) -> QueryResults[models.Build]:
     def _decode_hook(row: asyncpg.Record) -> models.Build:
-        return models.Build(id=row[0], project_id=row[1], number=row[2], tree_hash=row[3], commit_sha=row[4], branch=row[5], pr_number=row[6], pr_author=row[7], status=row[8], status_generation=row[9], effects_started=row[10], error=row[11], created_at=row[12], started_at=row[13], finished_at=row[14], eval_warnings=row[15], eval_completed=row[16], effects_commit_sha=row[17], effects_branch=row[18], effects_pr_number=row[19])
+        return models.Build(id=row[0], project_id=row[1], number=row[2], tree_hash=row[3], commit_sha=row[4], branch=row[5], pr_number=row[6], pr_author=row[7], status=row[8], status_generation=row[9], effects_started=row[10], error=row[11], created_at=row[12], started_at=row[13], finished_at=row[14], eval_warnings=row[15], eval_completed=row[16], effects_commit_sha=row[17], effects_branch=row[18], effects_pr_number=row[19], eval_key=row[20])
     return QueryResults[models.Build](conn, FIND_UNFINISHED_BUILDS, _decode_hook, statuses, build_id)
 
 

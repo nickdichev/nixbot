@@ -55,7 +55,7 @@ def branch_key(branch: str, pr_number: int | None = None) -> str:
 class InFlightBuild:
     build_id: int
     project_id: int
-    tree_hash: str
+    build_identity: str
     commit_sha: str
     cancel_event: asyncio.Event
     contexts: set[str] = field(default_factory=set)
@@ -78,7 +78,7 @@ class CancellationManager:
         project_id: int,
         context_key: str,
         build_id: int,
-        tree_hash: str,
+        build_identity: str,
         commit_sha: str,
         cancel_event: asyncio.Event,
         *,
@@ -101,11 +101,12 @@ class CancellationManager:
         if old_build_id is not None:
             old = self._builds.get(old_build_id)
             if old is not None:
-                # Identity is the post-merge tree hash only: the same
-                # head commit yields a different tree once the base
-                # branch advances.
-                if old.tree_hash == tree_hash:
-                    # Same content: shared build, nothing to cancel.
+                # Identity includes the post-merge tree and eval
+                # selection. The same head commit still yields a
+                # different identity once the base branch or selected
+                # flake attribute changes.
+                if old.build_identity == build_identity:
+                    # Same work: shared build, nothing to cancel.
                     old.contexts.add(context_key)
                     return RegisterOutcome.DUPLICATE
                 if incoming_is_ancestor_of_running:
@@ -124,7 +125,7 @@ class CancellationManager:
             build = InFlightBuild(
                 build_id=build_id,
                 project_id=project_id,
-                tree_hash=tree_hash,
+                build_identity=build_identity,
                 commit_sha=commit_sha,
                 cancel_event=cancel_event,
             )

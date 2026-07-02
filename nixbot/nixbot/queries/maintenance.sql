@@ -29,11 +29,14 @@ WITH cleared_failures AS (
         started_at = NULL, finished_at = NULL
     WHERE build_id = sqlc.arg(build_id)::bigint
       AND (sqlc.narg(attr)::text IS NULL OR attr = sqlc.narg(attr))
-), reset_effect_rows AS (
-    UPDATE build_effects SET status = 'pending', error = NULL,
-        finished_at = NULL, log_path = NULL, log_size = 0,
-        log_truncated = FALSE
+), delete_effect_runs AS (
+    DELETE FROM build_effect_runs
     WHERE build_id = sqlc.arg(build_id)::bigint
+      AND sqlc.narg(attr)::text IS NULL
+), delete_legacy_effect_rows AS (
+    DELETE FROM build_effects
+    WHERE build_id = sqlc.arg(build_id)::bigint
+      AND run_id IS NULL
       AND sqlc.narg(attr)::text IS NULL
 )
 UPDATE builds SET status = 'pending', error = NULL,
@@ -43,15 +46,16 @@ UPDATE builds SET status = 'pending', error = NULL,
 WHERE builds.id = sqlc.arg(build_id)::bigint;
 
 -- name: ResetEffectsState :exec
--- Drop the started-flag and reset the effect rows atomically (a
--- crash between the two writes must not leave re-runnable effects
--- behind a still-set flag).
-WITH flag AS (
+-- Drop the started-flag and old effect runs atomically (a crash
+-- between the writes must not leave re-runnable effects behind a
+-- still-set flag).
+WITH reset_flag AS (
     UPDATE builds SET effects_started = FALSE WHERE id = sqlc.arg(build_id)
+), delete_effect_runs AS (
+    DELETE FROM build_effect_runs WHERE build_id = sqlc.arg(build_id)
 )
-UPDATE build_effects SET status = 'pending', error = NULL,
-    finished_at = NULL, log_path = NULL, log_size = 0,
-    log_truncated = FALSE WHERE build_id = sqlc.arg(build_id);
+DELETE FROM build_effects
+WHERE build_effects.build_id = sqlc.arg(build_id)::bigint AND run_id IS NULL;
 
 -- name: CountUnfinishedAttributes :one
 SELECT count(*) AS count FROM build_attributes
@@ -160,11 +164,15 @@ WITH cancelled AS (
 SELECT cancelled.status_generation FROM cancelled;
 
 -- name: DropRemovedEffects :exec
-DELETE FROM build_effects WHERE build_id = $1
+DELETE FROM build_effects WHERE run_id = sqlc.arg(run_id)::bigint
 AND NOT (name = ANY(sqlc.arg(names)::text[]));
 
 -- name: EffectStatus :one
-SELECT status FROM build_effects WHERE build_id = $1 AND name = $2;
+SELECT status FROM build_effects WHERE build_id = $1 AND name = $2
+  AND (
+      run_id = sqlc.narg(run_id)::bigint
+      OR (run_id IS NULL AND sqlc.narg(run_id)::bigint IS NULL)
+  );
 
 -- name: SucceededAttributeOutputs :many
 SELECT attr, outputs FROM build_attributes

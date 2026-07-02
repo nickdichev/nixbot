@@ -107,7 +107,7 @@ async def rerun_pending_attributes(
             info.id,
             branch_key(build.branch, build.pr_number),
             build.id,
-            build.tree_hash or "",
+            f"{build.tree_hash or ''}:{build.eval_key}",
             build.commit_sha,
             cancel_event,
         )

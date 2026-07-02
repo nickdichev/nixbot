@@ -1,13 +1,14 @@
 -- Build lifecycle queries (db.py).
 
 -- name: LockBuildIdentity :exec
--- No unique constraint exists on (project_id, tree_hash); serialize
--- creators or concurrent events insert duplicates.
+-- No unique constraint exists on (project_id, tree_hash, eval_key);
+-- serialize creators or concurrent events insert duplicates.
 SELECT pg_advisory_xact_lock(hashtextextended(sqlc.arg(key)::text, 0));
 
 -- name: FindReusableBuild :one
 -- A cancelled build carries no verdict; never reuse it.
 SELECT * FROM builds WHERE project_id = $1 AND tree_hash = $2
+AND eval_key = sqlc.arg(eval_key)
 AND status <> 'cancelled' ORDER BY id DESC LIMIT 1;
 
 -- name: DetachBuildFromPr :one
@@ -33,10 +34,10 @@ WITH n AS (
     WHERE id = sqlc.arg(project_id)::bigint
     RETURNING next_build_number - 1 AS number
 )
-INSERT INTO builds (project_id, number, tree_hash, commit_sha,
+INSERT INTO builds (project_id, number, tree_hash, eval_key, commit_sha,
                     branch, pr_number, pr_author)
 SELECT sqlc.arg(project_id)::bigint, n.number, sqlc.narg(tree_hash)::text,
-       sqlc.arg(commit_sha)::text, sqlc.arg(branch)::text,
+       sqlc.arg(eval_key)::text, sqlc.arg(commit_sha)::text, sqlc.arg(branch)::text,
        sqlc.narg(pr_number)::bigint, sqlc.narg(pr_author)::text
 FROM n
 RETURNING *;
@@ -112,6 +113,7 @@ UPDATE builds SET eval_completed = TRUE WHERE id = $1;
 
 -- name: FindCompletedEval :one
 SELECT id FROM builds WHERE project_id = $1 AND tree_hash = $2
+AND eval_key = sqlc.arg(eval_key)
 AND eval_completed AND id <> sqlc.arg(exclude_build_id)
 ORDER BY id DESC LIMIT 1;
 
@@ -122,15 +124,39 @@ WHERE build_id = $1;
 -- name: GetBuild :one
 SELECT * FROM builds WHERE id = $1;
 
--- name: MarkEffectsStarted :one
--- Records the triggering ref alongside the flag so the effect items
--- (which only carry build_id) report on the commit that ran them
--- rather than the build's stored commit_sha.
-UPDATE builds SET effects_started = TRUE,
-    effects_commit_sha = sqlc.arg(commit_sha)::text,
-    effects_branch = sqlc.arg(branch)::text,
-    effects_pr_number = sqlc.narg(pr_number)::bigint
-WHERE id = sqlc.arg(id)::bigint AND effects_started = FALSE RETURNING id;
+-- name: StartEffectRun :one
+-- One build can be reused by several triggering refs; effects are
+-- branch-sensitive, so each branch/PR ref gets its own run. A
+-- duplicate ref with an identical tree returns no row and must not
+-- redeploy; its statuses are replayed onto the new commit instead.
+WITH inserted AS (
+    INSERT INTO build_effect_runs (build_id, commit_sha, branch, pr_number)
+    VALUES (
+        sqlc.arg(build_id)::bigint,
+        sqlc.arg(commit_sha)::text,
+        sqlc.arg(branch)::text,
+        COALESCE(sqlc.narg(pr_number)::bigint, 0)
+    )
+    ON CONFLICT (build_id, branch, pr_number) DO NOTHING
+    RETURNING id
+), marked AS (
+    UPDATE builds SET effects_started = TRUE,
+        effects_commit_sha = sqlc.arg(commit_sha)::text,
+        effects_branch = sqlc.arg(branch)::text,
+        effects_pr_number = sqlc.narg(pr_number)::bigint
+    WHERE id = sqlc.arg(build_id)::bigint
+      AND EXISTS (SELECT 1 FROM inserted)
+)
+SELECT id FROM inserted;
+
+-- name: EffectRunByContext :one
+SELECT id FROM build_effect_runs
+WHERE build_id = sqlc.arg(build_id)::bigint
+  AND branch = sqlc.arg(branch)::text
+  AND pr_number = COALESCE(sqlc.narg(pr_number)::bigint, 0);
+
+-- name: GetEffectRun :one
+SELECT * FROM build_effect_runs WHERE id = $1;
 
 -- name: SettleUnfinishedAttributes :exec
 UPDATE build_attributes
@@ -188,17 +214,18 @@ SELECT attr.id, sqlc.narg(log_path), sqlc.arg(log_size)::bigint,
 FROM attr WHERE sqlc.narg(log_path)::text IS NOT NULL;
 
 -- name: StartEffect :exec
-INSERT INTO build_effects (build_id, name, status) VALUES ($1, $2, $3)
-ON CONFLICT (build_id, name) DO UPDATE SET
+INSERT INTO build_effects (build_id, run_id, name, status)
+VALUES ($1, sqlc.narg(run_id)::bigint, $2, $3)
+ON CONFLICT (run_id, name) WHERE run_id IS NOT NULL DO UPDATE SET
     status = $3, error = NULL, log_path = NULL, log_size = 0,
     log_truncated = FALSE, started_at = now(), finished_at = NULL;
 
 -- name: StartPendingEffects :exec
 -- Batch variant for enqueueing one build's discovered effects.
-INSERT INTO build_effects (build_id, name, status)
-SELECT sqlc.arg(build_id)::bigint, u.name, 'pending'
+INSERT INTO build_effects (build_id, run_id, name, status)
+SELECT sqlc.arg(build_id)::bigint, sqlc.arg(run_id)::bigint, u.name, 'pending'
 FROM unnest(sqlc.arg(names)::text[]) AS u(name)
-ON CONFLICT (build_id, name) DO UPDATE SET
+ON CONFLICT (run_id, name) WHERE run_id IS NOT NULL DO UPDATE SET
     status = 'pending', error = NULL, log_path = NULL, log_size = 0,
     log_truncated = FALSE, started_at = now(), finished_at = NULL;
 
@@ -206,10 +233,17 @@ ON CONFLICT (build_id, name) DO UPDATE SET
 UPDATE build_effects SET
     status = $3, error = sqlc.narg(error), log_path = sqlc.narg(log_path),
     log_size = $4, log_truncated = $5, finished_at = now()
-WHERE build_id = $1 AND name = $2;
+WHERE build_id = $1 AND name = $2
+  AND (
+      run_id = sqlc.narg(run_id)::bigint
+      OR (run_id IS NULL AND sqlc.narg(run_id)::bigint IS NULL)
+  );
 
 -- name: EffectsForBuild :many
 SELECT * FROM build_effects WHERE build_id = $1 ORDER BY name;
+
+-- name: EffectsForRun :many
+SELECT * FROM build_effects WHERE run_id = $1 ORDER BY name;
 
 -- name: AttributeStatuses :many
 SELECT attr, status FROM build_attributes WHERE build_id = $1;

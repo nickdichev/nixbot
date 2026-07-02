@@ -65,8 +65,9 @@ ENQUEUE_EFFECT_ITEMS: typing.Final[str] = """-- name: EnqueueEffectItems :exec
 INSERT INTO work_queue (kind, dedup_key, payload)
 SELECT 'effect', $1::text,
        jsonb_build_object('build_id', $2::bigint,
+                          'run_id', $3::bigint,
                           'name', u.name)
-FROM unnest($3::text[]) AS u(name)
+FROM unnest($4::text[]) AS u(name)
 ON CONFLICT (kind, dedup_key, md5(payload::text))
 WHERE status = 'pending'
 DO NOTHING
@@ -118,8 +119,8 @@ async def cleanup_work_queue(conn: ConnectionLike, *, retention_days: int) -> No
     await conn.execute(CLEANUP_WORK_QUEUE, retention_days)
 
 
-async def enqueue_effect_items(conn: ConnectionLike, *, dedup_key: str, build_id: int, names: collections.abc.Sequence[str]) -> None:
-    await conn.execute(ENQUEUE_EFFECT_ITEMS, dedup_key, build_id, names)
+async def enqueue_effect_items(conn: ConnectionLike, *, dedup_key: str, build_id: int, run_id: int, names: collections.abc.Sequence[str]) -> None:
+    await conn.execute(ENQUEUE_EFFECT_ITEMS, dedup_key, build_id, run_id, names)
 
 
 async def enqueue_work_item(conn: ConnectionLike, *, kind: str, dedup_key: str, payload: str) -> int | None:

@@ -19,6 +19,7 @@ from nixbot.failed_builds import PostgresFailedBuildCache
 from nixbot.migrations import apply_migrations, load_migrations
 from nixbot.models import CacheStatus
 from nixbot.status import CheckRunStore, FailedStatusStore
+from nixbot.repo_config import eval_key_for
 
 from .support import attribute_statuses, db_pool, insert_build, insert_project, mk_job
 
@@ -193,8 +194,9 @@ async def test_failed_build_cache_component(pool: asyncpg.Pool) -> None:
 
 async def test_get_or_create_build_concurrent_no_duplicates(postgres_dsn: str) -> None:
     # SELECT-then-INSERT must be serialized: there is no unique
-    # constraint on (project_id, tree_hash), so without locking two
-    # concurrent change events for the same tree create two builds.
+    # constraint on (project_id, tree_hash, eval_key), so without
+    # locking two concurrent change events for the same identity
+    # create two builds.
     async with db_pool(postgres_dsn, min_size=5, max_size=5) as pool:
         project_id = await insert_project(pool, "race")
         results = await asyncio.gather(
@@ -225,6 +227,28 @@ async def test_cancelled_build_not_reused(pool: asyncpg.Pool) -> None:
     )
     assert created
     assert second.id != first.id
+
+
+async def test_build_reuse_includes_eval_key(pool: asyncpg.Pool) -> None:
+    project_id = await insert_project(pool, "eval-key-reuse")
+    checks_key = eval_key_for(".", "flake.lock", "checks")
+    packages_key = eval_key_for(".", "flake.lock", "packages")
+
+    checks, created = await db.get_or_create_build(
+        pool, project_id, "tree-e", "sha", "main", eval_key=checks_key
+    )
+    assert created
+    same_checks, created = await db.get_or_create_build(
+        pool, project_id, "tree-e", "sha2", "main", eval_key=checks_key
+    )
+    assert not created
+    assert same_checks.id == checks.id
+
+    packages, created = await db.get_or_create_build(
+        pool, project_id, "tree-e", "sha3", "main", eval_key=packages_key
+    )
+    assert created
+    assert packages.id != checks.id
 
 
 async def test_reuse_backfills_pr_fields(pool: asyncpg.Pool) -> None:

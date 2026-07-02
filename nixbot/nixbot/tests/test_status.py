@@ -21,6 +21,7 @@ from nixbot.db_gen.models import Build as BuildRecord
 from nixbot.events import BuildResult, ChangeEvent, RepoInfo
 from nixbot.forge import GitlabClient
 from nixbot.models import NixEvalJobError
+from nixbot.repo_config import DEFAULT_EVAL_KEY
 from nixbot.status import (
     CHECK_RUN_TEXT_LIMIT,
     POSTED_GENERATIONS_MAX,
@@ -114,6 +115,7 @@ BUILD = BuildRecord(
     effects_commit_sha=None,
     effects_branch=None,
     effects_pr_number=None,
+    eval_key=DEFAULT_EVAL_KEY,
 )
 
 
@@ -558,6 +560,26 @@ async def test_attr_prefix_follows_repo_configuration() -> None:
     )
     assert any(
         p.context == "nixbot/nix-build github:acme/widget#hydraJobs.foo"
+        for p in poster.posts
+    )
+
+
+async def test_packages_attr_prefix_posts_failed_context() -> None:
+    reporter, poster, store = make_reporter()
+
+    await reporter.build_finished(
+        EVENT,
+        BUILD,
+        BuildResult(
+            "failed",
+            1,
+            [attr_result("x86_64-linux.foo", AttributeStatus.failed)],
+            attr_prefix="packages",
+        ),
+    )
+    assert any(
+        p.context
+        == "nixbot/nix-build github:acme/widget#packages.x86_64-linux.foo"
         for p in poster.posts
     )
 

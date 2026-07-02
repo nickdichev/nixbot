@@ -32,7 +32,7 @@ from .memory import calculate_eval_workers
 from .models import CacheStatus, NixEvalJobSuccess
 from .nix_eval import EvalError, EvalSettings
 from .post_build import build_props, run_post_build_steps
-from .repo_config import BranchConfig
+from .repo_config import BranchConfig, eval_attribute_from_key
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -100,17 +100,20 @@ async def get_eval_jobs(
     return jobs
 
 
-async def run_build(
+async def run_build(  # noqa: PLR0913
     o: Orchestrator,
     event: ChangeEvent,
     build: BuildRecord,
     worktree_path: Path,
+    branch_config: BranchConfig,
     credentials: FetchCredentials | None = None,
 ) -> None:
     """Evaluate and build; every attribute completion is one
     transactional DB write, then the result is re-aggregated."""
     try:
-        await _run_build_inner(o, event, build, worktree_path, credentials)
+        await _run_build_inner(
+            o, event, build, worktree_path, credentials, branch_config
+        )
     except Exception as e:
         # Catch-all: a DB outage or GitError mid-eval would
         # otherwise wedge the build in 'evaluating' with no
@@ -193,7 +196,14 @@ async def _settle_aborted(
     else:
         await o.reporter.eval_finished(event, build, success=False, warnings=[])
     await o.reporter.build_finished(
-        event, build, BuildResult(status, build.status_generation, [])
+        event,
+        build,
+        BuildResult(
+            status,
+            build.status_generation,
+            [],
+            attr_prefix=eval_attribute_from_key(build.eval_key),
+        ),
     )
     await o.finish_linked(
         build,
@@ -211,12 +221,13 @@ async def _reap(*tasks: asyncio.Future[Any]) -> None:
             await task
 
 
-async def _run_build_inner(
+async def _run_build_inner(  # noqa: PLR0913
     o: Orchestrator,
     event: ChangeEvent,
     build: BuildRecord,
     worktree_path: Path,
     credentials: FetchCredentials | None,
+    branch_config: BranchConfig,
 ) -> None:
     await o.reporter.build_started(event, build)
     await db.set_build_status(o.pool, build.id, BuildStatus.EVALUATING)
@@ -224,7 +235,6 @@ async def _run_build_inner(
     if await _try_reuse_eval(o, event, build, worktree_path, credentials):
         return
 
-    branch_config = BranchConfig.load(worktree_path)
     eval_settings = _eval_settings(o, event, build, credentials)
     # Race the evaluation against the cancel event: a superseded
     # build must not hold the eval slot to completion.
@@ -350,6 +360,7 @@ async def _reusable_eval_jobs(
         o.pool,
         project_id=build.project_id,
         tree_hash=build.tree_hash,
+        eval_key=build.eval_key,
         exclude_build_id=build.id,
     )
     if source_id is None:
@@ -468,7 +479,7 @@ async def build_attributes(  # noqa: PLR0913
                 r.attr: r.status
                 for r in await q.attribute_statuses(o.pool, build_id=build.id)
             },
-            attr_prefix=BranchConfig.load(worktree_path).attribute,
+            attr_prefix=eval_attribute_from_key(build.eval_key),
         ),
     )
     await o.finish_linked(
