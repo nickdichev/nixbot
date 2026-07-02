@@ -223,30 +223,68 @@ def _instantiate(expr: str, opts: EffectsOptions, gcroot: Path) -> str:
         expr,
     ]
     proc = run(cmd, stdout=subprocess.PIPE, debug=opts.debug)
-    output = proc.stdout.rstrip()
-    if output == "":
+    paths = proc.stdout.split()
+    if not paths:
         return ""
-    # --add-root prints the symlink path; resolve to the actual store path
-    return str(Path(output).resolve())
+    # nix-instantiate prints one --add-root symlink per derivation; an
+    # effect must be a single one, else `derivation show` gets a bad path.
+    if len(paths) != 1:
+        msg = f"expected effect to be a single derivation, got {len(paths)}: {proc.stdout!r}"
+        raise NixbotEffectsError(msg)
+    return str(Path(paths[0]).resolve())
 
 
-def instantiate_effects(effect: str, opts: EffectsOptions, gcroot: Path) -> str:
-    return _instantiate(
-        f"let e = ({effect_function(opts)}).{effect}; in if e ? run then e.run else e",
-        opts,
-        gcroot,
+def _eval_bool(expr: str, opts: EffectsOptions) -> bool:
+    cmd = nix_command("eval", "--json", "--expr", expr)
+    proc = run(cmd, stdout=subprocess.PIPE, debug=opts.debug)
+    return bool(json.loads(proc.stdout))
+
+
+def _select_effect(
+    binding: str, opts: EffectsOptions, gcroot: Path
+) -> tuple[str, bool]:
+    """Instantiate an effect bound to `e` by `binding`.
+
+    hercules-ci's `runIf false` replaces the effect with a wrapper set
+    `{ dependencies; prebuilt; }` (recurseForDerivations) so nix-instantiate
+    would emit a root per derivation. Select a single derivation: the
+    runnable effect (`e.run`, or a bare effect derivation), otherwise the
+    dependency-only build. Only run in the former case; the latter mirrors
+    the agent, which just builds inputs when the effect is gated off.
+    See https://github.com/Mic92/nixbot/issues/56.
+    """
+    drv_path = _instantiate(f"{binding} e.run or e.dependencies or e", opts, gcroot)
+    if drv_path == "":
+        return "", False
+    should_run = _eval_bool(f"{binding} e ? run || !(e ? dependencies)", opts)
+    return drv_path, should_run
+
+
+def instantiate_effects(
+    effect: str, opts: EffectsOptions, gcroot: Path
+) -> tuple[str, bool]:
+    return _select_effect(
+        f"let e = ({effect_function(opts)}).{effect}; in", opts, gcroot
     )
 
 
 def instantiate_scheduled_effect(
     schedule_name: str, effect: str, opts: EffectsOptions, gcroot: Path
-) -> str:
+) -> tuple[str, bool]:
     """Instantiate a specific effect from a schedule."""
-    return _instantiate(
-        f"({scheduled_effect_function(opts)}).{schedule_name}.outputs.effects.{effect}",
+    return _select_effect(
+        f"let e = ({scheduled_effect_function(opts)})"
+        f".{schedule_name}.outputs.effects.{effect}; in",
         opts,
         gcroot,
     )
+
+
+def build_derivation(drv_path: str, opts: EffectsOptions) -> None:
+    """Realise a derivation without running it (gated-off effects only build
+    their dependencies, matching hercules-ci-agent)."""
+    cmd = nix_command("build", "--no-link", f"{drv_path}^*")
+    run(cmd, debug=opts.debug)
 
 
 def parse_derivation(path: str, *, debug: bool = False) -> dict[str, Any]:
