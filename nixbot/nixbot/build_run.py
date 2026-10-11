@@ -619,7 +619,6 @@ async def build_attributes(  # noqa: PLR0913
                 r.attr: r.status
                 for r in await q.attribute_statuses(o.pool, build_id=build.id_)
             },
-            attr_prefix=build.attribute,
         ),
     )
     await o.finish_linked(

@@ -29,7 +29,7 @@ from nixbot.events import BuildResult, NullStatusReporter
 from nixbot.forge import DiscoveredRepo
 from nixbot.schedule_runner import scheduled_worktree_id
 from nixbot.schedules import DueEffect, ScheduleWhen
-from nixbot.status import CheckRunStore
+from nixbot.status import CheckRunStore, FailedStatusStore, ForgeStatusReporter
 from nixbot.webhooks import ChangeRequest, CheckRerequested, PrApproved, PrClosed
 from nixbot.work_queue import MAX_WORK_ATTEMPTS
 
@@ -1029,6 +1029,46 @@ async def test_cancel_attribute_not_running_reaggregates_build(
         await pool.fetchval("SELECT status FROM builds WHERE id = $1", build_id)
         == "cancelled"
     )
+
+
+async def test_re_report_uses_the_stored_attribute(service: CIService) -> None:
+    """The queued re-report of a build under another attribute than
+    checks posts the per-attribute status under that attribute. Named
+    after checks it would not match the context of the first report."""
+    pool = service.pool
+    project_id = await seed_project(pool, "http://example/repo")
+    build_id = await insert_build(
+        pool, project_id, commit_sha="c4", status="failed", attribute="fast"
+    )
+    await pool.execute(
+        "INSERT INTO build_attributes (build_id, attr, system, status) "
+        "VALUES ($1, 'only', 'x', 'failed')",
+        build_id,
+    )
+    contexts: list[str] = []
+
+    class Poster:
+        async def post(
+            self,
+            owner: str,
+            repo: str,
+            sha: str,
+            context: str,
+            *args: object,
+            **extra: object,
+        ) -> None:
+            contexts.append(context)
+
+    service.orchestrator.reporter = ForgeStatusReporter(
+        {"github": Poster()}, FailedStatusStore(pool), "https://ci.test"
+    )
+
+    await service._re_report(build_id)  # noqa: SLF001
+
+    assert contexts == [
+        "nixbot/nix-build github:acme/widget#fast.only",
+        "nixbot/nix-build",
+    ]
 
 
 # --- pull-based projects --------------------------------------------------

@@ -99,7 +99,6 @@ class BuildResult:
     generation: int
     results: list[AttributeResult]
     attr_statuses: dict[str, str] | None = None
-    attr_prefix: str = "checks"
 
 
 class StatusReporter(Protocol):

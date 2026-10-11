@@ -344,10 +344,10 @@ class _PrefixReporter(RecordingReporter):
     async def build_finished(
         self,
         event: ChangeEvent,  # noqa: ARG002
-        build: BuildRecord,  # noqa: ARG002
-        result: BuildResult,
+        build: BuildRecord,
+        result: BuildResult,  # noqa: ARG002
     ) -> None:
-        self.prefixes.append(result.attr_prefix)
+        self.prefixes.append(build.attribute)
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git not available")

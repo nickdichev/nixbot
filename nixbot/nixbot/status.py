@@ -355,9 +355,13 @@ def attr_status_context(
     forge: str,
     project_name: str,
     attr: str,
-    prefix: str = "checks",
+    prefix: str,
     context_prefix: str = "nixbot",
 ) -> str:
+    """Status name of one attribute. prefix is the attribute the build
+    row stores: a name derived from anything else changes between the
+    failure, the restart and the success flip, and the failed status
+    stays on the commit."""
     # Attrs already contain the configured attribute path unless they
     # carry the legacy "default." job prefix; avoid doubling it.
     name = (
@@ -618,9 +622,7 @@ class ForgeStatusReporter:
             if attr_statuses is not None
             else {r.attr: r.status.value for r in results}
         )
-        counts = await self._post_attribute_statuses(
-            event, build, statuses, detail, result.attr_prefix
-        )
+        counts = await self._post_attribute_statuses(event, build, statuses, detail)
         await self._post_summary(event, build, result.status, counts, statuses)
 
     async def build_restarted(
@@ -642,6 +644,7 @@ class ForgeStatusReporter:
                 event.repo.forge,
                 event.repo.name,
                 attr,
+                build.attribute,
                 context_prefix=self.context_prefix,
             )
             await self._post(
@@ -668,7 +671,6 @@ class ForgeStatusReporter:
         build: BuildRecord,
         statuses: dict[str, str],
         detail: dict[str, AttributeResult],
-        attr_prefix: str,
     ) -> dict[str, int]:
         """Per-attribute failure statuses and success flips over the
         whole build. Returns failed/succeeded/cancelled counts."""
@@ -683,7 +685,7 @@ class ForgeStatusReporter:
                 event.repo.forge,
                 event.repo.name,
                 attr,
-                attr_prefix,
+                build.attribute,
                 context_prefix=self.context_prefix,
             )
             if status in FAILED_STATUS_STATES:

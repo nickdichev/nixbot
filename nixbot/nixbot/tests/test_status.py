@@ -168,21 +168,41 @@ async def test_posted_generations_bounded() -> None:
     assert (POSTED_GENERATIONS_MAX + 99) in reporter._posted_generations  # noqa: SLF001
 
 
-def test_context_names_default() -> None:
+def test_context_names_checks() -> None:
     assert (
-        attr_status_context("github", "acme/widget", "x86_64-linux.foo")
+        attr_status_context("github", "acme/widget", "x86_64-linux.foo", "checks")
         == "nixbot/nix-build github:acme/widget#checks.x86_64-linux.foo"
     )
     # Attrs already carrying the configured attribute path are not
     # doubled up.
     assert (
-        attr_status_context("github", "acme/widget", "checks.x86_64-linux.foo")
+        attr_status_context(
+            "github", "acme/widget", "checks.x86_64-linux.foo", "checks"
+        )
         == "nixbot/nix-build github:acme/widget#checks.x86_64-linux.foo"
     )
     # The legacy default. job prefix keeps its historic context names.
     assert (
-        attr_status_context("github", "acme/widget", "default.checks.x86_64-linux.foo")
+        attr_status_context(
+            "github", "acme/widget", "default.checks.x86_64-linux.foo", "checks"
+        )
         == "nixbot/nix-build github:acme/widget#checks.default.checks.x86_64-linux.foo"
+    )
+
+
+def test_context_names_other_attribute() -> None:
+    assert (
+        attr_status_context("github", "acme/widget", "x86_64-linux.foo", "a")
+        == "nixbot/nix-build github:acme/widget#a.x86_64-linux.foo"
+    )
+    assert (
+        attr_status_context("github", "acme/widget", "a.x86_64-linux.foo", "a")
+        == "nixbot/nix-build github:acme/widget#a.x86_64-linux.foo"
+    )
+    # Same form as the legacy default. job prefix under checks.
+    assert (
+        attr_status_context("github", "acme/widget", "default.a.x86_64-linux.foo", "a")
+        == "nixbot/nix-build github:acme/widget#a.default.a.x86_64-linux.foo"
     )
 
 
@@ -191,7 +211,11 @@ async def test_context_prefix_configurable() -> None:
     setting the buildbot-era prefix."""
     assert (
         attr_status_context(
-            "github", "acme/widget", "x86_64-linux.foo", context_prefix="buildbot"
+            "github",
+            "acme/widget",
+            "x86_64-linux.foo",
+            "checks",
+            context_prefix="buildbot",
         )
         == "buildbot/nix-build github:acme/widget#checks.x86_64-linux.foo"
     )
@@ -467,7 +491,7 @@ async def test_failure_description_from_structured_failure() -> None:
 
 async def test_success_flip_on_rebuild() -> None:
     reporter, poster, store = make_reporter()
-    context = attr_status_context("github", "acme/widget", "flaky")
+    context = attr_status_context("github", "acme/widget", "flaky", "checks")
 
     # First build: flaky fails.
     await reporter.build_finished(
@@ -504,7 +528,7 @@ async def test_cancelled_attributes_recorded_as_failed_statuses() -> None:
         BUILD,
         BuildResult("cancelled", 1, [attr_result("a", AttributeStatus.cancelled)]),
     )
-    context = attr_status_context("github", "acme/widget", "a")
+    context = attr_status_context("github", "acme/widget", "a", "checks")
     assert context in await store.get_failed("sha1")
     combined = next(p for p in poster.posts if p.context == "nixbot/nix-build")
     assert combined.state == StatusState.error
@@ -593,7 +617,7 @@ async def test_previously_failed_reposts_do_not_consume_budget() -> None:
         p.context for p in poster.posts if p.context.startswith("nixbot/nix-build ")
     }
     # a2 is reported: the re-posts did not exhaust the budget of 2.
-    assert attr_status_context("github", "acme/widget", "a2") in failure_posts
+    assert attr_status_context("github", "acme/widget", "a2", "checks") in failure_posts
 
 
 async def test_summary_counts_use_all_attribute_statuses() -> None:
@@ -618,7 +642,7 @@ async def test_summary_counts_use_all_attribute_statuses() -> None:
 async def test_success_flip_for_attributes_outside_the_rerun_subset() -> None:
     """results is a rerun subset. Earlier successes must still flip."""
     reporter, poster, store = make_reporter()
-    context = attr_status_context("github", "acme/widget", "a")
+    context = attr_status_context("github", "acme/widget", "a", "checks")
     await store.mark_failed("sha1", context)
     await reporter.build_finished(
         EVENT,
@@ -674,18 +698,51 @@ async def test_attr_prefix_follows_repo_configuration() -> None:
 
     await reporter.build_finished(
         EVENT,
-        BUILD,
-        BuildResult(
-            "failed",
-            1,
-            [attr_result("foo", AttributeStatus.failed)],
-            attr_prefix="hydraJobs",
-        ),
+        replace(BUILD, attribute="hydraJobs"),
+        BuildResult("failed", 1, [attr_result("foo", AttributeStatus.failed)]),
     )
     assert any(
         p.context == "nixbot/nix-build github:acme/widget#hydraJobs.foo"
         for p in poster.posts
     )
+
+
+async def test_attribute_context_stable_across_restart() -> None:
+    """A failure, its restart and the later success post under one
+    context named after the build's stored attribute. A restart or a
+    flip under another name leaves the failed status on the commit."""
+    reporter, poster, store = make_reporter()
+    build = replace(BUILD, attribute="fast")
+    context = "nixbot/nix-build github:acme/widget#fast.x86_64-linux.foo"
+
+    await reporter.build_finished(
+        EVENT,
+        build,
+        BuildResult(
+            "failed", 1, [attr_result("x86_64-linux.foo", AttributeStatus.failed)]
+        ),
+    )
+    await reporter.build_restarted(EVENT, build, "x86_64-linux.foo")
+    # The rerun reports from the build's attribute rows.
+    await reporter.build_finished(
+        EVENT,
+        build,
+        BuildResult(
+            "succeeded", 2, [], attr_statuses={"x86_64-linux.foo": "succeeded"}
+        ),
+    )
+
+    per_attribute = [
+        (p.context, p.state)
+        for p in poster.posts
+        if p.context.startswith("nixbot/nix-build ")
+    ]
+    assert per_attribute == [
+        (context, StatusState.failure),
+        (context, StatusState.pending),
+        (context, StatusState.success),
+    ]
+    assert await store.get_failed("sha1") == set()
 
 
 async def test_poster_network_errors_do_not_propagate() -> None:
