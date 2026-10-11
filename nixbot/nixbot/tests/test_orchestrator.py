@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from nixbot.db import BuildRecord
     from nixbot.executor import LogWriter
     from nixbot.models import NixEvalJobSuccess
+    from nixbot.repo_config import BranchConfig
     from nixbot.workload_identity import EffectIdentity
 
 pytestmark = [
@@ -72,6 +73,8 @@ class FakeEvalRunner:
     # Emitted as stderr warning lines through on_stderr_line.
     warnings: list[str] = field(default_factory=list)
     calls: int = 0
+    # The attribute of each evaluation, in call order.
+    attributes: list[str] = field(default_factory=list)
     last_settings: EvalSettings | None = None
     block: asyncio.Event | None = None
     started: asyncio.Event = field(default_factory=asyncio.Event)
@@ -86,12 +89,13 @@ class FakeEvalRunner:
     async def run(
         self,
         worktree_path: Path,
-        branch_config: object,
+        branch_config: BranchConfig,
         settings: EvalSettings,
         on_jobs: object = None,
         on_stderr_line: object = None,
     ) -> EvalResult:
         self.calls += 1
+        self.attributes.append(branch_config.attribute)
         self.started.set()
         self.last_settings = settings
         settings.gc_roots_dir.mkdir(parents=True, exist_ok=True)
@@ -374,6 +378,28 @@ def add_commit(upstream: Path, name: str) -> str:
     return git(upstream, "rev-parse", "HEAD")
 
 
+# Pull requests build `fast`, pushes to `production` build `release`,
+# everything else the top-level `checks`.
+ATTRIBUTE_RULES = """
+[[attribute_branches]]
+match = "*"
+attribute = "fast"
+events = ["pull_request"]
+
+[[attribute_branches]]
+match = "production"
+attribute = "release"
+events = ["push"]
+"""
+
+
+def add_config_commit(upstream: Path, config: str = ATTRIBUTE_RULES) -> str:
+    (upstream / "nixbot.toml").write_text(config)
+    git(upstream, "add", ".")
+    git(upstream, "commit", "-m", "nixbot.toml")
+    return git(upstream, "rev-parse", "HEAD")
+
+
 async def build_status(pool: asyncpg.Pool, build_id: int) -> str:
     return await pool.fetchval("SELECT status FROM builds WHERE id = $1", build_id)
 
@@ -556,6 +582,320 @@ async def test_main_push_promotes_reused_pr_build(
     assert await pool.fetchval(
         "SELECT count(*) FROM work_queue WHERE kind = 'refresh-schedules'"
     )
+
+
+async def test_main_push_does_not_reuse_pr_build_of_other_attribute(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    """A pull request built the fast attribute. The main push of the
+    same tree resolves to `checks`: it gets its own build and its own
+    evaluation instead of the pull request's result."""
+    sha = add_config_commit(upstream)
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    executor = FakeExecutor()
+    orchestrator, reporter, project = await make_env(
+        eval_runner, executor, name="attr-reuse"
+    )
+    pr_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=7)
+    )
+    assert pr_build is not None
+    assert pr_build.attribute == "fast"
+    assert await build_status(pool, pr_build.id_) == BuildStatus.SUCCEEDED
+
+    reporter.events.clear()
+    main_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+    assert main_build is not None
+    assert main_build.id_ != pr_build.id_
+    assert main_build.attribute == "checks"
+    assert main_build.tree_hash == pr_build.tree_hash
+    assert eval_runner.attributes == ["fast", "checks"]
+    assert executor.built == ["a", "a"]
+    assert await build_status(pool, main_build.id_) == BuildStatus.SUCCEEDED
+    # A full run of its own, nothing reported for the pull request's build.
+    assert [e[0] for e in reporter.events] == ["started", "eval", "finished"]
+    assert {e[1] for e in reporter.events} == {main_build.id_}
+    # The pull request keeps its build.
+    row = await pool.fetchrow(
+        "SELECT branch, pr_number FROM builds WHERE id = $1", pr_build.id_
+    )
+    assert dict(row) == {"branch": "main", "pr_number": 7}
+
+
+async def test_same_tree_and_attribute_share_one_build(
+    make_env: EnvFactory, upstream: Path
+) -> None:
+    """Two pull requests with one tree both resolve to the fast
+    attribute and still share a build."""
+    sha = add_config_commit(upstream)
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    orchestrator, reporter, project = await make_env(
+        eval_runner, FakeExecutor(), name="attr-share"
+    )
+    first = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=7)
+    )
+    reporter.events.clear()
+    second = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=8)
+    )
+    assert first is not None
+    assert second is not None
+    assert second.id_ == first.id_
+    assert second.attribute == "fast"
+    assert eval_runner.attributes == ["fast"]
+    assert [e[0] for e in reporter.events] == ["eval", "finished"]
+
+
+async def test_eval_not_reused_across_attributes(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    """The fast attribute's stored jobs are not the jobs of `checks`: a
+    build of the same tree under `checks` evaluates, even with the
+    other evaluation's derivations still in the store."""
+    sha = add_config_commit(upstream)
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    orchestrator, _, project = await make_env(
+        eval_runner, FakeExecutor(), name="attr-eval"
+    )
+
+    async def all_valid(paths: list[str]) -> set[str]:
+        return set(paths)
+
+    orchestrator.check_store_paths = all_valid
+    pr_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=7)
+    )
+    assert pr_build is not None
+    assert await pool.fetchval(
+        "SELECT eval_completed FROM builds WHERE id = $1", pr_build.id_
+    )
+
+    eval_runner.jobs = [mk_job("a"), mk_job("slow")]
+    main_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+    assert main_build is not None
+    assert eval_runner.attributes == ["fast", "checks"]
+    assert await eval_duration(pool, main_build.id_) == eval_runner.duration_ms
+    assert await attribute_statuses(pool, main_build.id_) == {
+        "a": "succeeded",
+        "slow": "succeeded",
+    }
+
+    # Same attribute: the stored jobs are reused as before.
+    await pool.execute(
+        "UPDATE builds SET status = 'cancelled' WHERE id = $1", main_build.id_
+    )
+    git(upstream, "commit", "--allow-empty", "-m", "same tree")
+    again = await orchestrator.handle_change_event(
+        ChangeEvent(
+            repo=project, branch="main", commit_sha=git(upstream, "rev-parse", "HEAD")
+        )
+    )
+    assert again is not None
+    assert again.id_ != main_build.id_
+    assert eval_runner.attributes == ["fast", "checks"]
+    assert await attribute_statuses(pool, again.id_) == {
+        "a": "succeeded",
+        "slow": "succeeded",
+    }
+
+
+async def test_push_does_not_attach_to_in_flight_build_of_other_attribute(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    """A main push arriving while the pull request's fast build of the
+    same tree runs starts its own build instead of waiting for that
+    build's result."""
+    sha = add_config_commit(upstream)
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    executor = FakeExecutor(gate=asyncio.Event())
+    orchestrator, reporter, project = await make_env(
+        eval_runner, executor, name="attr-inflight"
+    )
+    pr_task = asyncio.create_task(
+        orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha, pr_number=7)
+        )
+    )
+    await asyncio.wait_for(executor.started.wait(), timeout=10)
+    executor.started.clear()
+    main_task = asyncio.create_task(
+        orchestrator.handle_change_event(
+            ChangeEvent(repo=project, branch="main", commit_sha=sha)
+        )
+    )
+    # The push's own attribute build starts while the first still runs.
+    await asyncio.wait_for(executor.started.wait(), timeout=10)
+    assert not pr_task.done()
+    assert orchestrator.linked_events == {}
+    assert executor.gate is not None
+    executor.gate.set()
+    pr_build = await pr_task
+    main_build = await main_task
+    assert pr_build is not None
+    assert main_build is not None
+    assert main_build.id_ != pr_build.id_
+    assert (pr_build.attribute, main_build.attribute) == ("fast", "checks")
+    assert eval_runner.attributes == ["fast", "checks"]
+    finished = [e[1] for e in reporter.events if e[0] == "finished"]
+    assert sorted(finished) == sorted([pr_build.id_, main_build.id_])
+    for build in (pr_build, main_build):
+        assert await build_status(pool, build.id_) == BuildStatus.SUCCEEDED
+
+
+async def test_reevaluation_uses_the_stored_attribute(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    """A restart that has to re-evaluate reads the attribute from the
+    build row. Resolving it again from the row's branch and PR number
+    would pick `checks` once another context took the build over."""
+    sha = add_config_commit(upstream)
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    orchestrator, _, project = await make_env(
+        eval_runner, FakeExecutor(), name="attr-restart"
+    )
+    for pr_number in (7, 8):
+        await orchestrator.handle_change_event(
+            ChangeEvent(
+                repo=project, branch="main", commit_sha=sha, pr_number=pr_number
+            )
+        )
+    build_id = await pool.fetchval(
+        "SELECT id FROM builds WHERE project_id = $1", project.id
+    )
+    # As a restart does: reset, then re-evaluate for want of a stored
+    # evaluation.
+    await orchestrator.reset_build_for_restart(build_id, None)
+    record = await builds_q.get_build(pool, id_=build_id)
+    assert record is not None
+    # The second pull request detached the build: the row now reads
+    # like a push to main.
+    assert (record.branch, record.pr_number) == ("main", None)
+    assert record.attribute == "fast"
+    try:
+        async with orchestrator.rerun_worktree(project, record, "rerun", None) as (
+            event,
+            worktree_path,
+        ):
+            assert event.pr_number is None
+            await orchestrator.run_build(event, record, worktree_path)
+    finally:
+        orchestrator.release_run(record.id_)
+
+    assert eval_runner.attributes == ["fast", "fast"]
+    assert await build_status(pool, record.id_) == BuildStatus.SUCCEEDED
+
+
+EFFECTS_ON_PRODUCTION = 'effects_branches = ["production"]\n' + ATTRIBUTE_RULES
+
+
+async def test_branch_under_own_attribute_runs_its_own_effects(
+    pool: asyncpg.Pool,
+    make_env: EnvFactory,
+    upstream: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """main built the tree green under `checks` and deployed. Promoting
+    the commit to production resolves to the release attribute: its own
+    build, and so its own effects run. A reused build would only replay
+    main's effect statuses."""
+    ran = patch_effects(monkeypatch).ran
+    sha = add_config_commit(upstream, EFFECTS_ON_PRODUCTION)
+    git(upstream, "branch", "production", "main")
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    orchestrator, reporter, project = await make_env(
+        eval_runner, FakeExecutor(), name="attr-promote"
+    )
+    main_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+    assert main_build is not None
+    await drain_effect_items(orchestrator, project, pool)
+    assert ran == ["deploy"]
+
+    reporter.events.clear()
+    production_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="production", commit_sha=sha)
+    )
+    assert production_build is not None
+    assert production_build.id_ != main_build.id_
+    assert production_build.attribute == "release"
+    assert eval_runner.attributes == ["checks", "release"]
+    await drain_effect_items(orchestrator, project, pool)
+    assert ran == ["deploy", "deploy"]
+    assert await effect_statuses(pool, production_build.id_) == {"deploy": "succeeded"}
+    assert ("effect-started", production_build.id_, "deploy", sha) in reporter.events
+
+
+async def test_failed_attribute_under_own_attribute_runs_no_effects(
+    pool: asyncpg.Pool,
+    make_env: EnvFactory,
+    upstream: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production build is the deploy gate: a failed attribute in
+    it means no production effects, whatever main's build of the same
+    tree reported."""
+    ran = patch_effects(monkeypatch).ran
+    sha = add_config_commit(upstream, EFFECTS_ON_PRODUCTION)
+    git(upstream, "branch", "production", "main")
+    executor = FakeExecutor()
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("a")]), executor, name="attr-gate"
+    )
+    await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="main", commit_sha=sha)
+    )
+    await drain_effect_items(orchestrator, project, pool)
+    assert ran == ["deploy"]
+
+    executor.outcomes["a"] = BuildOutcome.failure
+    production_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="production", commit_sha=sha)
+    )
+    assert production_build is not None
+    assert await build_status(pool, production_build.id_) == BuildStatus.FAILED
+    await drain_effect_items(orchestrator, project, pool)
+    assert ran == ["deploy"]
+    assert await effect_statuses(pool, production_build.id_) == {}
+
+
+async def test_tag_of_tree_built_under_other_attribute_proceeds(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    """A tag push resolves to `checks` like any other push. With the
+    tree only built under the release attribute it gets a build of its
+    own, and its delivery once that build is green."""
+    sha = add_config_commit(upstream)
+    git(upstream, "branch", "production", "main")
+    eval_runner = FakeEvalRunner([mk_job("a")])
+    orchestrator, _, project = await make_env(
+        eval_runner, FakeExecutor(), name="attr-tag"
+    )
+    production_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="production", commit_sha=sha)
+    )
+    assert production_build is not None
+    assert production_build.attribute == "release"
+    # What the service asks before it lets a tag push through.
+    assert await builds_q.tree_built(
+        pool, project_id=project.id, tree_hash=production_build.tree_hash
+    )
+
+    tag_build = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="v1.0", commit_sha=sha, tag="v1.0")
+    )
+    assert tag_build is not None
+    assert tag_build.id_ != production_build.id_
+    assert tag_build.attribute == "checks"
+    assert await build_status(pool, tag_build.id_) == BuildStatus.SUCCEEDED
+    assert [(d["tag"], d["build_id"]) for d in await tag_deliveries(pool)] == [
+        ("v1.0", tag_build.id_)
+    ]
 
 
 async def test_merge_conflict_fails_build(

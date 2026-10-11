@@ -277,6 +277,128 @@ async def test_get_or_create_build_concurrent_no_duplicates(postgres_dsn: str) -
         assert count == 1
 
 
+async def test_get_or_create_build_concurrent_per_attribute(postgres_dsn: str) -> None:
+    # The identity lock covers the attribute: concurrent events for one
+    # tree under two attributes create exactly one build per attribute.
+    async with db_pool(postgres_dsn, min_size=6, max_size=6) as pool:
+        project_id = await insert_project(pool, "race-attr")
+        results = await asyncio.gather(
+            *(
+                db.get_or_create_build(
+                    pool, project_id, "tree-ra2", "sha", "main", attribute=attribute
+                )
+                for attribute in ("checks", "fast") * 3
+            )
+        )
+        by_attribute = {build.attribute: build.id_ for build, _ in results}
+        assert len(by_attribute) == 2
+        assert len({build.id_ for build, _ in results}) == 2
+        assert sum(created for _, created in results) == 2
+        rows = await pool.fetch(
+            "SELECT id, attribute FROM builds WHERE project_id = $1", project_id
+        )
+        assert {r["attribute"]: r["id"] for r in rows} == by_attribute
+
+
+async def test_build_attribute_migration_defaults_to_checks(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A build that predates the attribute column covered `checks`: it
+    stays reusable for a new event resolving to `checks`, and only for
+    that."""
+    async with db_pool(postgres_dsn) as pool:
+        await pool.execute("CREATE DATABASE db_pre_9002")
+    dsn = postgres_dsn.replace("/db?", "/db_pre_9002?")
+
+    shipped = load_migrations()
+    monkeypatch.setattr(
+        migrations_mod,
+        "load_migrations",
+        lambda: [m for m in shipped if m.version < 9002],
+    )
+    await apply_migrations(dsn)
+    async with db_pool(dsn) as pool:
+        project_id = await insert_project(pool, "pre-attribute")
+        old_id = await pool.fetchval(
+            "INSERT INTO builds (project_id, number, tree_hash, commit_sha, branch,"
+            " status) VALUES ($1, 100, 'tree-old', 'sha', 'main', 'succeeded')"
+            " RETURNING id",
+            project_id,
+        )
+
+    monkeypatch.setattr(migrations_mod, "load_migrations", lambda: shipped)
+    await apply_migrations(dsn)
+
+    async with db_pool(dsn) as pool:
+        assert (
+            await pool.fetchval("SELECT attribute FROM builds WHERE id = $1", old_id)
+            == "checks"
+        )
+        reused, created = await db.get_or_create_build(
+            pool, project_id, "tree-old", "sha2", "main", attribute="checks"
+        )
+        assert not created
+        assert reused.id_ == old_id
+        other, created = await db.get_or_create_build(
+            pool, project_id, "tree-old", "sha2", "main", attribute="fast"
+        )
+        assert created
+        assert other.id_ != old_id
+
+
+async def test_tree_built_under_any_attribute(pool: asyncpg.Pool) -> None:
+    """The tag gate asks whether the tree was built at all. Reuse asks
+    for the attribute too."""
+    project_id = await insert_project(pool, "tree-built")
+    await insert_build(
+        pool, project_id, tree_hash="tree-tb", status="succeeded", attribute="release"
+    )
+    await insert_build(
+        pool, project_id, number=2, tree_hash="tree-tb-cancelled", status="cancelled"
+    )
+    assert await builds_q.tree_built(pool, project_id=project_id, tree_hash="tree-tb")
+    assert (
+        await builds_q.find_reusable_build(
+            pool, project_id=project_id, tree_hash="tree-tb", attribute="checks"
+        )
+        is None
+    )
+    assert not await builds_q.tree_built(
+        pool, project_id=project_id, tree_hash="tree-tb-cancelled"
+    )
+    assert not await builds_q.tree_built(
+        pool, project_id=project_id, tree_hash="tree-unknown"
+    )
+
+
+async def test_completed_eval_is_per_attribute(pool: asyncpg.Pool) -> None:
+    project_id = await insert_project(pool, "eval-attr")
+    fast_id = await insert_build(
+        pool, project_id, tree_hash="tree-ea", status="succeeded", attribute="fast"
+    )
+    checks_id = await insert_build(pool, project_id, number=2, tree_hash="tree-ea")
+    assert (
+        await builds_q.find_completed_eval(
+            pool,
+            project_id=project_id,
+            tree_hash="tree-ea",
+            attribute="checks",
+            exclude_build_id=checks_id,
+        )
+        is None
+    )
+    assert (
+        await builds_q.find_completed_eval(
+            pool,
+            project_id=project_id,
+            tree_hash="tree-ea",
+            attribute="fast",
+            exclude_build_id=checks_id,
+        )
+        == fast_id
+    )
+
+
 async def test_commit_eval_result_atomic(pool: asyncpg.Pool) -> None:
     """Committing an eval result refreshes non-terminal rows, prunes
     rows the eval no longer produced and sets eval_completed, all in

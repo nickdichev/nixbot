@@ -33,7 +33,7 @@ from nixbot.nix_eval import (
     build_full_command,
     build_sandbox_command,
 )
-from nixbot.repo_config import BranchConfig
+from nixbot.repo_config import AttributeBranchRule, BranchConfig
 from nixbot.store_token import write_token
 
 from .support import git, init_upstream
@@ -396,6 +396,75 @@ async def test_eval_runner_ignores_hercules_ci_outputs(tmp_path: Path) -> None:
     assert attrs == {
         "checks.aarch64-linux.kept": "kept",
     }
+
+
+@pytest.mark.skipif(
+    shutil.which("nix-eval-jobs") is None or shutil.which("nix") is None,
+    reason="nix-eval-jobs not available",
+)
+async def test_eval_runner_missing_attribute(tmp_path: Path) -> None:
+    """An attribute a rule selects must exist in the flake: the error
+    names the path. The top-level attribute keeps evaluating to an
+    empty job set when it is missing."""
+    flake = tmp_path / "repo"
+    flake.mkdir()
+    (flake / "flake.nix").write_text(
+        """
+        {
+          outputs = { self }: {
+            ci.fast.x86_64-linux.ok = derivation {
+              name = "ok";
+              system = "x86_64-linux";
+              builder = "/bin/sh";
+              args = [ "-c" "echo ok > $out" ];
+            };
+          };
+        }
+        """
+    )
+    settings = EvalSettings(
+        gc_roots_dir=tmp_path / "gcroots",
+        sandbox=False,
+        systemd_scope=False,
+    )
+    rules = [
+        AttributeBranchRule(match="*", attribute="ci.fast"),
+        AttributeBranchRule(match="production", attribute="ci.release"),
+    ]
+
+    def config(attribute: str) -> BranchConfig:
+        return BranchConfig(attribute=attribute, attribute_branches=rules)
+
+    result = await EvalRunner().run(flake, config("ci.fast"), settings)
+    assert [j.attr for j in result.jobs] == ["ci.fast.x86_64-linux.ok"]
+
+    with pytest.raises(EvalError, match=r"no output 'ci\.release'"):
+        await EvalRunner().run(flake, config("ci.release"), settings)
+
+    # Not named by a rule: today's behavior.
+    result = await EvalRunner().run(flake, config("checks"), settings)
+    assert result.jobs == []
+    result = await EvalRunner().run(
+        flake, BranchConfig(attribute="hydraJobs"), settings
+    )
+    assert result.jobs == []
+
+
+def test_select_requires_only_rule_attributes(tmp_path: Path) -> None:
+    settings = EvalSettings(gc_roots_dir=tmp_path / "gcroots")
+    rules = [AttributeBranchRule(match="*", attribute="fast")]
+
+    def select(config: BranchConfig) -> str:
+        cmd = build_eval_command(tmp_path, config, settings)
+        return cmd[cmd.index("--select") + 1]
+
+    assert '\\"required\\": false' in select(BranchConfig())
+    assert '\\"required\\": false' in select(
+        BranchConfig(attribute="checks", attribute_branches=rules)
+    )
+    assert '\\"required\\": true' in select(
+        BranchConfig(attribute="fast", attribute_branches=rules)
+    )
 
 
 @pytest.mark.skipif(

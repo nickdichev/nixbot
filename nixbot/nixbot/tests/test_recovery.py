@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+import pytest
+
 from nixbot import db
+from nixbot.build_scheduler import BuildOutcome
 from nixbot.db_gen import builds as builds_q
 from nixbot.recovery import (
     check_store_paths,
@@ -19,12 +23,24 @@ from nixbot.recovery import (
 )
 
 from .support import insert_build, insert_project
+from .test_orchestrator import (  # noqa: F401
+    FakeEvalRunner,
+    FakeExecutor,
+    RecordingReporter,
+    add_commit,
+    make_env,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
     import asyncpg
+
+    from nixbot.db import BuildRecord
+    from nixbot.events import BuildResult, ChangeEvent
+
+    from .test_orchestrator import EnvFactory
 
 
 async def make_build(pool: asyncpg.Pool, name: str) -> int:
@@ -316,3 +332,58 @@ async def test_interrupted_effects_sweep_spares_live_effects(
         "SELECT status FROM effect_runs WHERE build_id = $1", build_id
     )
     assert status == "running"
+
+
+class _PrefixReporter(RecordingReporter):
+    """Records the per-attribute status prefix of each final report."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.prefixes: list[str] = []
+
+    async def build_finished(
+        self,
+        event: ChangeEvent,  # noqa: ARG002
+        build: BuildRecord,  # noqa: ARG002
+        result: BuildResult,
+    ) -> None:
+        self.prefixes.append(result.attr_prefix)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+@pytest.mark.usefixtures("fresh_work_queue")
+async def test_recovery_reports_under_the_stored_attribute(
+    pool: asyncpg.Pool,
+    make_env: EnvFactory,  # noqa: F811
+    upstream: Path,
+) -> None:
+    """A recovered build names its per-attribute statuses after the
+    attribute stored on the row. The worktree's configuration would say
+    `checks` here."""
+    sha = add_commit(upstream, "recover-attr")
+    # Failing attribute: keeps the effects path out of this test.
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([]),
+        FakeExecutor(outcomes={"a": BuildOutcome.failure}),
+        "recover-attr",
+    )
+    reporter = _PrefixReporter()
+    orchestrator.reporter = reporter
+    build, _ = await db.get_or_create_build(
+        pool, project.id, "recover-attr-tree", sha, "main", attribute="fast"
+    )
+    await pool.execute(
+        "UPDATE builds SET status = 'building', eval_completed = TRUE WHERE id = $1",
+        build.id_,
+    )
+    await add_attr(pool, build.id_, "a", "building")
+    (resumable,) = await find_unfinished_builds(pool, build_id=build.id_)
+    assert [j.attr for j in resumable.pending_jobs] == ["a"]
+
+    await orchestrator.rerun_pending_attributes(project, build, resumable.pending_jobs)
+
+    assert reporter.prefixes == ["fast"]
+    assert (
+        await pool.fetchval("SELECT attribute FROM builds WHERE id = $1", build.id_)
+        == "fast"
+    )

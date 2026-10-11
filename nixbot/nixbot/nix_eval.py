@@ -129,6 +129,13 @@ def build_select_expr(branch_config: BranchConfig, settings: EvalSettings) -> st
         "jobPrefix": "default" if settings.legacy_attr_prefix else None,
         # The attribute may be a dotted path (e.g. "hydraJobs.ci").
         "attrPath": branch_config.attribute.split("."),
+        # An attribute a rule names must exist. Evaluating a missing
+        # one to an empty job set would turn the build green with no
+        # checks, e.g. every PR after the output was renamed.
+        "required": any(
+            rule.attribute == branch_config.attribute
+            for rule in branch_config.attribute_branches
+        ),
     }
     return f"({SELECT_FN}) (builtins.fromJSON {json.dumps(json.dumps(params))})"
 

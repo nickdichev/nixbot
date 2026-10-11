@@ -1,14 +1,23 @@
 -- Build lifecycle queries (db.py).
 
 -- name: LockBuildIdentity :exec
--- No unique constraint exists on (project_id, tree_hash); serialize
--- creators or concurrent events insert duplicates.
+-- No unique constraint exists on (project_id, tree_hash, attribute);
+-- serialize creators or concurrent events insert duplicates.
 SELECT pg_advisory_xact_lock(hashtextextended(sqlc.arg(key)::text, 0));
 
 -- name: FindReusableBuild :one
 -- A cancelled build carries no verdict; never reuse it.
 SELECT * FROM builds WHERE project_id = $1 AND tree_hash = $2
+AND attribute = sqlc.arg(attribute)
 AND status <> 'cancelled' ORDER BY id DESC LIMIT 1;
+
+-- name: TreeBuilt :one
+-- Tag pushes only: any build of the tree counts, whatever attribute
+-- it covered.
+SELECT EXISTS (
+    SELECT 1 FROM builds WHERE project_id = $1 AND tree_hash = $2
+    AND status <> 'cancelled'
+);
 
 -- name: DetachBuildFromPr :one
 -- Reused in another context (another PR, or the default branch after
@@ -35,9 +44,10 @@ WITH n AS (
     WHERE id = sqlc.arg(project_id)::bigint
     RETURNING next_build_number - 1 AS number
 )
-INSERT INTO builds (project_id, number, tree_hash, commit_sha,
+INSERT INTO builds (project_id, number, tree_hash, attribute, commit_sha,
                     branch, pr_number, pr_author, actor)
 SELECT sqlc.arg(project_id)::bigint, n.number, sqlc.narg(tree_hash)::text,
+       sqlc.arg(attribute)::text,
        sqlc.arg(commit_sha)::text, sqlc.arg(branch)::text,
        sqlc.narg(pr_number)::bigint, sqlc.narg(pr_author)::text,
        sqlc.narg(actor)::text
@@ -117,7 +127,10 @@ SET status = sqlc.arg(status),
 WHERE builds.id = sqlc.arg(id)::bigint;
 
 -- name: FindCompletedEval :one
+-- Another build's jobs are only this build's jobs when both evaluated
+-- the same attribute of the tree.
 SELECT id FROM builds WHERE project_id = $1 AND tree_hash = $2
+AND attribute = sqlc.arg(attribute)
 AND eval_completed AND id <> sqlc.arg(exclude_build_id)
 ORDER BY id DESC LIMIT 1;
 

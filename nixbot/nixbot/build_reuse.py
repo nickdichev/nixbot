@@ -150,6 +150,7 @@ async def reuse_terminal_build(  # noqa: PLR0913
         key,
         build.id_,
         tree_hash,
+        build.attribute,
         event.commit_sha,
         asyncio.Event(),
         incoming_is_ancestor_of_running=incoming_stale,

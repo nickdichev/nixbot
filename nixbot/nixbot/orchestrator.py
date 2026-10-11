@@ -315,6 +315,12 @@ class Orchestrator:
 
         try:
             tree_hash = await worktree.tree_hash()
+            # Rules come from the build worktree, like `attribute`: a
+            # PR can test its own rule change.
+            repo_config = RepoBranchConfig.load(worktree.path)
+            attribute = repo_config.resolve_attribute(
+                event.branch, is_pull_request=event.pr_number is not None
+            )
             build, created = await db.get_or_create_build(
                 self.pool,
                 repo.id,
@@ -324,6 +330,7 @@ class Orchestrator:
                 pr_number=event.pr_number,
                 pr_author=event.pr_author,
                 actor=event.actor,
+                attribute=attribute,
             )
             await self._dispatch_build(
                 event,
@@ -331,6 +338,7 @@ class Orchestrator:
                 created=created,
                 tree_hash=tree_hash,
                 worktree_path=worktree.path,
+                branch_config=repo_config,
                 credentials=credentials,
             )
             return build
@@ -345,6 +353,7 @@ class Orchestrator:
         created: bool,
         tree_hash: str,
         worktree_path: Path,
+        branch_config: BranchConfig | None = None,
         credentials: FetchCredentials | None,
     ) -> None:
         """Decide what this event means for the (possibly shared) build:
@@ -394,6 +403,7 @@ class Orchestrator:
             key,
             build.id_,
             tree_hash,
+            build.attribute,
             event.commit_sha,
             cancel_event,
             incoming_is_ancestor_of_running=incoming_stale,
@@ -413,7 +423,9 @@ class Orchestrator:
             await build_reuse.attach_linked_event(self, event, build)
             return
         try:
-            await self.run_build(event, build, worktree_path, credentials)
+            await self._run_build(
+                event, build, worktree_path, branch_config, credentials
+            )
         finally:
             self.canceller.complete(build.id_)
             self.release_run(build.id_)
@@ -428,7 +440,26 @@ class Orchestrator:
     ) -> None:
         """Evaluate and build. Every attribute completion is one
         transactional DB write, then the result is re-aggregated."""
-        await build_run.run_build(self, event, build, worktree_path, credentials)
+        await self._run_build(event, build, worktree_path, None, credentials)
+
+    async def _run_build(
+        self,
+        event: ChangeEvent,
+        build: BuildRecord,
+        worktree_path: Path,
+        branch_config: BranchConfig | None,
+        credentials: FetchCredentials | None,
+    ) -> None:
+        """Without `branch_config` (restarts) it is read from the
+        worktree. Either way the attribute is the one stored on the
+        build: the row's branch and PR number may have changed since, so
+        resolving it again could select another attribute."""
+        if branch_config is None:
+            branch_config = RepoBranchConfig.load(worktree_path)
+        branch_config = branch_config.model_copy(update={"attribute": build.attribute})
+        await build_run.run_build(
+            self, event, build, worktree_path, branch_config, credentials
+        )
 
     async def deliver_events(
         self, event: ChangeEvent, build: BuildRecord, *, finished: bool = True

@@ -11,7 +11,8 @@ order: an event whose commit is an ancestor of the running build's
 commit is stale and ignored (delivery-GUID dedupe lives in webhook
 ingestion). A build shared by multiple contexts (branch
 push + PR with identical tree) is only cancelled when superseded in
-all contexts referencing it. PR close/merge cancels that PR's builds.
+all contexts referencing it; the same tree under another flake
+attribute is different content. PR close/merge cancels that PR's builds.
 
 `[skip ci]` / `[ci skip]` commit message markers are honored here too.
 """
@@ -56,6 +57,7 @@ class InFlightBuild:
     build_id: int
     project_id: int
     tree_hash: str
+    attribute: str
     commit_sha: str
     cancel_event: asyncio.Event
     contexts: set[str] = field(default_factory=set)
@@ -79,6 +81,7 @@ class CancellationManager:
         context_key: str,
         build_id: int,
         tree_hash: str,
+        attribute: str,
         commit_sha: str,
         cancel_event: asyncio.Event,
         *,
@@ -101,10 +104,10 @@ class CancellationManager:
         if old_build_id is not None:
             old = self._builds.get(old_build_id)
             if old is not None:
-                # Identity is the post-merge tree hash only: the same
-                # head commit yields a different tree once the base
-                # branch advances.
-                if old.tree_hash == tree_hash:
+                # Identity is the post-merge tree hash and the flake
+                # attribute, never the commit: the same head commit
+                # yields a different tree once the base branch advances.
+                if (old.tree_hash, old.attribute) == (tree_hash, attribute):
                     # Same content: shared build, nothing to cancel.
                     old.contexts.add(context_key)
                     return RegisterOutcome.DUPLICATE
@@ -125,6 +128,7 @@ class CancellationManager:
                 build_id=build_id,
                 project_id=project_id,
                 tree_hash=tree_hash,
+                attribute=attribute,
                 commit_sha=commit_sha,
                 cancel_event=cancel_event,
             )

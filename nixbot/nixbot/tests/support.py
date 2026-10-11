@@ -407,6 +407,7 @@ async def insert_build(  # noqa: PLR0913
     error: str | None = None,
     started: bool = False,
     eval_completed: bool | None = None,
+    attribute: str = "checks",
 ) -> int:
     """A builds row for the project.
 
@@ -419,9 +420,9 @@ async def insert_build(  # noqa: PLR0913
         """
         INSERT INTO builds (project_id, number, branch, commit_sha, tree_hash,
                             status, pr_number, pr_author, effects_started,
-                            error, started_at, eval_completed)
+                            error, started_at, eval_completed, attribute)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                CASE WHEN $11 THEN now() END, $12)
+                CASE WHEN $11 THEN now() END, $12, $13)
         RETURNING id
         """,
         project_id,
@@ -436,6 +437,7 @@ async def insert_build(  # noqa: PLR0913
         error,
         started,
         eval_completed,
+        attribute,
     )
 
 

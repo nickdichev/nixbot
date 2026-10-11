@@ -36,7 +36,6 @@ from .memory import calculate_eval_workers
 from .models import CacheStatus, NixEvalJobSuccess
 from .nix_eval import EvalError, EvalResult, EvalSettings
 from .post_build import build_props, run_post_build_steps
-from .repo_config import BranchConfig
 from .store_token import store_token_file
 from .workload_identity import identity_from_event
 
@@ -52,6 +51,7 @@ if TYPE_CHECKING:
     from .gitrepo import FetchCredentials
     from .models import NixEvalJob
     from .orchestrator import Orchestrator
+    from .repo_config import BranchConfig
 
 logger = logging.getLogger(__name__)
 
@@ -143,17 +143,21 @@ async def get_eval_jobs(
     return jobs
 
 
-async def run_build(
+async def run_build(  # noqa: PLR0913
     o: Orchestrator,
     event: ChangeEvent,
     build: BuildRecord,
     worktree_path: Path,
+    branch_config: BranchConfig,
     credentials: FetchCredentials | None = None,
 ) -> None:
     """Evaluate and build. Every attribute completion is one
-    transactional DB write, then the result is re-aggregated."""
+    transactional DB write, then the result is re-aggregated.
+    `branch_config` carries the build's stored attribute."""
     try:
-        await _run_build_inner(o, event, build, worktree_path, credentials)
+        await _run_build_inner(
+            o, event, build, worktree_path, branch_config, credentials
+        )
     except Exception as e:
         # Catch-all: a DB outage or GitError mid-eval would
         # otherwise wedge the build in 'evaluating' with no
@@ -322,6 +326,7 @@ async def _evaluate(  # noqa: PLR0913
     event: ChangeEvent,
     build: BuildRecord,
     worktree_path: Path,
+    branch_config: BranchConfig,
     credentials: FetchCredentials | None,
     jobs_queue: asyncio.Queue[list[NixEvalJob] | None],
     live_warnings: LiveWarningAggregator,
@@ -358,7 +363,6 @@ async def _evaluate(  # noqa: PLR0913
                 o.pool, id_=build.id_, warnings=json.dumps(live_warnings.snapshot())
             )
 
-    branch_config = BranchConfig.load(worktree_path)
     async with o.eval_slots:
         await db.set_build_status(o.pool, build.id_, BuildStatus.EVALUATING)
         await _prefetch_inputs(o, build, worktree_path, branch_config, credentials)
@@ -403,11 +407,12 @@ async def _with_build_store(
     return dataclasses.replace(settings, build_store_token_file=token_file)
 
 
-async def _run_build_inner(
+async def _run_build_inner(  # noqa: PLR0913
     o: Orchestrator,
     event: ChangeEvent,
     build: BuildRecord,
     worktree_path: Path,
+    branch_config: BranchConfig,
     credentials: FetchCredentials | None,
 ) -> None:
     await o.reporter.build_started(event, build)
@@ -424,7 +429,14 @@ async def _run_build_inner(
     cancel_event = o.cancel_events.setdefault(build.id_, asyncio.Event())
     eval_task = asyncio.ensure_future(
         _evaluate(
-            o, event, build, worktree_path, credentials, jobs_queue, live_warnings
+            o,
+            event,
+            build,
+            worktree_path,
+            branch_config,
+            credentials,
+            jobs_queue,
+            live_warnings,
         )
     )
     # Builds start as soon as the first eval batch arrives.
@@ -475,15 +487,16 @@ async def _run_build_inner(
 async def _reusable_eval_jobs(
     o: Orchestrator, build: BuildRecord
 ) -> list[NixEvalJobSuccess] | None:
-    """Eval result of another build of the same tree (e.g. cancelled
-    after evaluation, retried later), reusable when its derivations
-    are still in the store; None means evaluate afresh."""
+    """Eval result of another build of the same tree and attribute
+    (e.g. cancelled after evaluation, retried later), reusable when its
+    derivations are still in the store; None means evaluate afresh."""
     if build.tree_hash is None:
         return None
     source_id = await q.find_completed_eval(
         o.pool,
         project_id=build.project_id,
         tree_hash=build.tree_hash,
+        attribute=build.attribute,
         exclude_build_id=build.id_,
     )
     if source_id is None:
@@ -606,7 +619,7 @@ async def build_attributes(  # noqa: PLR0913
                 r.attr: r.status
                 for r in await q.attribute_statuses(o.pool, build_id=build.id_)
             },
-            attr_prefix=BranchConfig.load(worktree_path).attribute,
+            attr_prefix=build.attribute,
         ),
     )
     await o.finish_linked(

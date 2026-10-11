@@ -6,9 +6,10 @@ queries/builds.sql; `sqlc generate` produces db_gen/builds.py.
 
 Key invariants:
 
-- build identity is the post-merge tree hash: a second change event
-  producing the same tree for the same project reuses the existing
-  build instead of creating a new one,
+- build identity is the post-merge tree hash plus the flake attribute
+  the build covers: a second change event producing the same tree and
+  resolving to the same attribute for the same project reuses the
+  existing build instead of creating a new one,
 - attribute completion is one transactional write (status + log
   metadata together),
 - re-aggregation of a build's result is serialized per build via a row
@@ -61,12 +62,14 @@ async def get_or_create_build(  # noqa: PLR0913
     pr_number: int | None = None,
     pr_author: str | None = None,
     actor: str | None = None,
+    attribute: str = "checks",
 ) -> tuple[BuildRecord, bool]:
-    """Reuse keyed on post-merge tree hash across contexts."""
+    """Reuse keyed on post-merge tree hash and attribute across
+    contexts."""
     async with pool.acquire() as conn, conn.transaction():
-        await q.lock_build_identity(conn, key=f"{project_id}:{tree_hash}")
+        await q.lock_build_identity(conn, key=f"{project_id}:{tree_hash}:{attribute}")
         row = await q.find_reusable_build(
-            conn, project_id=project_id, tree_hash=tree_hash
+            conn, project_id=project_id, tree_hash=tree_hash, attribute=attribute
         )
         if row is not None:
             if pr_number != row.pr_number:
@@ -95,6 +98,7 @@ async def get_or_create_build(  # noqa: PLR0913
             conn,
             project_id=project_id,
             tree_hash=tree_hash,
+            attribute=attribute,
             commit_sha=commit_sha,
             branch=branch,
             pr_number=pr_number,

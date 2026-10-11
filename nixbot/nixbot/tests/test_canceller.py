@@ -37,6 +37,7 @@ def reg(  # noqa: PLR0913
     context: str = "main",
     project: int = 1,
     *,
+    attribute: str = "checks",
     stale: bool = False,
 ) -> tuple[str, asyncio.Event]:
     event = asyncio.Event()
@@ -45,6 +46,7 @@ def reg(  # noqa: PLR0913
         context,
         build_id,
         tree,
+        attribute,
         sha,
         event,
         incoming_is_ancestor_of_running=stale,
@@ -89,12 +91,28 @@ def test_out_of_order_event_ignored() -> None:
     assert not running_event.is_set()
 
 
+def test_same_tree_other_attribute_is_not_a_duplicate() -> None:
+    # A context moving to a build of the same tree under another
+    # attribute (a PR retargeted to a base with its own rule) gets that
+    # build registered, and the old one superseded.
+    mgr = CancellationManager()
+    _, old_event = reg(mgr, 1, "tree1", "sha1", attribute="fast")
+    outcome, new_event = reg(mgr, 2, "tree1", "sha1", attribute="checks")
+    assert outcome == RegisterOutcome.NEW
+    assert old_event.is_set()
+    assert not new_event.is_set()
+    assert mgr.running_commit_for(1, "main") == "sha1"
+    # The second build is the context's build now.
+    outcome, _ = reg(mgr, 2, "tree1", "sha1", attribute="checks")
+    assert outcome == RegisterOutcome.DUPLICATE
+
+
 def test_shared_build_cancelled_only_when_all_contexts_superseded() -> None:
     mgr = CancellationManager()
     event = asyncio.Event()
     # One build (same tree) referenced by a branch push and a PR.
-    mgr.register(1, "main", 1, "tree1", "sha1", event)
-    mgr.register(1, "pr/5", 1, "tree1", "sha1", event)
+    mgr.register(1, "main", 1, "tree1", "checks", "sha1", event)
+    mgr.register(1, "pr/5", 1, "tree1", "checks", "sha1", event)
 
     # Superseded on the branch only: still alive via the PR context.
     reg(mgr, 2, "tree2", "sha2", context="main")

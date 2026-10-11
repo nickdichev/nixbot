@@ -8,6 +8,9 @@
   evalSystems,
   # Historic "default" job prefix for compat; null omits it.
   jobPrefix,
+  # Whether a missing attrPath is an error. Otherwise it is an empty
+  # job set.
+  required,
 }:
 flake:
 let
@@ -30,6 +33,14 @@ let
       builtins.mapAttrs (n: prune) v;
   getAt =
     set: path: builtins.foldl' (s: n: if builtins.isAttrs s && s ? ${n} then s.${n} else { }) set path;
+  hasAt =
+    set: path:
+    path == [ ]
+    || (
+      builtins.isAttrs set
+      && set ? ${builtins.head path}
+      && hasAt set.${builtins.head path} (builtins.tail path)
+    );
   setAt =
     path: v: if path == [ ] then v else { ${builtins.head path} = setAt (builtins.tail path) v; };
   configured0 = getAt flake.outputs attrPath;
@@ -52,4 +63,11 @@ let
       configured0;
   job = setAt attrPath (prune configured);
 in
-if jobPrefix == null then job else { ${jobPrefix} = job; }
+# Checked before any job exists, so the whole evaluation fails instead
+# of one job at that path.
+if required && !hasAt flake.outputs attrPath then
+  throw "the flake has no output '${builtins.concatStringsSep "." attrPath}', which an attribute_branches rule selects"
+else if jobPrefix == null then
+  job
+else
+  { ${jobPrefix} = job; }

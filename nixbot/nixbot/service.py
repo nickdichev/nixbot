@@ -484,14 +484,16 @@ class CIService:
         return dataclasses.replace(change, commit_sha=commit)
 
     async def _tree_built(self, project_id: int, info: RepoInfo, commit: str) -> bool:
-        """Whether a build of the commit's tree exists, in any context."""
+        """Whether a build of the commit's tree exists, in any context
+        and under any attribute."""
         tree_hash = await self.orchestrator.repos.rev_parse(
             info.key, f"{commit}^{{tree}}"
         )
-        build = await builds_q.find_reusable_build(
-            self.pool, project_id=project_id, tree_hash=tree_hash
+        return bool(
+            await builds_q.tree_built(
+                self.pool, project_id=project_id, tree_hash=tree_hash
+            )
         )
-        return build is not None
 
     # -- ControlBackend ---------------------------------------------------
 
