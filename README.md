@@ -139,6 +139,22 @@ evaluating, parse it as TOML and apply the configuration specified. See
 [examples/nixbot.toml](./examples/nixbot.toml) for a commented example with all
 supported options.
 
+`attribute` selects the flake attribute to evaluate and build. An
+`[[attribute_branches]]` rule replaces it for some branches: `match` is a branch
+glob, `attribute` the attribute to build instead, and `events` a subset of
+`"push"` and `"pull_request"` (both when omitted). The first matching rule wins;
+with no match the top-level `attribute` applies. For a pull request, `match`
+tests the base branch, not the source branch.
+
+```toml
+attribute = "checks"
+
+[[attribute_branches]]
+match = "*"
+attribute = "fastChecks"
+events = ["pull_request"]
+```
+
 By default, effects only run on the default branch. The `build_branches`,
 `effects_branches` and `effects_on_pull_requests` settings are always read from
 the **default branch's** `nixbot.toml` (via `git show`) so that pull request

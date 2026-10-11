@@ -4,7 +4,8 @@ build worktree instead of via a buildbot remote command."""
 from __future__ import annotations
 
 import tomllib
-from typing import TYPE_CHECKING, Self
+from fnmatch import fnmatch
+from typing import TYPE_CHECKING, Literal, Self
 
 from pydantic import BaseModel, ValidationError
 
@@ -29,10 +30,23 @@ def _validate_flake_dir(flake_dir: str, repo_root: Path) -> None:
         raise RepoConfigError(msg)
 
 
+AttributeEvent = Literal["push", "pull_request"]
+
+
+class AttributeBranchRule(BaseModel):
+    # Branch glob. For a pull request it tests the base branch.
+    match: str
+    attribute: str
+    events: list[AttributeEvent] = ["push", "pull_request"]
+
+
 class BranchConfig(BaseModel):
     flake_dir: str = "."
     lock_file: str = "flake.lock"
     attribute: str = "checks"
+    # Per-branch replacements for `attribute`. The first rule whose
+    # glob and events match wins. No match means `attribute` applies.
+    attribute_branches: list[AttributeBranchRule] = []
     effects_on_pull_requests: bool = False
     effects_branches: list[str] = []
     # Branch globs whose pushes build, replacing the globally
@@ -41,6 +55,15 @@ class BranchConfig(BaseModel):
     build_branches: list[str] | None = None
     # False opts out of the instance-wide contributor approval gate.
     require_approval: bool = True
+
+    def resolve_attribute(self, branch: str, *, is_pull_request: bool) -> str:
+        """Flake attribute to build for an event on `branch` (the base
+        branch for a pull request)."""
+        event: AttributeEvent = "pull_request" if is_pull_request else "push"
+        for rule in self.attribute_branches:
+            if event in rule.events and fnmatch(branch, rule.match):
+                return rule.attribute
+        return self.attribute
 
     @classmethod
     def loads(cls, text: str | None) -> Self:

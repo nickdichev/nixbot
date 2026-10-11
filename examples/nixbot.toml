@@ -9,6 +9,21 @@
 # Flake attribute to evaluate and build.
 #attribute = "checks"
 
+# Per-branch replacements for `attribute`. `match` is a branch glob; for a pull
+# request it tests the base branch. `events` is a subset of "push" and
+# "pull_request" and defaults to both. The first matching rule wins, and with
+# no match the top-level `attribute` applies. As TOML tables, the rules must
+# come after every top-level key in the file.
+#[[attribute_branches]]
+#match = "*"
+#attribute = "fastChecks"
+#events = ["pull_request"]
+#
+#[[attribute_branches]]
+#match = "release-*"
+#attribute = "hydraJobs"
+#events = ["push"]
+
 # Directory the flake is located in.
 #flake_dir = "."
 
