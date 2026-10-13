@@ -66,9 +66,9 @@ according to the repository's effects gating.
 
 ## Claims
 
-Common claims: `iss` (the nixbot URL), `aud` (one requested audience per token),
-`sub`, `event`, `forge`, `repository`, `repository_owner`, `effect`, plus
-`iat`/`nbf`/`exp`/`jti`.
+Common claims: `iss` (the workload identity issuer URL), `aud` (one requested
+audience per token), `sub`, `event`, `forge`, `repository`, `repository_owner`,
+`effect`, plus `iat`/`nbf`/`exp`/`jti`.
 
 | event        | `sub`                                                 | extra claims                               |
 | ------------ | ----------------------------------------------------- | ------------------------------------------ |
@@ -82,7 +82,26 @@ refs/heads/main may deploy") therefore never match a PR run.
 ## Relying-party configuration
 
 Discovery and JWKS documents are served unauthenticated at
-`<url>/.well-known/openid-configuration` and `<url>/.well-known/jwks.json`.
+`<issuerUrl>/.well-known/openid-configuration` and
+`<issuerUrl>/.well-known/jwks.json`.
+
+`services.nixbot.workloadIdentity.issuerUrl` is a string that defaults to the
+main nixbot URL (derived from `domain`, `port`, `nginx.enable` and `useHTTPS`).
+It sets the token's `iss`, the discovery document's `issuer`, and the base URL
+of `jwks_uri`; trailing slashes are removed. The UI, API base and status links
+continue to use the main nixbot URL. For a private nixbot instance with a public
+issuer, for example:
+
+```nix
+services.nixbot.workloadIdentity.issuerUrl = "https://nixbot-issuer.example.com";
+```
+
+Configure the public reverse proxy to forward only
+`/.well-known/openid-configuration` and `/.well-known/jwks.json` to nixbot.
+Setting the option does not configure DNS, TLS or a reverse proxy. Relying
+parties must be able to fetch both paths at the issuer URL. For a standalone
+JSON configuration, set `workload_identity.issuer_url`; omitting it or setting
+it to `null` retains the main `url` as the issuer.
 
 Example niks3 provider:
 

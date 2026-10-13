@@ -3,6 +3,7 @@
 # (which verifies it against nixbot's JWKS), trades it for a short-lived
 # SSH certificate from OpenBao's SSH CA and logs into the host with it.
 let
+  issuerUrl = "http://127.0.0.1:8010";
   audience = "https://openbao.example";
   openbaoAddr = "http://127.0.0.1:8200";
   deployScript =
@@ -19,6 +20,8 @@ let
         -H "Authorization: Bearer $NIXBOT_ID_TOKEN_REQUEST_TOKEN" \
         -H "Content-Type: application/json" \
         --data '{"audience": "${audience}"}' | jq -re .token)
+      printf '%s' "$jwt" | jq -Re \
+        'split(".")[1] | gsub("-"; "+") | gsub("_"; "/") | @base64d | fromjson | .iss == "${issuerUrl}"' > /dev/null
       BAO_TOKEN=$(bao write -field=token auth/jwt/login role=deploy jwt="$jwt")
       export BAO_TOKEN
 
@@ -58,9 +61,19 @@ in
 (import ./lib.nix) {
   name = "nixbot-workload-identity";
   nodes.machine =
-    { pkgs, ... }:
+    { pkgs, options, ... }:
     {
       imports = [ (import ./github-node.nix { inherit flakeText; }) ];
+
+      # Keep the UI/API URL at http://localhost:8010 and use a distinct
+      # issuer. The trailing slash also exercises issuer normalization.
+      services.nixbot.workloadIdentity.issuerUrl = "${issuerUrl}/";
+      assertions = [
+        {
+          assertion = options.services.nixbot.workloadIdentity.issuerUrl.default == "http://localhost:8010/";
+          message = "The default workload identity issuer must remain the main nixbot URL.";
+        }
+      ];
 
       # The raw test effect references bash and the login script without
       # declaring them as derivation inputs, so they are only visible to
@@ -106,9 +119,10 @@ in
         doc = json.loads(machine.succeed(
             "curl --fail -s http://127.0.0.1:8010/.well-known/openid-configuration"
         ))
-        assert doc["issuer"] == "http://localhost:8010", doc
+        assert doc["issuer"] == "${issuerUrl}", doc
+        assert doc["jwks_uri"] == "${issuerUrl}/.well-known/jwks.json", doc
         jwks = json.loads(machine.succeed(
-            "curl --fail -s http://127.0.0.1:8010/.well-known/jwks.json"
+            f"curl --fail -s {doc['jwks_uri']}"
         ))
         assert jwks["keys"], jwks
 
@@ -117,7 +131,8 @@ in
         bao = "BAO_ADDR=${openbaoAddr} BAO_TOKEN=root bao "
         machine.succeed(bao + "auth enable jwt")
         machine.succeed(
-            bao + "write auth/jwt/config oidc_discovery_url=http://localhost:8010"
+            bao + "write auth/jwt/config oidc_discovery_url=${issuerUrl} "
+            "bound_issuer=${issuerUrl}"
         )
         machine.succeed(
             "echo 'path \"ssh/sign/deploy\" { capabilities = [\"update\"] }' | "

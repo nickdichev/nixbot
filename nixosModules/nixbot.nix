@@ -136,6 +136,7 @@ let
           };
       workload_identity = {
         enable = cfg.workloadIdentity.enable;
+        issuer_url = cfg.workloadIdentity.issuerUrl;
         signing_key_file =
           if cfg.workloadIdentity.signingKeyFile != null then "workload-identity-key" else null;
         token_ttl = cfg.workloadIdentity.tokenTtl;
@@ -712,6 +713,20 @@ in
           tokens for effects that declare idTokenAudiences, so they can
           authenticate to relying parties (Vault, AWS, niks3, ...)
           without static secrets. See docs/WORKLOAD_IDENTITY.md.
+        '';
+      };
+
+      issuerUrl = lib.mkOption {
+        type = lib.types.str;
+        default = baseUrl;
+        defaultText = "The nixbot URL derived from domain, port, nginx and useHTTPS.";
+        example = "https://nixbot-issuer.example.com";
+        description = ''
+          OIDC issuer URL used for the token iss claim and discovery
+          document, including its jwks_uri. Trailing slashes are removed.
+          Serve the discovery and JWKS paths at this URL when it differs
+          from the main nixbot URL. The UI, API and status links continue
+          to use the main nixbot URL.
         '';
       };
 
