@@ -211,6 +211,8 @@ class WorkloadIdentityConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enable: bool = True
+    # Defaults to the main nixbot URL when unset.
+    issuer_url: str | None = None
     # Operator-provided PEM RSA private key; auto-generated and rotated
     # in the state dir when unset.
     signing_key_file: Path | None = None

@@ -278,7 +278,9 @@ async def build_service(config: Config) -> tuple[CIService, FastAPI]:
     if config.workload_identity.enable:
         identity_issuer = load_issuer(
             config.state_dir,
-            config.url,
+            config.workload_identity.issuer_url
+            if config.workload_identity.issuer_url is not None
+            else config.url,
             signing_key_file=resolve_credential_path(
                 config.workload_identity.signing_key_file
             ),
