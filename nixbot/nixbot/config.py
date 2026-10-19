@@ -534,3 +534,5 @@ class ScheduledEffectConfig(BaseModel):
     name: str
     when: ScheduleWhen
     effects: list[str]
+    # Effect name -> declared lock, shared with onPush/onEvent effects.
+    locks: dict[str, str] = Field(default_factory=dict)

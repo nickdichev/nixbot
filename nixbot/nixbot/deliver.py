@@ -26,7 +26,7 @@ from .effects import effects_context
 from .forge import ForgeError
 from .gitrepo import GitError
 from .repos import repo_info
-from .work_queue import TransientError
+from .work_queue import TransientError, effect_lock_key
 
 if TYPE_CHECKING:
     from nixbot_effects import EffectMeta
@@ -163,7 +163,7 @@ def event_dedup_key(
 ) -> str:
     # onPush effects use the same lock key, so a lock is shared across both.
     if lock is not None:
-        return f"effect-lock-{project_id}-{lock}"
+        return effect_lock_key(project_id, lock)
     return f"build-{build_id}-{kind}-{name}"
 
 

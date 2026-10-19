@@ -21,6 +21,7 @@ from .schedules import (
     ScheduledEffectsStore,
     parse_schedules_from_json,
 )
+from .work_queue import effect_lock_key
 from .workload_identity import EffectIdentity
 
 if TYPE_CHECKING:
@@ -39,6 +40,15 @@ def scheduled_worktree_id(due: DueEffect) -> str:
     return f"scheduled-{due.project_id}-{safe}"
 
 
+def scheduled_dedup_key(due: DueEffect, unlocked: str) -> str:
+    """Work queue key for a scheduled run. A declared lock shares the
+    key of the project's onPush/onEvent effects with that lock, so the
+    run waits for them (and they for it) for its whole duration."""
+    if due.lock is not None:
+        return effect_lock_key(due.project_id, due.lock)
+    return unlocked
+
+
 async def scheduled_effects_loop(s: CIService) -> None:
     store = ScheduledEffectsStore(s.pool)
     while True:
@@ -55,7 +65,10 @@ async def scheduled_effects_loop(s: CIService) -> None:
                 # the occurrence when we crash in between.
                 await s.enqueue_work(
                     "scheduled",
-                    f"scheduled-{due.project_id}-{due.schedule_name}-{due.effect}",
+                    scheduled_dedup_key(
+                        due,
+                        f"scheduled-{due.project_id}-{due.schedule_name}-{due.effect}",
+                    ),
                     {
                         "project_id": due.project_id,
                         "schedule_name": due.schedule_name,

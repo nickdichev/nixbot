@@ -62,7 +62,9 @@ class FakeBackend:
     effect_cancels: list[tuple] = field(default_factory=list)
     cancelled: list[int] = field(default_factory=list)
     attr_cancels: list[tuple[int, str]] = field(default_factory=list)
-    scheduled_runs: list[tuple[int, str, str, str]] = field(default_factory=list)
+    scheduled_runs: list[tuple[int, str, str, str, str | None]] = field(
+        default_factory=list
+    )
     refreshes: int = 0
     activated: list[int] = field(default_factory=list)
     approvals: list[tuple[int, int, str | None]] = field(default_factory=list)
@@ -106,9 +108,14 @@ class FakeBackend:
         self.activated.append(project_id)
 
     async def run_scheduled_now(
-        self, project_id: int, schedule_name: str, effect: str, when_spec: str
+        self,
+        project_id: int,
+        schedule_name: str,
+        effect: str,
+        when_spec: str,
+        lock: str | None = None,
     ) -> None:
-        self.scheduled_runs.append((project_id, schedule_name, effect, when_spec))
+        self.scheduled_runs.append((project_id, schedule_name, effect, when_spec, lock))
 
 
 @pytest.fixture(scope="module")
@@ -130,8 +137,8 @@ async def seed(dsn: str) -> None:
         await pool.execute(
             """
             INSERT INTO scheduled_effects
-                (project_id, schedule_name, effect, when_spec) VALUES
-              ($1, 'nightly', 'deploy', '{}')
+                (project_id, schedule_name, effect, when_spec, lock) VALUES
+              ($1, 'nightly', 'deploy', '{}', 'prod')
             """,
             project_id,
         )
@@ -437,7 +444,7 @@ def test_run_schedule(harness: WebHarness) -> None:
     response = harness.post(url, ROOT, data=data)
     assert response.status_code == 303
     assert response.headers["location"] == "/repos/github/acme/widget/effects"
-    assert BACKEND.scheduled_runs == [(1, "nightly", "deploy", "{}")]
+    assert BACKEND.scheduled_runs == [(1, "nightly", "deploy", "{}", "prod")]
 
     # Unknown schedule is a 404, not an enqueue.
     assert (

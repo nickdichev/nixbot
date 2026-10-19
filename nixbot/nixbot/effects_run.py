@@ -32,6 +32,7 @@ from .event_effects import cloned_checkout, run_event_effect_item
 from .events import effects_event_for_build
 from .executor import failure_excerpt
 from .running_effect import RunningEffect
+from .work_queue import effect_lock_key
 from .workload_identity import identity_from_event
 
 if TYPE_CHECKING:
@@ -248,7 +249,7 @@ def _dedup_key(build: BuildRecord, name: str, meta: EffectMeta) -> str:
     one build run in parallel (the claim query holds back effects whose
     dependencies have not settled)."""
     if meta.lock is not None:
-        return f"effect-lock-{build.project_id}-{meta.lock}"
+        return effect_lock_key(build.project_id, meta.lock)
     return f"build-{build.id_}-effect-{name}"
 
 

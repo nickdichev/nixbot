@@ -110,6 +110,12 @@ class WorkQueue:
         await q.cleanup_work_queue(self.pool, retention_days=retention_days)
 
 
+def effect_lock_key(project_id: int, lock: str) -> str:
+    """Dedup key shared by every effect of a project that declares
+    `lock`: onPush, onEvent and onSchedule runs serialize on it."""
+    return f"effect-lock-{project_id}-{lock}"
+
+
 MAX_WORK_ATTEMPTS = 6
 MAX_WORK_DELAY_SECONDS = 3600
 

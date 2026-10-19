@@ -55,7 +55,12 @@ class ControlBackend(Protocol):
     async def project_activated(self, project_id: int) -> None: ...
 
     async def run_scheduled_now(
-        self, project_id: int, schedule_name: str, effect: str, when_spec: str
+        self,
+        project_id: int,
+        schedule_name: str,
+        effect: str,
+        when_spec: str,
+        lock: str | None = None,
     ) -> None: ...
 
     async def approve_pr(
@@ -438,7 +443,7 @@ class _ControlRoutes:
         if match is None:
             raise HTTPException(status_code=404, detail="unknown schedule")
         await self.backend.run_scheduled_now(
-            project["id"], schedule, effect, match["when_spec"]
+            project["id"], schedule, effect, match["when_spec"], match["lock"]
         )
         return RedirectResponse(
             f"/repos/{forge}/{owner}/{name}/effects", status_code=303

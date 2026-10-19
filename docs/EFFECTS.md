@@ -95,7 +95,8 @@ Two attributes on an effect control when it runs:
 - `lock`: a named lock. Effects holding the same lock run one at a time per
   project, across builds and pull requests, which suits a staging environment or
   a hardware lab. A lock is handed out in build order, so the effects of two
-  builds never interleave.
+  builds never interleave. `onEvent` and `onSchedule` effects with the same
+  lock share it, so a nightly run waits for a deploy holding it.
 
 Both are plain attributes next to `effectScript`. Hercules CI ignores them.
 

@@ -560,7 +560,12 @@ class CIService:
         await restart_dispatch.cancel_effects(self, build_id, name, kind)
 
     async def run_scheduled_now(
-        self, project_id: int, schedule_name: str, effect: str, when_spec: str
+        self,
+        project_id: int,
+        schedule_name: str,
+        effect: str,
+        when_spec: str,
+        lock: str | None = None,
     ) -> None:
         """Manually trigger an onSchedule effect from the UI.
 
@@ -568,17 +573,21 @@ class CIService:
         before the dispatcher claims the work. The dedup key carries
         run_id to stay distinct from a sweep-loop due item, and this
         path never touches last_run, so the regular schedule is
-        unaffected."""
+        unaffected. A declared lock replaces that key with the shared
+        lock key (the payload's run_id keeps the item distinct)."""
         due = DueEffect(
             project_id=project_id,
             schedule_name=schedule_name,
             effect=effect,
             when=ScheduleWhen.model_validate(json.loads(when_spec)),
+            lock=lock,
         )
         run_id = await ScheduledEffectsStore(self.pool).start_run(due)
         await self.enqueue_work(
             "scheduled",
-            f"manual-{project_id}-{schedule_name}-{effect}-{run_id}",
+            schedule_runner.scheduled_dedup_key(
+                due, f"manual-{project_id}-{schedule_name}-{effect}-{run_id}"
+            ),
             {
                 "project_id": project_id,
                 "schedule_name": schedule_name,

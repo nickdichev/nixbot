@@ -25,13 +25,14 @@ from nixbot.config import (
 )
 from nixbot.db_gen import approvals as approvals_q
 from nixbot.db_gen import builds as builds_q
+from nixbot.deliver import event_dedup_key
 from nixbot.events import BuildResult, NullStatusReporter
 from nixbot.forge import DiscoveredRepo
-from nixbot.schedule_runner import scheduled_worktree_id
+from nixbot.schedule_runner import scheduled_dedup_key, scheduled_worktree_id
 from nixbot.schedules import DueEffect, ScheduleWhen
 from nixbot.status import CheckRunStore, FailedStatusStore, ForgeStatusReporter
 from nixbot.webhooks import ChangeRequest, CheckRerequested, PrApproved, PrClosed
-from nixbot.work_queue import MAX_WORK_ATTEMPTS
+from nixbot.work_queue import MAX_WORK_ATTEMPTS, WorkQueue
 
 from .support import (
     FakeGitlab,
@@ -131,6 +132,56 @@ def test_scheduled_worktree_id_sanitizes_traversal() -> None:
     wid = scheduled_worktree_id(due)
     assert "/" not in wid
     assert ".." not in wid
+
+
+def test_scheduled_dedup_key_shares_the_effect_lock() -> None:
+    when = ScheduleWhen()
+    locked = DueEffect(
+        project_id=7, schedule_name="s", effect="drift", when=when, lock="tofu-aws"
+    )
+    # The key onEvent/onPush effects with the same lock queue under.
+    assert scheduled_dedup_key(locked, "unused") == event_dedup_key(
+        7, 1, "pr", "plan", "tofu-aws"
+    )
+    unlocked = DueEffect(project_id=7, schedule_name="s", effect="drift", when=when)
+    assert scheduled_dedup_key(unlocked, "scheduled-7-s-drift") == (
+        "scheduled-7-s-drift"
+    )
+
+
+async def test_locked_scheduled_run_waits_for_effect_lock(
+    service: CIService,
+) -> None:
+    """A scheduled run declaring a lock does not start while an onEvent
+    effect holding that lock runs, and vice versa."""
+    pool = service.pool
+    project_id = await insert_project(pool, forge_repo_id="sched-lock")
+    queue = WorkQueue(pool)
+    lock_key = event_dedup_key(project_id, 1, "push", "apply", "tofu-aws")
+    await queue.enqueue("effect", lock_key, {"build_id": 1, "name": "apply"})
+    apply = await queue.claim_next()
+    assert apply is not None
+
+    await service.run_scheduled_now(project_id, "nightly", "drift", "{}", "tofu-aws")
+    await service.run_scheduled_now(project_id, "nightly", "report", "{}")
+    # The unlocked effect runs; the locked one waits for the apply.
+    report = await queue.claim_next()
+    assert report is not None
+    assert report.payload["effect"] == "report"
+    assert await queue.claim_next() is None
+
+    await queue.finish(apply.id)
+    drift = await queue.claim_next()
+    assert drift is not None
+    assert drift.dedup_key == lock_key
+    assert drift.payload["effect"] == "drift"
+    # While the drift runs, the next apply on the lock waits in turn.
+    await queue.enqueue("effect", lock_key, {"build_id": 2, "name": "apply"})
+    assert await queue.claim_next() is None
+    await queue.finish(drift.id)
+    next_apply = await queue.claim_next()
+    assert next_apply is not None
+    assert next_apply.payload == {"build_id": 2, "name": "apply"}
 
 
 def test_resolve_credential_path(monkeypatch: pytest.MonkeyPatch) -> None:

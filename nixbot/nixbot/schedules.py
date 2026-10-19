@@ -42,6 +42,12 @@ def parse_schedules_from_json(
                 dayOfMonth=when_data.get("dayOfMonth"),
             ),
             effects=schedule_data.get("effects", []),
+            # Older listings carry no locks; null means the effect has none.
+            locks={
+                effect: lock
+                for effect, lock in (schedule_data.get("locks") or {}).items()
+                if lock is not None
+            },
         )
     return result
 
@@ -143,6 +149,8 @@ class DueEffect:
     schedule_name: str
     effect: str
     when: ScheduleWhen
+    # Lock shared with onPush/onEvent effects, see deliver.event_dedup_key.
+    lock: str | None = None
 
 
 class ScheduledEffectsStore:
@@ -167,7 +175,7 @@ class ScheduledEffectsStore:
             }
             await q.delete_project_schedules(conn, project_id=project_id)
             seen: set[tuple[str, str]] = set()
-            rows: list[tuple[str, str, str, datetime | None]] = []
+            rows: list[tuple[str, str, str, datetime | None, str | None]] = []
             for config in schedules.values():
                 for effect in config.effects:
                     key = (config.name, effect)
@@ -186,7 +194,15 @@ class ScheduledEffectsStore:
                         and json.loads(old.when_spec) == json.loads(when_spec)
                         else None
                     )
-                    rows.append((config.name, effect, when_spec, last_run))
+                    rows.append(
+                        (
+                            config.name,
+                            effect,
+                            when_spec,
+                            last_run,
+                            config.locks.get(effect),
+                        )
+                    )
             if rows:
                 await q.insert_schedules(
                     conn,
@@ -196,8 +212,9 @@ class ScheduledEffectsStore:
                     when_specs=[r[2] for r in rows],
                     # The generated signature types timestamptz[]
                     # elements non-null, but Postgres arrays carry
-                    # NULLs fine (last_run is nullable).
+                    # NULLs fine (last_run and lock are nullable).
                     last_runs=cast("list[datetime]", [r[3] for r in rows]),
+                    locks=cast("list[str]", [r[4] for r in rows]),
                 )
 
     async def due_effects(self, now: datetime | None = None) -> list[DueEffect]:
@@ -229,6 +246,7 @@ class ScheduledEffectsStore:
                         schedule_name=row.schedule_name,
                         effect=row.effect,
                         when=when,
+                        lock=row.lock,
                     )
                 )
         return due

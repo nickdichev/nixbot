@@ -43,6 +43,31 @@ def test_parse_schedules() -> None:
     assert schedules["nightly"].when.minute == 30
     assert schedules["nightly"].effects == ["deploy", "backup"]
     assert schedules["monthly"].when.dayOfMonth == [1]
+    # Listings from before locks were carried have none.
+    assert schedules["nightly"].locks == {}
+
+
+async def test_schedule_locks_roundtrip(pool: asyncpg.Pool) -> None:
+    project_id = await insert_project(pool, forge_repo_id="sched-locks")
+    schedules = parse_schedules_from_json(
+        {
+            "nightly": {
+                "when": {"minute": 30, "hour": 2},
+                "effects": ["drift", "report"],
+                "locks": {"drift": "tofu-aws", "report": None},
+            }
+        }
+    )
+    assert schedules["nightly"].locks == {"drift": "tofu-aws"}
+    store = ScheduledEffectsStore(pool)
+    await store.replace_schedules(project_id, schedules)
+    due = await store.due_effects(datetime(2026, 6, 5, 2, 30, tzinfo=UTC))
+    locks = {d.effect: d.lock for d in due if d.project_id == project_id}
+    assert locks == {"drift": "tofu-aws", "report": None}
+    rows = await store.schedules_for_project(project_id)
+    assert {r["effect"]: r["lock"] for r in rows} == locks
+    # The module shares one database: do not leave due schedules behind.
+    await store.replace_schedules(project_id, {})
 
 
 def test_is_due() -> None:

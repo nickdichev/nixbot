@@ -63,6 +63,7 @@ class ProjectSchedulesRow:
     effect: str
     when_spec: str
     last_run: datetime.datetime | None
+    lock: str | None
 
 
 LOCK_PROJECT_SCHEDULES: typing.Final[str] = """-- name: LockProjectSchedules :exec
@@ -81,17 +82,18 @@ DELETE FROM scheduled_effects WHERE project_id = $1
 
 INSERT_SCHEDULES: typing.Final[str] = """-- name: InsertSchedules :exec
 INSERT INTO scheduled_effects
-    (project_id, schedule_name, effect, when_spec, last_run)
+    (project_id, schedule_name, effect, when_spec, last_run, lock)
 SELECT $1::bigint, u.schedule_name, u.effect, u.when_spec,
-       u.last_run
+       u.last_run, u.lock
 FROM (SELECT unnest($2::text[]) AS schedule_name,
              unnest($3::text[]) AS effect,
              unnest($4::jsonb[]) AS when_spec,
-             unnest($5::timestamptz[]) AS last_run) u
+             unnest($5::timestamptz[]) AS last_run,
+             unnest($6::text[]) AS lock) u
 """
 
 DUE_SCHEDULE_ROWS: typing.Final[str] = """-- name: DueScheduleRows :many
-SELECT project_id, schedule_name, effect, when_spec, last_run
+SELECT project_id, schedule_name, effect, when_spec, last_run, lock
 FROM scheduled_effects
 WHERE last_run IS NULL
    OR last_run < date_trunc('minute', $1::timestamptz)
@@ -118,7 +120,7 @@ ORDER BY schedule_name, name, started_at DESC
 """
 
 PROJECT_SCHEDULES: typing.Final[str] = """-- name: ProjectSchedules :many
-SELECT schedule_name, effect, when_spec, last_run
+SELECT schedule_name, effect, when_spec, last_run, lock
 FROM scheduled_effects WHERE project_id = $1
 ORDER BY schedule_name, effect
 """
@@ -186,13 +188,13 @@ async def delete_project_schedules(conn: ConnectionLike, *, project_id: int) -> 
     await conn.execute(DELETE_PROJECT_SCHEDULES, project_id)
 
 
-async def insert_schedules(conn: ConnectionLike, *, project_id: int, schedule_names: collections.abc.Sequence[str], effects: collections.abc.Sequence[str], when_specs: collections.abc.Sequence[str], last_runs: collections.abc.Sequence[datetime.datetime]) -> None:
-    await conn.execute(INSERT_SCHEDULES, project_id, schedule_names, effects, when_specs, last_runs)
+async def insert_schedules(conn: ConnectionLike, *, project_id: int, schedule_names: collections.abc.Sequence[str], effects: collections.abc.Sequence[str], when_specs: collections.abc.Sequence[str], last_runs: collections.abc.Sequence[datetime.datetime], locks: collections.abc.Sequence[str]) -> None:
+    await conn.execute(INSERT_SCHEDULES, project_id, schedule_names, effects, when_specs, last_runs, locks)
 
 
 def due_schedule_rows(conn: ConnectionLike, *, now: datetime.datetime) -> QueryResults[models.ScheduledEffect]:
     def _decode_hook(row: asyncpg.Record) -> models.ScheduledEffect:
-        return models.ScheduledEffect(project_id=row[0], schedule_name=row[1], effect=row[2], when_spec=row[3], last_run=row[4])
+        return models.ScheduledEffect(project_id=row[0], schedule_name=row[1], effect=row[2], when_spec=row[3], last_run=row[4], lock=row[5])
 
     return QueryResults(conn, DUE_SCHEDULE_ROWS, _decode_hook, now)
 
@@ -217,7 +219,7 @@ def latest_scheduled_runs(conn: ConnectionLike, *, project_id: int) -> QueryResu
 
 def project_schedules(conn: ConnectionLike, *, project_id: int) -> QueryResults[ProjectSchedulesRow]:
     def _decode_hook(row: asyncpg.Record) -> ProjectSchedulesRow:
-        return ProjectSchedulesRow(schedule_name=row[0], effect=row[1], when_spec=row[2], last_run=row[3])
+        return ProjectSchedulesRow(schedule_name=row[0], effect=row[1], when_spec=row[2], last_run=row[3], lock=row[4])
 
     return QueryResults(conn, PROJECT_SCHEDULES, _decode_hook, project_id)
 

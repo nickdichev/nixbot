@@ -14,16 +14,17 @@ DELETE FROM scheduled_effects WHERE project_id = $1;
 -- Batch insert of a project's freshly discovered schedules; arrays
 -- are zipped positionally by unnest.
 INSERT INTO scheduled_effects
-    (project_id, schedule_name, effect, when_spec, last_run)
+    (project_id, schedule_name, effect, when_spec, last_run, lock)
 SELECT sqlc.arg(project_id)::bigint, u.schedule_name, u.effect, u.when_spec,
-       u.last_run
+       u.last_run, u.lock
 FROM (SELECT unnest(sqlc.arg(schedule_names)::text[]) AS schedule_name,
              unnest(sqlc.arg(effects)::text[]) AS effect,
              unnest(sqlc.arg(when_specs)::jsonb[]) AS when_spec,
-             unnest(sqlc.arg(last_runs)::timestamptz[]) AS last_run) u;
+             unnest(sqlc.arg(last_runs)::timestamptz[]) AS last_run,
+             unnest(sqlc.arg(locks)::text[]) AS lock) u;
 
 -- name: DueScheduleRows :many
-SELECT project_id, schedule_name, effect, when_spec, last_run
+SELECT project_id, schedule_name, effect, when_spec, last_run, lock
 FROM scheduled_effects
 WHERE last_run IS NULL
    OR last_run < date_trunc('minute', sqlc.arg(now)::timestamptz);
@@ -46,7 +47,7 @@ FROM effect_runs WHERE project_id = $1 AND kind = 'schedule'
 ORDER BY schedule_name, name, started_at DESC;
 
 -- name: ProjectSchedules :many
-SELECT schedule_name, effect, when_spec, last_run
+SELECT schedule_name, effect, when_spec, last_run, lock
 FROM scheduled_effects WHERE project_id = $1
 ORDER BY schedule_name, effect;
 

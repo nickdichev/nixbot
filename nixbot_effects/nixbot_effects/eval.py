@@ -272,15 +272,19 @@ async def list_all_event_effects(
 
 
 async def list_scheduled_effects(opts: EffectsOptions) -> dict[str, Any]:
-    """All onSchedule definitions: schedule name -> {when, effects}."""
+    """All onSchedule definitions: schedule name -> {when, effects, locks}.
+    `locks` maps each effect to its declared lock (null without one),
+    read from the effect or its `run` wrapper like onPush/onEvent."""
     expr = f"""
         let
           schedules = {await scheduled_effect_function(opts)};
         in
-          builtins.mapAttrs (name: schedule: {{
-            when = schedule.when or {{}};
-            effects = builtins.attrNames (schedule.outputs.effects or {{}});
-          }}) schedules
+          builtins.mapAttrs (name: schedule:
+            let effects = schedule.outputs.effects or {{}}; in {{
+              when = schedule.when or {{}};
+              effects = builtins.attrNames effects;
+              locks = builtins.mapAttrs (n: e: (e.run or e).lock or null) effects;
+            }}) schedules
         """
     return dict(await _nix_eval_json(expr, opts))
 

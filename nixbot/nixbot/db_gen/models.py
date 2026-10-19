@@ -130,3 +130,4 @@ class ScheduledEffect:
     effect: str
     when_spec: str
     last_run: datetime.datetime | None
+    lock: str | None
