@@ -586,10 +586,13 @@ Run locally it just prints the body.
 A pull request that breaks an effect should be red before it is merged, even
 though its effects do not run there. Every build therefore evaluates `onPush`
 and `onEvent` of the built commit and builds each effect's dependencies without
-running it, like hercules-ci-agent does for a `runIf false` effect. The results
-appear as "Effect checks" on the build page and count towards the `effects`
-forge status. Evaluation errors are shown there too, including a broken
-`onEvent` on the default branch found while delivering an event.
+running it, like hercules-ci-agent does for a `runIf false` effect. Two kinds of
+check only evaluate the effect, because their dependencies can be costly (a test
+suite, release images) and get built where the effect runs: `onSchedule` effects
+on every build, and gated `onPush` effects on pull requests. The results appear
+as "Effect checks" on the build page and count towards the `effects` forge
+status. Evaluation errors are shown there too, including a broken `onEvent` on
+the default branch found while delivering an event.
 
 ### Restarting
 

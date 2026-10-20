@@ -87,6 +87,42 @@ async def test_list_event_effects(tmp_path: Path) -> None:
         await check_event_effect(opts, "pull_request", "missing")
 
 
+BROKEN_DEPS_FLAKE_NIX = """\
+{
+  outputs = { self, ... }:
+    let
+      broken = derivation {
+        name = "broken-dep";
+        system = builtins.currentSystem;
+        builder = "/bin/sh";
+        args = [ "-c" "exit 1" ];
+      };
+    in {
+      herculesCI = { ... }: {
+        onEvent.pull_request.deploy = derivation {
+          name = "effect";
+          system = builtins.currentSystem;
+          builder = "/bin/sh";
+          args = [ "-c" "echo > $out" ];
+          isEffect = true;
+        } // { dependencies = broken; };
+      };
+    };
+}
+"""
+
+
+async def test_check_without_build_only_evaluates(tmp_path: Path) -> None:
+    repo, _ = init_repo(tmp_path, {"flake.nix": BROKEN_DEPS_FLAKE_NIX})
+    opts = EffectsOptions(path=repo)
+    # Evaluation succeeds; only building the dependencies would fail.
+    await check_event_effect(opts, "pull_request", "deploy", build=False)
+    with pytest.raises(EffectError):
+        await check_event_effect(opts, "pull_request", "deploy")
+    with pytest.raises(EffectError):
+        await check_event_effect(opts, "pull_request", "missing", build=False)
+
+
 PR = {
     "number": 7,
     "headRev": "abc",

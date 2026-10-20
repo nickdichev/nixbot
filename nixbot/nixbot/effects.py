@@ -173,24 +173,33 @@ async def list_all_event_effects(
     )
 
 
-async def check_effect(ctx: EffectsContext, effect: str) -> None:
-    """Build an onPush effect's dependencies. Raises EffectError."""
-    await _with_timeout(nixbot_effects.check_effect(ctx, effect), "effect check")
-
-
-async def check_event_effect(ctx: EffectsContext, kind: str, effect: str) -> None:
-    """Build an onEvent effect's dependencies. Raises EffectError."""
+async def check_effect(ctx: EffectsContext, effect: str, *, build: bool = True) -> None:
+    """Build an onPush effect's dependencies, or with build=False only
+    evaluate it. Raises EffectError."""
     await _with_timeout(
-        nixbot_effects.check_event_effect(ctx, kind, effect), "effect check"
+        nixbot_effects.check_effect(ctx, effect, build=build), "effect check"
+    )
+
+
+async def check_event_effect(
+    ctx: EffectsContext, kind: str, effect: str, *, build: bool = True
+) -> None:
+    """Build an onEvent effect's dependencies, or with build=False only
+    evaluate it. Raises EffectError."""
+    await _with_timeout(
+        nixbot_effects.check_event_effect(ctx, kind, effect, build=build),
+        "effect check",
     )
 
 
 async def check_scheduled_effect(
-    ctx: EffectsContext, schedule: str, effect: str
+    ctx: EffectsContext, schedule: str, effect: str, *, build: bool = True
 ) -> None:
-    """Build an onSchedule effect's dependencies. Raises EffectError."""
+    """Build an onSchedule effect's dependencies, or with build=False
+    only evaluate it. Raises EffectError."""
     await _with_timeout(
-        nixbot_effects.check_scheduled_effect(ctx, schedule, effect), "effect check"
+        nixbot_effects.check_scheduled_effect(ctx, schedule, effect, build=build),
+        "effect check",
     )
 
 
@@ -282,12 +291,14 @@ class EffectsBackend(Protocol):
         self, ctx: EffectsContext
     ) -> dict[str, dict[str, nixbot_effects.EventEffectMeta]]: ...
     async def list_scheduled_effects(self, ctx: EffectsContext) -> dict: ...
-    async def check_effect(self, ctx: EffectsContext, effect: str) -> None: ...
+    async def check_effect(
+        self, ctx: EffectsContext, effect: str, *, build: bool = True
+    ) -> None: ...
     async def check_event_effect(
-        self, ctx: EffectsContext, kind: str, effect: str
+        self, ctx: EffectsContext, kind: str, effect: str, *, build: bool = True
     ) -> None: ...
     async def check_scheduled_effect(
-        self, ctx: EffectsContext, schedule: str, effect: str
+        self, ctx: EffectsContext, schedule: str, effect: str, *, build: bool = True
     ) -> None: ...
     async def run_effect(
         self, ctx: EffectsContext, effect: str, log_write: LogWrite | None = None

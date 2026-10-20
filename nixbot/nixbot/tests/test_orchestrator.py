@@ -1659,8 +1659,10 @@ async def test_pr_worktree_config_cannot_grant_effects(
     )
     # Listed for visibility (Mic92/nixbot#106), never queued or reported.
     assert await effect_statuses(pool, build.id_) == {"deploy": "skipped"}
-    # The gated effect and the scheduled effect were built as checks.
+    # The gated effect and the scheduled effect were checked, by
+    # evaluation only: neither builds its dependencies on a pull request.
     assert sorted(fake.checked) == ["deploy", "schedule.nightly.gc"]
+    assert sorted(fake.evaluated_only) == ["deploy", "schedule.nightly.gc"]
     assert await effect_statuses(pool, build.id_, "check") == {
         "push.deploy": "succeeded",
         "schedule.nightly.gc": "succeeded",
@@ -1668,6 +1670,32 @@ async def test_pr_worktree_config_cannot_grant_effects(
     # The PR gets an effects status for its checks: started 2, 0 failed.
     kinds = [e[0] for e in reporter.events if e[0].startswith("effect")]
     assert kinds == ["effects-started", "effects-finished"]
+
+
+async def test_default_branch_checks_scheduled_effects_by_evaluation(
+    pool: asyncpg.Pool,
+    make_env: EnvFactory,
+    upstream: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On the default branch the onPush effect runs, a scheduled effect
+    is checked by evaluation only (its schedule builds and runs it), and
+    an onEvent effect still builds its dependencies."""
+    fake = patch_effects(monkeypatch)
+    fake.schedules = {"nightly": {"when": {}, "effects": ["gc"]}}
+    fake.events = {"comment": {"apply": EventEffectMeta()}}
+    orchestrator, _, project = await make_env(
+        FakeEvalRunner([mk_job("a")]), FakeExecutor(), name="main-checks"
+    )
+    build = await push_commit(orchestrator, project, upstream, "sched")
+    await drain_effect_items(orchestrator, project, pool)
+    assert fake.ran == ["deploy"]
+    assert sorted(fake.checked) == ["comment.apply", "schedule.nightly.gc"]
+    assert fake.evaluated_only == ["schedule.nightly.gc"]
+    assert await effect_statuses(pool, build.id_, "check") == {
+        "comment.apply": "succeeded",
+        "schedule.nightly.gc": "succeeded",
+    }
 
 
 async def test_rerun_effects_runs_effects_again(

@@ -379,21 +379,25 @@ async def instantiate_effect_deps(
     )
 
 
-async def check_effect(opts: EffectsOptions, effect: str) -> None:
-    """Build an onPush effect's dependencies without running it."""
+async def check_effect(
+    opts: EffectsOptions, effect: str, *, build: bool = True
+) -> None:
+    """Build an onPush effect's dependencies without running it, or
+    with build=False only evaluate it."""
     with_gcroot = _with_gcroot()
     async with with_gcroot as gcroot:
         drv = await instantiate_effect_deps(
             f"let e = ({await effect_function(opts)}).{effect}; in", opts, gcroot
         )
-        if drv:
+        if drv and build:
             await build_derivation(drv, opts)
 
 
 async def check_scheduled_effect(
-    opts: EffectsOptions, schedule: str, effect: str
+    opts: EffectsOptions, schedule: str, effect: str, *, build: bool = True
 ) -> None:
-    """Build an onSchedule effect's dependencies without running it."""
+    """Build an onSchedule effect's dependencies without running it, or
+    with build=False only evaluate it."""
     with_gcroot = _with_gcroot()
     async with with_gcroot as gcroot:
         drv = await instantiate_effect_deps(
@@ -402,12 +406,15 @@ async def check_scheduled_effect(
             opts,
             gcroot,
         )
-        if drv:
+        if drv and build:
             await build_derivation(drv, opts)
 
 
-async def check_event_effect(opts: EffectsOptions, kind: str, effect: str) -> None:
-    """Build an onEvent effect's dependencies without running it."""
+async def check_event_effect(
+    opts: EffectsOptions, kind: str, effect: str, *, build: bool = True
+) -> None:
+    """Build an onEvent effect's dependencies without running it, or
+    with build=False only evaluate it."""
     with_gcroot = _with_gcroot()
     async with with_gcroot as gcroot:
         drv = await instantiate_effect_deps(
@@ -415,7 +422,7 @@ async def check_event_effect(opts: EffectsOptions, kind: str, effect: str) -> No
             opts,
             gcroot,
         )
-        if drv:
+        if drv and build:
             await build_derivation(drv, opts)
 
 

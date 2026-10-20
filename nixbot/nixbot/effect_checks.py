@@ -3,6 +3,7 @@ evaluates the onPush/onEvent/onSchedule effects of its own commit and
 builds their dependencies without running them, the way hercules-ci-agent
 treats a `runIf false` effect. That turns a pull request red when it
 breaks an effect, before the effect would run on the default branch.
+Some checks only evaluate, see `_builds_deps`.
 Check names are `<kind>.<effect>`; kind is `push`, an event kind, or
 `schedule.<schedule>`.
 """
@@ -128,16 +129,34 @@ async def enqueue_checks(
     )
 
 
-async def _check(o: Orchestrator, ctx: EffectsContext, name: str) -> None:
+def _builds_deps(kind: str, build: BuildRecord) -> bool:
+    """Whether a check builds the effect's dependencies or only evaluates
+    it. Dependencies can be the expensive part: a scheduled test suite, or
+    a deploy's release images. A scheduled effect builds them when its
+    schedule runs, so its check only evaluates. An onPush effect builds
+    them when it runs on the default branch, so its check only evaluates
+    on pull requests. A definition that fails to evaluate still fails
+    the check."""
+    if kind == SCHEDULE:
+        return False
+    if kind == "push":
+        return build.pr_number is None
+    return True
+
+
+async def _check(
+    o: Orchestrator, ctx: EffectsContext, name: str, build: BuildRecord
+) -> None:
     """Dispatch a check name back to the effect it was listed from."""
     kind, _, effect = name.partition(".")
+    deps = _builds_deps(kind, build)
     if kind == "push":
-        await o.effects.check_effect(ctx, effect)
+        await o.effects.check_effect(ctx, effect, build=deps)
     elif kind == SCHEDULE:
         schedule, _, effect = effect.partition(".")
-        await o.effects.check_scheduled_effect(ctx, schedule, effect)
+        await o.effects.check_scheduled_effect(ctx, schedule, effect, build=deps)
     else:
-        await o.effects.check_event_effect(ctx, kind, effect)
+        await o.effects.check_event_effect(ctx, kind, effect, build=deps)
 
 
 async def run_check_item(
@@ -161,7 +180,7 @@ async def run_check_item(
             ):
                 ctx = build_context(o, event, worktree_path)
                 ctx.log = writer.write
-                await _check(o, ctx, name)
+                await _check(o, ctx, name, build)
                 success = True
         except EffectError as e:
             await writer.write(f"error: {e}\n".encode())

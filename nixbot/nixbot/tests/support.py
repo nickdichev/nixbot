@@ -89,6 +89,8 @@ class FakeEffects:
     ran: list[str] = field(default_factory=list)
     event_ran: list[tuple[str, str, dict[str, Any]]] = field(default_factory=list)
     checked: list[str] = field(default_factory=list)
+    # The checks that only evaluated, without building dependencies.
+    evaluated_only: list[str] = field(default_factory=list)
 
     async def list_effects(self, _ctx: Any) -> dict[str, EffectMeta]:
         if self.push_error is not None:
@@ -105,16 +107,23 @@ class FakeEffects:
     async def list_scheduled_effects(self, _ctx: Any) -> dict[str, Any]:
         return self.schedules
 
-    async def check_effect(self, _ctx: Any, effect: str) -> None:
-        self.checked.append(effect)
+    async def check_effect(self, _ctx: Any, effect: str, *, build: bool = True) -> None:
+        self._checked(effect, build)
 
-    async def check_event_effect(self, _ctx: Any, kind: str, effect: str) -> None:
-        self.checked.append(f"{kind}.{effect}")
+    async def check_event_effect(
+        self, _ctx: Any, kind: str, effect: str, *, build: bool = True
+    ) -> None:
+        self._checked(f"{kind}.{effect}", build)
 
     async def check_scheduled_effect(
-        self, _ctx: Any, schedule: str, effect: str
+        self, _ctx: Any, schedule: str, effect: str, *, build: bool = True
     ) -> None:
-        self.checked.append(f"schedule.{schedule}.{effect}")
+        self._checked(f"schedule.{schedule}.{effect}", build)
+
+    def _checked(self, name: str, build: bool) -> None:
+        self.checked.append(name)
+        if not build:
+            self.evaluated_only.append(name)
 
     async def run_effect(self, _ctx: Any, effect: str, _log: Any = None) -> bool:
         self.ran.append(effect)
