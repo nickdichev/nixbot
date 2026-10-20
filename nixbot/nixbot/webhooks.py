@@ -13,7 +13,9 @@ fast with 500 so the GitHub App redelivers (Gitea and GitLab are
 backstopped by startup reconciliation).
 
 All pull requests build unless `pr_approval` gating is enabled (see
-nixbot.approval). Merge-queue branches always build.
+nixbot.approval). Merge-queue branches always build. Mergify's queue
+pull requests are the exception: their head branch builds on push, so
+the pull request itself does not build.
 """
 
 from __future__ import annotations
@@ -43,7 +45,17 @@ logger = logging.getLogger(__name__)
 # GitHub itself caps webhook payloads at 25 MB.
 MAX_BODY_SIZE = 25 * 1024 * 1024
 
-MERGE_QUEUE_PATTERNS = ("gh-readonly-queue/*", "gitea-mq/*", "staging", "trying")
+# Mergify tests a batch on a pushed branch and opens a draft pull request
+# from it. The push builds the branch's own attribute; a pull-request
+# build of the same commit would report under the same status contexts.
+MERGIFY_QUEUE_PATTERN = "mergify/merge-queue/*"
+MERGE_QUEUE_PATTERNS = (
+    "gh-readonly-queue/*",
+    "gitea-mq/*",
+    "staging",
+    "trying",
+    MERGIFY_QUEUE_PATTERN,
+)
 
 
 def is_merge_queue_branch(branch: str) -> bool:
@@ -276,7 +288,7 @@ def _pr_action_builds(action: str, payload: dict[str, Any], sync_action: str) ->
     return action in ("opened", sync_action, "reopened")
 
 
-def _parse_pr_event(
+def _parse_pr_event(  # noqa: PLR0911
     forge: str, repo_id: str, payload: dict[str, Any], sync_action: str
 ) -> WebhookEvent | None:
     """GitHub/Gitea pull_request payloads share this shape."""
@@ -304,12 +316,15 @@ def _parse_pr_event(
         )
     if not _pr_action_builds(action, payload, sync_action):
         return None
-    # No commit_message: the [skip ci] check must not run on the PR
-    # title, and the payload lacks the head commit message.
     base = pr.get("base") or {}
     base_ref = base.get("ref", "")
     head = pr.get("head") or {}
     head_repo_id = (head.get("repo") or {}).get("id")
+    head_in_base_repo = head_repo_id is not None and str(head_repo_id) == repo_id
+    if head_in_base_repo and fnmatch(head.get("ref", ""), MERGIFY_QUEUE_PATTERN):
+        return None
+    # No commit_message: the [skip ci] check must not run on the PR
+    # title, and the payload lacks the head commit message.
     return ChangeRequest(
         forge=forge,
         forge_repo_id=repo_id,
@@ -323,7 +338,7 @@ def _parse_pr_event(
         base_sha=f"refs/heads/{base_ref}" if base_ref else base.get("sha"),
         actor=_actor(forge, payload),
         author_association=pr.get("author_association"),
-        head_in_base_repo=head_repo_id is not None and str(head_repo_id) == repo_id,
+        head_in_base_repo=head_in_base_repo,
     )
 
 

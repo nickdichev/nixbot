@@ -62,6 +62,7 @@ def test_merge_queue_branches() -> None:
     assert is_merge_queue_branch("gitea-mq/main")
     assert is_merge_queue_branch("staging")
     assert is_merge_queue_branch("trying")
+    assert is_merge_queue_branch("mergify/merge-queue/a76b1f3d25")
     assert not is_merge_queue_branch("feature/foo")
 
 
@@ -232,6 +233,38 @@ def test_parse_github_pr() -> None:
 
     payload["action"] = "labeled"
     assert parse_github_event("pull_request", payload) is None
+
+
+def test_parse_github_mergify_queue_pr_does_not_build() -> None:
+    """The queue branch builds on push; its draft pull request must not
+    build the same commit again under the same status contexts."""
+    payload: dict[str, Any] = {
+        "action": "opened",
+        "repository": {"id": 7},
+        "sender": {"login": "mergify[bot]"},
+        "pull_request": {
+            "number": 40,
+            "state": "open",
+            "draft": True,
+            "user": {"login": "mergify[bot]"},
+            "head": {
+                "ref": "mergify/merge-queue/a76b1f3d25",
+                "sha": "queuesha",
+                "repo": {"id": 7},
+            },
+            "base": {"ref": "main", "sha": "basesha", "repo": {"id": 7}},
+        },
+    }
+    assert parse_github_event("pull_request", payload) is None
+
+    # Closing still reaches the service.
+    payload["action"] = "closed"
+    assert isinstance(parse_github_event("pull_request", payload), PrClosed)
+
+    # A fork cannot opt out of its pull-request build by naming its branch.
+    payload["action"] = "opened"
+    payload["pull_request"]["head"]["repo"] = {"id": 999}
+    assert isinstance(parse_github_event("pull_request", payload), ChangeRequest)
 
 
 def test_parse_github_check_rerequested() -> None:
