@@ -32,6 +32,7 @@ from nixbot.hook_secrets import WebhookSecrets
 from nixbot.reconcile import (
     RemoteHead,
     gitea_heads,
+    github_heads,
     gitlab_heads,
     max_pr_updated,
     reconcile_repo,
@@ -627,6 +628,59 @@ async def test_gitlab_heads_carry_target_branch_base(pool: asyncpg.Pool) -> None
     heads = await gitlab_heads(client, project)
     mr_head = next(h for h in heads if h.pr_number == 5)
     assert mr_head.base_sha == "refs/heads/main"
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl required")
+async def test_github_heads_reconcile_mergify_queue_pr_as_branch_push(
+    pool: asyncpg.Pool, github_client: GitHubAppClient
+) -> None:
+    """A Mergify queue pull request must not build with the pull-request
+    attribute: it would report the queue commit green under the same
+    status contexts without the full checks. Its branch push builds
+    instead. A fork's branch of the same name stays a pull request."""
+
+    def pull(number: int, ref: str, repo_id: int) -> dict:
+        return {
+            "number": number,
+            "user": {"login": "mergify[bot]"},
+            "head": {"sha": f"head-pr{number}", "ref": ref, "repo": {"id": repo_id}},
+            "base": {"ref": "main", "sha": "b", "repo": {"id": 1100}},
+            "updated_at": "2026-06-09T10:00:00Z",
+        }
+
+    fallback = github_transport()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/repos/acme/repo11/branches/main":
+            return httpx.Response(200, json={"commit": {"sha": "head-main"}})
+        if path == "/repos/acme/repo11/pulls":
+            return httpx.Response(
+                200,
+                json=[
+                    pull(1, "mergify/merge-queue/abc", 1100),
+                    pull(2, "feature", 1100),
+                    pull(3, "mergify/merge-queue/abc", 9999),
+                ],
+            )
+        return fallback.handler(request)  # type: ignore[attr-defined,return-value]
+
+    github_client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    github_client.repo_installations["acme/repo11"] = 11
+    await insert_project(pool, "repo11", forge="github", forge_repo_id="1100")
+    project = await RepoStore(pool).by_forge_id("github", "1100")
+    assert project is not None
+    heads = await github_heads(github_client, project)
+    by_sha = {h.commit_sha: h for h in heads}
+    queue = by_sha["head-pr1"]
+    assert (queue.branch, queue.pr_number, queue.base_sha) == (
+        "mergify/merge-queue/abc",
+        None,
+        None,
+    )
+    assert queue.updated_at is not None
+    assert by_sha["head-pr2"].pr_number == 2
+    assert by_sha["head-pr3"].pr_number == 3
 
 
 async def test_gitea_heads_encode_slashed_default_branch(pool: asyncpg.Pool) -> None:

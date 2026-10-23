@@ -12,11 +12,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 from .db_gen import maintenance as q
-from .webhooks import ChangeRequest
+from .webhooks import MERGIFY_QUEUE_PATTERN, ChangeRequest
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -99,23 +100,37 @@ async def github_heads(
         ),
         updated_since,
     )
-    heads.extend(
-        RemoteHead(
-            branch=pull["base"]["ref"],
-            commit_sha=pull["head"]["sha"],
-            pr_number=pull["number"],
-            pr_author=f"github:{pull['user']['login']}",
-            # base.sha is frozen at PR creation. Merge into the current
-            # base branch tip instead (see webhooks._parse_pr_event).
-            base_sha=f"refs/heads/{pull['base']['ref']}",
-            updated_at=datetime.fromisoformat(pull["updated_at"]),
-            author_association=pull.get("author_association"),
-            head_in_base_repo=(pull["head"].get("repo") or {}).get("id")
-            == pull["base"]["repo"]["id"],
-        )
-        for pull in pulls
-    )
+    heads.extend(_github_pr_head(pull) for pull in pulls)
     return heads
+
+
+def _github_pr_head(pull: dict[str, Any]) -> RemoteHead:
+    head_in_base_repo = (pull["head"].get("repo") or {}).get("id") == pull["base"][
+        "repo"
+    ]["id"]
+    updated_at = datetime.fromisoformat(pull["updated_at"])
+    if head_in_base_repo and fnmatch(pull["head"]["ref"], MERGIFY_QUEUE_PATTERN):
+        # A Mergify queue pull request does not build (see
+        # webhooks._parse_pr_event): its branch push does, with the
+        # branch's attribute. Reconcile that push instead, which also
+        # recovers one missed during downtime.
+        return RemoteHead(
+            branch=pull["head"]["ref"],
+            commit_sha=pull["head"]["sha"],
+            updated_at=updated_at,
+        )
+    return RemoteHead(
+        branch=pull["base"]["ref"],
+        commit_sha=pull["head"]["sha"],
+        pr_number=pull["number"],
+        pr_author=f"github:{pull['user']['login']}",
+        # base.sha is frozen at PR creation. Merge into the current
+        # base branch tip instead (see webhooks._parse_pr_event).
+        base_sha=f"refs/heads/{pull['base']['ref']}",
+        updated_at=updated_at,
+        author_association=pull.get("author_association"),
+        head_in_base_repo=head_in_base_repo,
+    )
 
 
 async def gitea_heads(
