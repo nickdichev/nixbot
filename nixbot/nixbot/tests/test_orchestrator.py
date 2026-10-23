@@ -1330,6 +1330,41 @@ async def test_cancelled_build_reuse_rebuilds(
     assert await build_status(pool, build2.id_) == BuildStatus.SUCCEEDED
 
 
+async def test_failed_build_reuse_rebuilds(
+    pool: asyncpg.Pool, make_env: EnvFactory, upstream: Path
+) -> None:
+    """A merge queue retries a failed batch by pushing the same tree
+    under a new commit. Reusing the failure would make the retry a
+    no-op, so the push builds again, reusing the stored eval."""
+    sha1 = add_commit(upstream, "failreuse")
+    eval_runner = FakeEvalRunner([mk_job("flaky")])
+    executor = FakeExecutor({"flaky": BuildOutcome.failure})
+    orchestrator, reporter, project = await make_env(eval_runner, executor, "failreuse")
+
+    async def check(paths: list[str]) -> set[str]:
+        return set(paths)
+
+    orchestrator.check_store_paths = check
+    build1 = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="mergify/merge-queue/a", commit_sha=sha1)
+    )
+    assert build1 is not None
+    assert await build_status(pool, build1.id_) == BuildStatus.FAILED
+
+    executor.outcomes.clear()
+    git(upstream, "commit", "--allow-empty", "-m", "same tree")
+    sha2 = git(upstream, "rev-parse", "HEAD")
+    build2 = await orchestrator.handle_change_event(
+        ChangeEvent(repo=project, branch="mergify/merge-queue/b", commit_sha=sha2)
+    )
+    assert build2 is not None
+    assert build2.id_ != build1.id_
+    assert executor.built == ["flaky", "flaky"]
+    assert eval_runner.calls == 1
+    assert await build_status(pool, build2.id_) == BuildStatus.SUCCEEDED
+    assert reporter.events[-1][2] == BuildStatus.SUCCEEDED
+
+
 async def test_inflight_share_fans_out_final_status(
     make_env: EnvFactory, upstream: Path
 ) -> None:

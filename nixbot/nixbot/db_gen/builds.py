@@ -115,7 +115,7 @@ SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))
 FIND_REUSABLE_BUILD: typing.Final[str] = """-- name: FindReusableBuild :one
 SELECT id, project_id, number, tree_hash, commit_sha, branch, pr_number, pr_author, status, status_generation, effects_started, error, created_at, started_at, finished_at, eval_warnings, eval_completed, effects_commit_sha, effects_branch, effects_pr_number, eval_duration_ms, actor, merged_pr_number, attribute FROM builds WHERE project_id = $1 AND tree_hash = $2
 AND attribute = $3
-AND status <> 'cancelled' ORDER BY id DESC LIMIT 1
+AND status NOT IN ('cancelled', 'failed') ORDER BY id DESC LIMIT 1
 """
 
 TREE_BUILT: typing.Final[str] = """-- name: TreeBuilt :one

@@ -6,10 +6,13 @@
 SELECT pg_advisory_xact_lock(hashtextextended(sqlc.arg(key)::text, 0));
 
 -- name: FindReusableBuild :one
--- A cancelled build carries no verdict; never reuse it.
+-- A cancelled build carries no verdict; never reuse it. Nor a failed
+-- one: re-pushing the same tree is how a merge queue retries a flaky
+-- failure, so it must build again. The rebuild still reuses the eval
+-- (FindCompletedEval) and every output that built.
 SELECT * FROM builds WHERE project_id = $1 AND tree_hash = $2
 AND attribute = sqlc.arg(attribute)
-AND status <> 'cancelled' ORDER BY id DESC LIMIT 1;
+AND status NOT IN ('cancelled', 'failed') ORDER BY id DESC LIMIT 1;
 
 -- name: TreeBuilt :one
 -- Tag pushes only: any build of the tree counts, whatever attribute
